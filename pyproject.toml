@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compile-code"
+version = "0.1.0"
+description = "A compiler for AI coding tasks: pre-resolves repo facts before your agent's first token. Fewer turns, fewer tokens, same answers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Cranot" }]
+keywords = ["ai", "agents", "claude-code", "context", "compiler", "developer-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+    # >=13.5: `roam hooks claude` (the wire/unwire backend) ships in 13.5.
+    "roam-code>=13.5",
+    "click>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Cranot/compile-code"
+Issues = "https://github.com/Cranot/compile-code/issues"
+Toolchain = "https://github.com/Cranot/roam-code"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4"]
+
+[project.scripts]
+# `compile` is the flagship name; `compile-code` and `cmpl` are collision-safe
+# fallbacks (some autotools setups ship a `compile` wrapper script).
+compile = "compile_code.cli:cli"
+compile-code = "compile_code.cli:cli"
+cmpl = "compile_code.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
