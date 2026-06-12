@@ -36,21 +36,26 @@ def run(title: str, cmd: list[str]) -> bool:
     return ok
 
 
+def _scan_file_for_leaks(rel: str) -> list[str]:
+    """All leak-pattern hits in one tracked file, formatted for display."""
+    path = ROOT / rel
+    if path.suffix in (".png", ".jpg", ".gif", ".ico"):
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return []
+    hits: list[str] = []
+    for pattern, label in LEAK_PATTERNS:
+        for m in re.finditer(pattern, text):
+            line = text.count("\n", 0, m.start()) + 1
+            hits.append(f"  {rel}:{line}  [{label}] {m.group(0)[:40]}")
+    return hits
+
+
 def leak_scan() -> bool:
     tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True).stdout.splitlines()
-    hits: list[str] = []
-    for rel in tracked:
-        path = ROOT / rel
-        if path.suffix in (".png", ".jpg", ".gif", ".ico"):
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        for pattern, label in LEAK_PATTERNS:
-            for m in re.finditer(pattern, text):
-                line = text.count("\n", 0, m.start()) + 1
-                hits.append(f"  {rel}:{line}  [{label}] {m.group(0)[:40]}")
+    hits = [hit for rel in tracked for hit in _scan_file_for_leaks(rel)]
     print(f"[check] leak scan: {'PASS' if not hits else 'FAIL'}")
     for h in hits[:10]:
         print(h)
