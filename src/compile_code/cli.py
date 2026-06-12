@@ -192,18 +192,17 @@ def doctor() -> None:
     user_wired = _wired_in(os.path.join(os.path.expanduser("~"), ".claude", "settings.json"))
     wired = project_wired or user_wired
     wired_label = (
-        "wired (project)" if project_wired
-        else "wired (user-global)" if user_wired
+        "wired (project)"
+        if project_wired
+        else "wired (user-global)"
+        if user_wired
         else "not wired (run `compile wire claude`)"
     )
     click.echo(f"toolchain : {'ok' if toolchain_ok else 'MISSING'}")
     click.echo(f"index     : {'ok' if indexed else 'absent (run `compile init`)'}")
     click.echo(f"claude    : {wired_label}")
     if not toolchain_ok:
-        click.echo(
-            "VERDICT: toolchain missing — `roam` not on PATH "
-            "(pip install --force-reinstall compile-code)"
-        )
+        click.echo("VERDICT: toolchain missing — `roam` not on PATH (pip install --force-reinstall compile-code)")
         raise SystemExit(EXIT_TOOLCHAIN)
     click.echo("VERDICT: ready" if indexed and wired else "VERDICT: install ok — finish setup above")
 

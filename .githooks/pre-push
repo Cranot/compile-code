@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Every push runs the polish pipeline. Bypass only deliberately:
+#   git push --no-verify
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check.py"
