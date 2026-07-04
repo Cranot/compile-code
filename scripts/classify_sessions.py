@@ -182,6 +182,11 @@ def _retry_proving_repeats(pairs: list[tuple[int, str]]) -> dict[str, int]:
     return {k: n for k, n in counts.items() if n >= 2}
 
 
+def _first_verify_line_preserves_failure_signal(command: str) -> str:
+    stripped = command.strip()
+    return stripped.splitlines()[0][:80] if stripped else "(empty)"
+
+
 def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str], bool]:
     # Verify-fail aftermath: a verify-shaped Bash step failed at index F and at
     # least one tool call or prompt came after the earliest such F. Using the
@@ -189,7 +194,7 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     verify_fails: list[str] = []
     fail_indices: list[int] = []
     verify_candidates: list[tuple[object, int, str]] = [
-        (tid, idx, cmd.strip().splitlines()[0][:80] if cmd.strip() else "(empty)")
+        (tid, idx, _first_verify_line_preserves_failure_signal(cmd))
         for tid, (idx, cmd) in evidence.tool_uses.items()
         if VERIFY_RE.search(cmd)
     ]
