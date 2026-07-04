@@ -378,9 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     for s in heapq.nlargest(ns.top, flagged, key=lambda s: sum(s["buckets"].values())):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
-        for cmd, n in sorted(s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1], reverse=True)[:2]:
+        for cmd, n in heapq.nlargest(2, s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1]):
             print(f"        bash x{n}: {cmd[:70]}")
-        for fp, n in sorted(s["counts"]["read_repeats"].items(), key=lambda kv: kv[1], reverse=True)[:2]:
+        for fp, n in heapq.nlargest(2, s["counts"]["read_repeats"].items(), key=lambda kv: kv[1]):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
