@@ -31,6 +31,16 @@ compile wire claude     # persistent; `compile unwire claude` to undo
 Requirements: Python 3.10+, a git repository, and Claude Code for the wired
 flow (`compile run` works standalone). The indexer reads 28 languages.
 
+For a one-off navigation prompt, preflight the facts before your agent starts
+with broad grep/read setup:
+
+```bash
+compile run "who calls handleSave?"
+```
+
+That prints the compiled answer envelope up front: callers, file:line citations,
+and the answer contract the agent can use instead of re-deriving the basics.
+
 ## Why
 
 Coding agents burn most of their turns and tokens *gathering context*:
