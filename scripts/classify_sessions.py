@@ -370,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
     print(f"[classify] top {min(ns.top, len(flagged))} retry-like session(s):")
-    for s in sorted(flagged, key=lambda s: sum(s["buckets"].values()), reverse=True)[: ns.top]:
+    for s in heapq.nlargest(ns.top, flagged, key=lambda s: sum(s["buckets"].values())):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
         for cmd, n in sorted(s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1], reverse=True)[:2]:
