@@ -51,9 +51,7 @@ _VERIFY_TOKENS = ("check.py", "pytest", "ruff", "verify")
 # One compiled whole-word pattern per token. This avoids the O(text * N)
 # alternation retry cost of a single ``|``-joined regex, which re-tests every
 # alternative at each position while still preserving exact boundary semantics.
-_VERIFY_PATTERNS = tuple(
-    re.compile(r"\b" + re.escape(token) + r"\b") for token in _VERIFY_TOKENS
-)
+_VERIFY_PATTERNS = tuple(re.compile(r"\b" + re.escape(token) + r"\b") for token in _VERIFY_TOKENS)
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
 
@@ -113,9 +111,7 @@ def _real_user_text(content: object) -> str | None:
     return None
 
 
-def _tool_result_body_preserves_searchable_text(
-    raw: object, json_dumps: Callable[[object], str] = json.dumps
-) -> str:
+def _tool_result_body_preserves_searchable_text(raw: object, json_dumps: Callable[[object], str] = json.dumps) -> str:
     """Return result content as text so failure markers remain searchable."""
     if isinstance(raw, str):
         return raw
@@ -209,20 +205,30 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
         _record_tool_use_without_rescanning(evidence, idx, block)
 
 
+def _typed_turn_payload(rec: object) -> tuple[str, object] | None:
+    """Return (role, content) for one user/assistant ledger record, or None."""
+    if not isinstance(rec, dict):
+        return None
+    hoisted_ledger_field = _ledger_field
+    rtype = hoisted_ledger_field(rec, "type")
+    if rtype not in ("user", "assistant"):
+        return None
+    msg = hoisted_ledger_field(rec, "message")
+    if not isinstance(msg, dict):
+        return None
+    content = hoisted_ledger_field(msg, "content")
+    if not isinstance(rtype, str):
+        return None
+    return rtype, content
+
+
 def _iter_typed_records(path: Path):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
-    hoisted_ledger_field = _ledger_field
     for idx, rec in enumerate(_iter_records(path)):
-        if not isinstance(rec, dict):
-            continue
-        rtype = hoisted_ledger_field(rec, "type")
-        if rtype not in ("user", "assistant"):
-            continue
-        msg = hoisted_ledger_field(rec, "message")
-        if not isinstance(msg, dict):
-            continue
-        content = hoisted_ledger_field(msg, "content")
-        yield idx, rtype, content
+        payload = _typed_turn_payload(rec)
+        if payload is not None:
+            rtype, content = payload
+            yield idx, rtype, content
 
 
 def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
