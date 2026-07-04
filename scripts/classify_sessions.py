@@ -223,10 +223,12 @@ def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> boo
 def _verify_candidates_preserve_failure_context(evidence: SessionEvidence) -> list[tuple[object, int, str]]:
     """Return verify-shaped tool calls with the display text needed on failure."""
     verify_candidates: list[tuple[object, int, str]] = []
+    hoisted_VERIFY_RE_search = VERIFY_RE.search
+    hoisted_first_verify_line_preserves_failure_signal = _first_verify_line_preserves_failure_signal
     for tid, (idx, cmd) in evidence.tool_uses.items():
-        if not VERIFY_RE.search(cmd):
+        if not hoisted_VERIFY_RE_search(cmd):
             continue
-        verify_candidates.append((tid, idx, _first_verify_line_preserves_failure_signal(cmd)))
+        verify_candidates.append((tid, idx, hoisted_first_verify_line_preserves_failure_signal(cmd)))
     return verify_candidates
 
 
