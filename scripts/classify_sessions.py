@@ -209,13 +209,16 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     verify_fails: list[str] = []
     fail_indices: list[int] = []
     verify_candidates: list[tuple[object, int, str]] = []
+    hoisted_verify_re_search = VERIFY_RE.search
+    hoisted_first_verify_line = _first_verify_line_preserves_failure_signal
+    hoisted_tool_result_preserves = _tool_result_preserves_verify_failure_signal
     for tid, (idx, cmd) in evidence.tool_uses.items():
-        if not VERIFY_RE.search(cmd):
+        if not hoisted_verify_re_search(cmd):
             continue
-        verify_candidates.append((tid, idx, _first_verify_line_preserves_failure_signal(cmd)))
+        verify_candidates.append((tid, idx, hoisted_first_verify_line(cmd)))
     for tid, idx, first_line in verify_candidates:
         is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
-        if not _tool_result_preserves_verify_failure_signal(is_err, body):
+        if not hoisted_tool_result_preserves(is_err, body):
             continue
         verify_fails.append(first_line)
         fail_indices.append(idx)
