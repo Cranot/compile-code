@@ -48,10 +48,11 @@ from pathlib import Path
 # must clean up. Kept broad on purpose: this repo's gate is check.py, the
 # kernel's is `roam verify`, and CI shells out to pytest/ruff directly.
 _VERIFY_TOKENS = ("check.py", "pytest", "ruff", "verify")
-# Single regex scan that treats each token as a whole word. Using ``re.escape``
-# keeps the tokens literal, so the alternation has no backtracking traps.
-_VERIFY_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(token) for token in _VERIFY_TOKENS) + r")\b"
+# One compiled whole-word pattern per token. This avoids the O(text * N)
+# alternation retry cost of a single ``|``-joined regex, which re-tests every
+# alternative at each position while still preserving exact boundary semantics.
+_VERIFY_PATTERNS = tuple(
+    re.compile(r"\b" + re.escape(token) + r"\b") for token in _VERIFY_TOKENS
 )
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
@@ -59,7 +60,7 @@ FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "erro
 
 def _command_contains_verify_signal(cmd: str) -> bool:
     """Return True when cmd contains a verify-shaped keyword as a whole word."""
-    return bool(_VERIFY_RE.search(cmd))
+    return any(pattern.search(cmd) for pattern in _VERIFY_PATTERNS)
 
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
