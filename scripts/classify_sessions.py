@@ -131,7 +131,9 @@ def _real_user_text(content: object) -> str | None:
     return None
 
 
-def _tool_result_body_preserves_searchable_text(raw: object, json_dumps: Callable[[object], str]) -> str:
+def _tool_result_body_preserves_searchable_text(
+    raw: object, json_dumps: Callable[[object], str] = json.dumps
+) -> str:
     """Return result content as text so failure markers remain searchable."""
     if isinstance(raw, str):
         return raw
@@ -170,14 +172,13 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
         evidence.prompts.append((idx, text))
     if not isinstance(content, list):
         return
-    hoisted_json_dumps = json.dumps
     hoisted_tool_result_body_preserves_searchable_text = _tool_result_body_preserves_searchable_text
     hoisted_ledger_field = _ledger_field
     for block in content:
         if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_result":
             continue
         raw = hoisted_ledger_field(block, "content")
-        body = hoisted_tool_result_body_preserves_searchable_text(raw, hoisted_json_dumps)
+        body = hoisted_tool_result_body_preserves_searchable_text(raw)
         evidence.results[hoisted_ledger_field(block, "tool_use_id")] = (bool(hoisted_ledger_field(block, "is_error")), body)
 
 
