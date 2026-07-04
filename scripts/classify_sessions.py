@@ -132,11 +132,12 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
     if not isinstance(content, list):
         return
     hoisted_json_dumps = json.dumps
+    hoisted_tool_result_body_preserves_searchable_text = _tool_result_body_preserves_searchable_text
     for block in content:
         if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_result":
             continue
         raw = _ledger_field(block, "content")
-        body = _tool_result_body_preserves_searchable_text(raw, hoisted_json_dumps)
+        body = hoisted_tool_result_body_preserves_searchable_text(raw, hoisted_json_dumps)
         evidence.results[_ledger_field(block, "tool_use_id")] = (bool(_ledger_field(block, "is_error")), body)
 
 
