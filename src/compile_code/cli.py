@@ -362,8 +362,17 @@ def _classify_verify_failure(output: str, rc: int) -> str:
     return _EXIT_CAUSE.get(rc, "verify failure")
 
 
-def _format_verify_failure(*, command: str, files: list[str], cause: str, next_action: str) -> str:
-    """Render the verify-failure block — the four things needed to act locally."""
+def _format_verify_failure(**failure: object) -> str:
+    """Render the verify-failure block from the context needed to act locally."""
+    command = failure.get("command")
+    files = failure.get("files")
+    cause = failure.get("cause")
+    next_action = failure.get("next_action")
+    if not isinstance(command, str) or not isinstance(cause, str) or not isinstance(next_action, str):
+        raise TypeError("verify failure context must include command, cause, and next_action strings")
+    if not isinstance(files, list) or not all(isinstance(file, str) for file in files):
+        raise TypeError("verify failure context must include files as a list of strings")
+
     files_line = ", ".join(files) if files else "(no changed files)"
     return (
         "VERDICT: verify failed.\n"
