@@ -233,3 +233,104 @@ class TestFailurePathsLaunch:
         assert "wiring failed (continuing without hooks" in res.output
         assert execs and execs[0][0] == "claude"
         assert res.exit_code == 0
+
+
+class TestVerifyFailureFormatting:
+    """`compile verify` must turn a roam verify failure into a block that names
+    the failing command, the changed files, a likely cause, and one local rerun."""
+
+    FAIL_OUTPUT = (
+        "VERDICT: FAIL (score 60/100) -- 2 issues in 1 changed file\n"
+        "checks: naming, imports, error_handling, duplicates, syntax\n\n"
+        "NAMING (40/100):\n"
+        "  FAIL: src/bad.py:12 -- function 'Foo' should be snake_case\n\n"
+        "SYNTAX (0/100):\n"
+        "  FAIL: src/bad.py:30 -- python syntax error at line 30: unexpected indent\n"
+    )
+
+    def _capture(self, output, rc):
+        """Stub _roam_capture to return a CompletedProcess-shaped object."""
+        captured = {}
+
+        class _P:
+            def __init__(self, args):
+                captured["args"] = list(args)
+
+            returncode = rc
+            stdout = output
+
+        def fake(*args, timeout=600):
+            return _P(args)
+
+        return fake, captured
+
+    def test_failing_files_dedupes_in_order(self):
+        assert mod._failing_files(self.FAIL_OUTPUT) == ["src/bad.py"]
+
+    def test_classify_maps_failing_sections_to_causes(self):
+        assert mod._classify_verify_failure(self.FAIL_OUTPUT, 5) == "naming violation + syntax error"
+
+    def test_classify_falls_back_to_exit_code_without_fail_lines(self):
+        assert mod._classify_verify_failure("VERDICT: FAIL (score 0/100)\n", 5) == "quality gate"
+        assert mod._classify_verify_failure("no index\n", 3) == "index missing"
+        assert mod._classify_verify_failure("oops\n", 99) == "verify failure"
+
+    def test_format_contains_all_four_components(self):
+        block = mod._format_verify_failure(
+            command="compile verify src/bad.py",
+            files=["src/bad.py"],
+            cause="syntax error",
+            next_action="compile verify src/bad.py",
+        )
+        assert block.startswith("VERDICT: verify failed.")
+        assert "command : compile verify src/bad.py" in block
+        assert "files   : src/bad.py" in block
+        assert "cause   : syntax error" in block
+        assert "next    : compile verify src/bad.py" in block
+
+    def test_format_shows_placeholder_when_no_changed_files(self):
+        block = mod._format_verify_failure(
+            command="compile verify --changed", files=[], cause="quality gate", next_action="compile verify --changed"
+        )
+        assert "files   : (no changed files)" in block
+
+    def test_verify_failure_emits_block_and_exit_5(self, runner, monkeypatch):
+        fake, captured = self._capture(self.FAIL_OUTPUT, 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        monkeypatch.setattr(mod, "_changed_files", lambda: ["src/bad.py"])
+        res = runner.invoke(mod.cli, ["verify"])
+        assert res.exit_code == 5
+        # roam's raw output is preserved...
+        assert "FAIL: src/bad.py:12" in res.output
+        # ...and the explained block carries all four components.
+        assert "VERDICT: verify failed." in res.output
+        assert "command : compile verify src/bad.py" in res.output
+        assert "files   : src/bad.py" in res.output
+        assert "cause   : naming violation + syntax error" in res.output
+        assert "next    : compile verify src/bad.py" in res.output
+        # delegated to roam verify with the resolved files + default threshold.
+        assert captured["args"] == ["verify", "--threshold", "70", "src/bad.py"]
+
+    def test_verify_pass_streams_roam_output_without_block(self, runner, monkeypatch):
+        fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+        assert res.exit_code == 0
+        assert "VERDICT: PASS" in res.output
+        assert "verify failed" not in res.output
+
+    def test_verify_threshold_passes_through_and_shows_in_command(self, runner, monkeypatch):
+        fake, captured = self._capture(self.FAIL_OUTPUT, 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        res = runner.invoke(mod.cli, ["verify", "--threshold", "90", "src/bad.py"])
+        assert res.exit_code == 5
+        assert captured["args"] == ["verify", "--threshold", "90", "src/bad.py"]
+        assert "command : compile verify --threshold 90 src/bad.py" in res.output
+
+    def test_verify_no_changed_files_delegates_changed_flag(self, runner, monkeypatch):
+        fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        monkeypatch.setattr(mod, "_changed_files", lambda: [])
+        res = runner.invoke(mod.cli, ["verify"])
+        assert res.exit_code == 0
+        assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
