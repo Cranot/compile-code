@@ -164,16 +164,17 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
 
 def _iter_typed_records(path: Path):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
+    hoisted_ledger_field = _ledger_field
     for idx, rec in enumerate(_iter_records(path)):
         if not isinstance(rec, dict):
             continue
-        rtype = _ledger_field(rec, "type")
+        rtype = hoisted_ledger_field(rec, "type")
         if rtype not in ("user", "assistant"):
             continue
-        msg = _ledger_field(rec, "message")
+        msg = hoisted_ledger_field(rec, "message")
         if not isinstance(msg, dict):
             continue
-        content = _ledger_field(msg, "content")
+        content = hoisted_ledger_field(msg, "content")
         yield idx, rtype, content
 
 
