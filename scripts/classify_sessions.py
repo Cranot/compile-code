@@ -187,6 +187,10 @@ def _first_verify_line_preserves_failure_signal(command: str) -> str:
     return stripped.splitlines()[0][:80] if stripped else "(empty)"
 
 
+def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> bool:
+    return is_err or any(marker in body for marker in FAIL_MARKERS)
+
+
 def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str], bool]:
     # Verify-fail aftermath: a verify-shaped Bash step failed at index F and at
     # least one tool call or prompt came after the earliest such F. Using the
@@ -200,7 +204,7 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
         verify_candidates.append((tid, idx, _first_verify_line_preserves_failure_signal(cmd)))
     for tid, idx, first_line in verify_candidates:
         is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
-        if not (is_err or any(marker in body for marker in FAIL_MARKERS)):
+        if not _tool_result_preserves_verify_failure_signal(is_err, body):
             continue
         verify_fails.append(first_line)
         fail_indices.append(idx)
