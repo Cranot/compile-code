@@ -153,6 +153,20 @@ def _retry_key_preserving_single_pass_tool_evidence(block: dict[str, object]) ->
     return None
 
 
+def _record_tool_use_without_rescanning(evidence: SessionEvidence, idx: int, block: dict[str, object]) -> None:
+    """Record retry evidence for one tool call while preserving the ledger scan."""
+    retry_key = _retry_key_preserving_single_pass_tool_evidence(block)
+    if retry_key is None:
+        return
+    bucket, key = retry_key
+    if bucket == "bash":
+        evidence.bash_keys.append((idx, key))
+    else:
+        evidence.read_keys.append((idx, key))
+    if key:
+        evidence.tool_uses[_ledger_field(block, "id")] = (idx, key)
+
+
 def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
     """Index assistant tool calls that can prove repeated work or verify cleanup."""
     if not isinstance(content, list):
@@ -161,16 +175,7 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
     for block in content:
         if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_use":
             continue
-        retry_key = _retry_key_preserving_single_pass_tool_evidence(block)
-        if retry_key is None:
-            continue
-        bucket, key = retry_key
-        if bucket == "bash":
-            evidence.bash_keys.append((idx, key))
-        else:
-            evidence.read_keys.append((idx, key))
-        if key:
-            evidence.tool_uses[hoisted_ledger_field(block, "id")] = (idx, key)
+        _record_tool_use_without_rescanning(evidence, idx, block)
 
 
 def _iter_typed_records(path: Path):
