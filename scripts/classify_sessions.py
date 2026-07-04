@@ -230,23 +230,31 @@ def _verify_candidates_preserve_failure_context(evidence: SessionEvidence) -> li
     return verify_candidates
 
 
+def _failed_verify_candidate_preserves_signal_and_position(
+    candidate: tuple[object, int, str],
+    results: dict[object, tuple[bool, str]],
+) -> tuple[int, str] | None:
+    """Return failure evidence only when both display signal and ledger position survive."""
+    tid, idx, first_line = candidate
+    is_err, body = results.get(tid, (False, ""))
+    if not _tool_result_preserves_verify_failure_signal(is_err, body):
+        return None
+    return idx, first_line
+
+
 def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str], bool]:
     # Verify-fail aftermath: a verify-shaped Bash step failed at index F and at
     # least one tool call or prompt came after the earliest such F. Using the
     # first failure keeps the signature "the session continued past a failure".
-    verify_fails: list[str] = []
-    fail_indices: list[int] = []
-    hoisted_tool_result_preserves_verify_failure_signal = _tool_result_preserves_verify_failure_signal
-    results = evidence.results
-    for tid, idx, first_line in _verify_candidates_preserve_failure_context(evidence):
-        is_err, body = results[tid] if tid in results else (False, "")
-        if not hoisted_tool_result_preserves_verify_failure_signal(is_err, body):
-            continue
-        verify_fails.append(first_line)
-        fail_indices.append(idx)
+    failed_candidates = [
+        failed
+        for candidate in _verify_candidates_preserve_failure_context(evidence)
+        if (failed := _failed_verify_candidate_preserves_signal_and_position(candidate, evidence.results)) is not None
+    ]
+    verify_fails = [first_line for _, first_line in failed_candidates]
     # Guard the empty case explicitly: min() on an empty list would otherwise
     # raise, and the `and` below would not short-circuit an eager generator.
-    first_fail = min(fail_indices) if fail_indices else -1
+    first_fail = min((idx for idx, _ in failed_candidates), default=-1)
     activity_indices = [j for j, _ in evidence.bash_keys + evidence.read_keys + evidence.prompts]
     aftermath = first_fail >= 0 and any(i > first_fail for i in activity_indices)
     return verify_fails, aftermath
