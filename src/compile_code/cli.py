@@ -155,6 +155,11 @@ def cli() -> None:
     \b
       compile init
       compile wire claude
+
+    Preflight one navigation prompt without launching an agent:
+
+    \b
+      compile run "who calls handleSave?"
     """
 
 
