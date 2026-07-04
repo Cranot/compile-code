@@ -51,6 +51,16 @@ FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "erro
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
 
 
+def _text_from_message_block(block: object) -> str | None:
+    """Return text from one ledger content block when it is a text payload."""
+    if not isinstance(block, dict):
+        return None
+    if "type" not in block or block["type"] != "text":
+        return None
+    raw_text = block["text"] if "text" in block else ""
+    return (raw_text or "").strip() or None
+
+
 def _real_user_text(content: object) -> str | None:
     """Return a real user prompt, or None for tool-result round-trips.
 
@@ -62,8 +72,7 @@ def _real_user_text(content: object) -> str | None:
     if isinstance(content, list):
         text = None
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text = (block.get("text") or "").strip() or text
+            text = _text_from_message_block(block) or text
         return text
     return None
 
