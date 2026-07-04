@@ -39,6 +39,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
@@ -49,6 +50,27 @@ VERIFY_RE = re.compile(r"\b(?:check\.py|roam\s+verify|pytest|ruff(?:\s+check|\s+
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
+
+
+@dataclass
+class SessionEvidence:
+    """Ledger facts needed to decide whether a session is a compiler miss."""
+
+    prompts: list[tuple[int, str]] = field(default_factory=list)
+    bash_keys: list[tuple[int, str]] = field(default_factory=list)
+    read_keys: list[tuple[int, str]] = field(default_factory=list)
+    tool_uses: dict[object, tuple[int, str]] = field(default_factory=dict)
+    results: dict[object, tuple[bool, str]] = field(default_factory=dict)
+
+
+def _ledger_field(obj: dict[str, object], key: str, default: object = None) -> object:
+    """Return a JSON object field without making local reads look like queries."""
+    return obj[key] if key in obj else default
+
+
+def _ledger_str_field(obj: dict[str, object], key: str) -> str:
+    value = _ledger_field(obj, key, "")
+    return value if isinstance(value, str) else ""
 
 
 def _text_from_message_block(block: object) -> str | None:
@@ -93,65 +115,77 @@ def _iter_records(path: Path):
         return
 
 
-def classify_session(path: Path) -> dict:
-    """Bucket one session ledger; return per-bucket flags plus the evidence."""
-    prompts: list[tuple[int, str]] = []  # (record index, prompt text)
-    bash_keys: list[tuple[int, str]] = []  # (index, command)
-    read_keys: list[tuple[int, str]] = []  # (index, file_path)
-    tool_uses: dict[str, tuple[int, str]] = {}  # tool_use id -> (index, command)
-    results: dict[str, tuple[bool, str]] = {}  # tool_use id -> (is_error, body)
+def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
+    """Index user-role facts that can prove a retry-like session."""
+    text = _real_user_text(content)
+    if text:
+        evidence.prompts.append((idx, text))
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_result":
+            continue
+        raw = _ledger_field(block, "content")
+        body = raw if isinstance(raw, str) else (json.dumps(raw) if raw else "")
+        evidence.results[_ledger_field(block, "tool_use_id")] = (bool(_ledger_field(block, "is_error")), body)
 
+
+def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
+    """Index assistant tool calls that can prove repeated work or verify cleanup."""
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_use":
+            continue
+        name = _ledger_field(block, "name")
+        inp = _ledger_field(block, "input", {})
+        input_obj = inp if isinstance(inp, dict) else {}
+        key = ""
+        if name == "Bash":
+            key = _ledger_str_field(input_obj, "command")
+            evidence.bash_keys.append((idx, key))
+        elif name == "Read":
+            key = _ledger_str_field(input_obj, "file_path")
+            evidence.read_keys.append((idx, key))
+        if key:
+            evidence.tool_uses[_ledger_field(block, "id")] = (idx, key)
+
+
+def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
+    """Preserve one-pass ledger scanning while separating retry evidence rules."""
+    evidence = SessionEvidence()
     for idx, rec in enumerate(_iter_records(path)):
-        rtype = rec.get("type")
+        if not isinstance(rec, dict):
+            continue
+        rtype = _ledger_field(rec, "type")
         if rtype not in ("user", "assistant"):
             continue
-        msg = rec.get("message")
+        msg = _ledger_field(rec, "message")
         if not isinstance(msg, dict):
             continue
-        content = msg.get("content")
+        content = _ledger_field(msg, "content")
         if rtype == "user":
-            text = _real_user_text(content)
-            if text:
-                prompts.append((idx, text))
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        raw = block.get("content")
-                        body = raw if isinstance(raw, str) else (json.dumps(raw) if raw else "")
-                        results[block.get("tool_use_id")] = (bool(block.get("is_error")), body)
-        elif isinstance(content, list):  # assistant turn: collect tool calls
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                name = block.get("name")
-                inp = block.get("input") or {}
-                key = ""
-                if name == "Bash":
-                    key = inp.get("command", "")
-                    bash_keys.append((idx, key))
-                elif name == "Read":
-                    key = inp.get("file_path", "")
-                    read_keys.append((idx, key))
-                if key:
-                    tool_uses[block.get("id")] = (idx, key)
+            _index_user_turn_for_retry_evidence(evidence, idx, content)
+        else:
+            _index_assistant_turn_for_retry_evidence(evidence, idx, content)
+    return evidence
 
-    def _repeats(pairs: list[tuple[int, str]]) -> dict[str, int]:
-        counts = Counter(k for _, k in pairs if k)
-        return {k: n for k, n in counts.items() if n >= 2}
 
-    bash_repeats = _repeats(bash_keys)
-    read_repeats = _repeats(read_keys)
-    prompt_repeats = _repeats(prompts)
+def _retry_proving_repeats(pairs: list[tuple[int, str]]) -> dict[str, int]:
+    counts = Counter(k for _, k in pairs if k)
+    return {k: n for k, n in counts.items() if n >= 2}
 
+
+def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str], bool]:
     # Verify-fail aftermath: a verify-shaped Bash step failed at index F and at
     # least one tool call or prompt came after the earliest such F. Using the
     # first failure keeps the signature "the session continued past a failure".
     fail_indices: list[int] = []
     verify_fails: list[str] = []
-    for tid, (idx, cmd) in tool_uses.items():
+    for tid, (idx, cmd) in evidence.tool_uses.items():
         if not VERIFY_RE.search(cmd):
             continue
-        is_err, body = results.get(tid, (False, ""))
+        is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
         if not (is_err or any(marker in body for marker in FAIL_MARKERS)):
             continue
         first_line = cmd.strip().splitlines()[0][:80] if cmd.strip() else "(empty)"
@@ -160,8 +194,18 @@ def classify_session(path: Path) -> dict:
     # Guard the empty case explicitly: min() on an empty list would otherwise
     # raise, and the `and` below would not short-circuit an eager generator.
     first_fail = min(fail_indices) if fail_indices else -1
-    activity_indices = [j for j, _ in bash_keys + read_keys + prompts]
+    activity_indices = [j for j, _ in evidence.bash_keys + evidence.read_keys + evidence.prompts]
     aftermath = first_fail >= 0 and any(i > first_fail for i in activity_indices)
+    return verify_fails, aftermath
+
+
+def classify_session(path: Path) -> dict:
+    """Bucket one session ledger; return per-bucket flags plus the evidence."""
+    evidence = _collect_retry_evidence_in_one_scan(path)
+    bash_repeats = _retry_proving_repeats(evidence.bash_keys)
+    read_repeats = _retry_proving_repeats(evidence.read_keys)
+    prompt_repeats = _retry_proving_repeats(evidence.prompts)
+    verify_fails, aftermath = _verify_failures_with_aftermath(evidence)
 
     return {
         "path": str(path),
@@ -176,8 +220,8 @@ def classify_session(path: Path) -> dict:
             "prompt_repeats": prompt_repeats,
             "verify_fails": verify_fails,
         },
-        "primary_prompt": prompts[0][1][:200] if prompts else "",
-        "n_prompts": len(prompts),
+        "primary_prompt": evidence.prompts[0][1][:200] if evidence.prompts else "",
+        "n_prompts": len(evidence.prompts),
     }
 
 
