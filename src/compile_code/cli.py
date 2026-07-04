@@ -19,6 +19,7 @@ Hardening contract: every toolchain failure surfaces as a one-line
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 import click
@@ -29,6 +30,9 @@ __all__ = ["cli"]
 
 EXIT_TOOLCHAIN = 2
 EXIT_TIMEOUT = 124
+# roam verify quality-gate failure (see `roam exit-codes`); the one verify exit
+# code the product surface acts on — checks ran and the score fell below threshold.
+EXIT_VERIFY_GATE = 5
 
 # The hook script the roam-code dependency installs into a Claude settings
 # file; its presence is how we detect that compile is wired in. Kept as a
@@ -77,6 +81,41 @@ def _delegate(*args: str, timeout: int = 600) -> int:
     except KeyboardInterrupt:
         click.echo("VERDICT: interrupted")
         return 130
+
+
+def _roam_capture(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
+    """Run the roam toolchain CLI capturing stdout (``_roam`` streams it).
+
+    Kept as a separate indirection so tests stub it the way they stub
+    ``_roam``. Only ``verify`` needs the captured output — to classify the
+    failure and explain the next local action — so the other commands keep
+    streaming via ``_delegate``.
+    """
+    return subprocess.run(["roam", *args], timeout=timeout, check=False, capture_output=True, text=True)
+
+
+def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str]:
+    """Run the toolchain and translate failure modes like ``_delegate``.
+
+    Returns ``(rc, stdout)`` instead of streaming, so the caller can classify
+    a verify failure from roam's check output before composing the verdict.
+    """
+    try:
+        proc = _roam_capture(*args, timeout=timeout)
+        return proc.returncode, proc.stdout or ""
+    except FileNotFoundError:
+        click.echo(
+            "VERDICT: toolchain missing — `roam` is not on PATH. "
+            "Fix: pip install --force-reinstall compile-code  "
+            "(installs the roam-code dependency)"
+        )
+        return EXIT_TOOLCHAIN, ""
+    except subprocess.TimeoutExpired:
+        click.echo(f"VERDICT: toolchain call timed out after {timeout}s — rerun with a smaller scope or file an issue")
+        return EXIT_TIMEOUT, ""
+    except KeyboardInterrupt:
+        click.echo("VERDICT: interrupted")
+        return 130, ""
 
 
 def _ensure_indexed_for_launch() -> int:
@@ -245,6 +284,125 @@ def _run(task: str, json_out: bool) -> None:
 def _stats() -> None:
     """Show compile telemetry for this repo (routing, latency, cache)."""
     raise SystemExit(_delegate("compile-stats"))
+
+
+# `compile verify` is the one product command that emits a *rich* failure block
+# instead of a one-line VERDICT: a verify failure is only actionable when it
+# names the failing command, the changed files, a likely cause, and the single
+# local rerun to run next. The helpers below keep that block in one place.
+
+# roam verify check-section label -> human cause phrase (matches `roam verify`).
+_VERIFY_CAUSE_LABELS = {
+    "SYNTAX": "syntax error",
+    "IMPORTS": "import problem",
+    "NAMING": "naming violation",
+    "DUPLICATES": "duplicate logic",
+    "ERROR HANDLING": "error-handling gap",
+    "CLAIMS": "unverified claim",
+    "COMMAND EXAMPLES": "broken command example",
+    "SECRETS": "exposed secret",
+}
+# A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
+_VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
+# A failing check line, e.g. ``  FAIL: src/cli.py:5 -- <message>``.
+_VERIFY_FAIL_LINE = re.compile(r"^\s*FAIL:\s*(\S+?):\d+\b")
+# Cause when no FAIL line was parseable — fall back to the roam exit code.
+_EXIT_CAUSE = {2: "bad arguments", 3: "index missing", 4: "index stale", EXIT_VERIFY_GATE: "quality gate"}
+
+
+def _changed_files() -> list[str]:
+    """Tracked files that differ from HEAD (staged + unstaged). Empty outside git."""
+    try:
+        out = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"], check=False, capture_output=True, text=True, timeout=10
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _failing_files(output: str) -> list[str]:
+    """Files named on ``FAIL: file:line`` lines, de-duplicated, order-preserving."""
+    failing: list[str] = []
+    for line in output.splitlines():
+        match = _VERIFY_FAIL_LINE.match(line)
+        if match and match.group(1) not in failing:
+            failing.append(match.group(1))
+    return failing
+
+
+def _classify_verify_failure(output: str, rc: int) -> str:
+    """Map a roam verify failure to a one-phrase cause category.
+
+    Prefers the check sections that contain a ``FAIL:`` line; falls back to
+    the roam exit code so non-gate failures (missing/stale index, bad args)
+    still get a meaningful label rather than a generic "verify failure".
+    """
+    failing: list[str] = []
+    current: str | None = None
+    for line in output.splitlines():
+        section = _VERIFY_SECTION.match(line)
+        if section:
+            current = section.group(1).strip()
+            continue
+        if current and _VERIFY_FAIL_LINE.match(line):
+            failing.append(current)
+            current = None  # one failing section per category is enough signal
+    if failing:
+        labels = [_VERIFY_CAUSE_LABELS.get(name, name.lower()) for name in failing]
+        return " + ".join(dict.fromkeys(labels))
+    return _EXIT_CAUSE.get(rc, "verify failure")
+
+
+def _format_verify_failure(*, command: str, files: list[str], cause: str, next_action: str) -> str:
+    """Render the verify-failure block — the four things needed to act locally."""
+    files_line = ", ".join(files) if files else "(no changed files)"
+    return (
+        "VERDICT: verify failed.\n"
+        f"  command : {command}\n"
+        f"  files   : {files_line}\n"
+        f"  cause   : {cause}\n"
+        f"  next    : {next_action}"
+    )
+
+
+@cli.command("verify")
+@click.argument("files", nargs=-1)
+@click.option(
+    "--threshold",
+    type=int,
+    default=70,
+    show_default=True,
+    help="Fail below this score (default 70, or .roam/verify.yaml).",
+)
+def _verify(files: tuple[str, ...], threshold: int) -> None:
+    """Run scoped verify on changed files; on failure, explain the next local action.
+
+    Delegates to `roam verify` (naming, imports, error handling, duplicates,
+    syntax on the changed set). On a failure the raw check output is kept and
+    followed by a block naming the failing command, the changed files, a
+    likely cause category, and the single local rerun to run next.
+    """
+    targets = list(files) or _changed_files()
+    argv = ["verify", "--threshold", str(threshold), *(targets if targets else ["--changed"])]
+    rc, output = _delegate_capturing(*argv)
+    if output:
+        click.echo(output.rstrip())
+    if rc not in (0, EXIT_TOOLCHAIN, EXIT_TIMEOUT, 130):
+        failing = _failing_files(output)
+        scoped = failing or targets
+        files_suffix = " ".join(targets) if targets else "--changed"
+        next_suffix = " ".join(scoped) if scoped else "--changed"
+        threshold_suffix = f" --threshold {threshold}" if threshold != 70 else ""
+        click.echo(
+            _format_verify_failure(
+                command=f"compile verify{threshold_suffix} {files_suffix}",
+                files=targets,
+                cause=_classify_verify_failure(output, rc),
+                next_action=f"compile verify {next_suffix}",
+            )
+        )
+    raise SystemExit(rc)
 
 
 @cli.command("doctor")
