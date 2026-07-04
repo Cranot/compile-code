@@ -141,24 +141,33 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
         evidence.results[_ledger_field(block, "tool_use_id")] = (bool(_ledger_field(block, "is_error")), body)
 
 
+def _retry_key_preserving_single_pass_tool_evidence(block: dict[str, object]) -> tuple[str, str] | None:
+    """Return the retry-evidence bucket/key for Bash and Read tool calls."""
+    name = _ledger_field(block, "name")
+    inp = _ledger_field(block, "input", {})
+    input_obj = inp if isinstance(inp, dict) else {}
+    if name == "Bash":
+        return "bash", _ledger_str_field(input_obj, "command")
+    if name == "Read":
+        return "read", _ledger_str_field(input_obj, "file_path")
+    return None
+
+
 def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
     """Index assistant tool calls that can prove repeated work or verify cleanup."""
     if not isinstance(content, list):
         return
     hoisted_ledger_field = _ledger_field
-    hoisted_ledger_str_field = _ledger_str_field
     for block in content:
         if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_use":
             continue
-        name = hoisted_ledger_field(block, "name")
-        inp = hoisted_ledger_field(block, "input", {})
-        input_obj = inp if isinstance(inp, dict) else {}
-        key = ""
-        if name == "Bash":
-            key = hoisted_ledger_str_field(input_obj, "command")
+        retry_key = _retry_key_preserving_single_pass_tool_evidence(block)
+        if retry_key is None:
+            continue
+        bucket, key = retry_key
+        if bucket == "bash":
             evidence.bash_keys.append((idx, key))
-        elif name == "Read":
-            key = hoisted_ledger_str_field(input_obj, "file_path")
+        else:
             evidence.read_keys.append((idx, key))
         if key:
             evidence.tool_uses[hoisted_ledger_field(block, "id")] = (idx, key)
