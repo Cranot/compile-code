@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,6 +101,13 @@ def _real_user_text(content: object) -> str | None:
     return None
 
 
+def _tool_result_body_preserves_searchable_text(raw: object, json_dumps: Callable[[object], str]) -> str:
+    """Return result content as text so failure markers remain searchable."""
+    if isinstance(raw, str):
+        return raw
+    return json_dumps(raw) if raw else ""
+
+
 def _iter_records(path: Path):
     """Yield parsed JSON records from a session ledger, skipping bad lines."""
     try:
@@ -123,11 +131,12 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
         evidence.prompts.append((idx, text))
     if not isinstance(content, list):
         return
+    hoisted_json_dumps = json.dumps
     for block in content:
         if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_result":
             continue
         raw = _ledger_field(block, "content")
-        body = raw if isinstance(raw, str) else (json.dumps(raw) if raw else "")
+        body = _tool_result_body_preserves_searchable_text(raw, hoisted_json_dumps)
         evidence.results[_ledger_field(block, "tool_use_id")] = (bool(_ledger_field(block, "is_error")), body)
 
 
