@@ -144,6 +144,7 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
     """Index assistant tool calls that can prove repeated work or verify cleanup."""
     if not isinstance(content, list):
         return
+    hoisted_ledger_str_field = _ledger_str_field
     for block in content:
         if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_use":
             continue
@@ -152,10 +153,10 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
         input_obj = inp if isinstance(inp, dict) else {}
         key = ""
         if name == "Bash":
-            key = _ledger_str_field(input_obj, "command")
+            key = hoisted_ledger_str_field(input_obj, "command")
             evidence.bash_keys.append((idx, key))
         elif name == "Read":
-            key = _ledger_str_field(input_obj, "file_path")
+            key = hoisted_ledger_str_field(input_obj, "file_path")
             evidence.read_keys.append((idx, key))
         if key:
             evidence.tool_uses[_ledger_field(block, "id")] = (idx, key)
