@@ -219,9 +219,10 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     # first failure keeps the signature "the session continued past a failure".
     verify_fails: list[str] = []
     fail_indices: list[int] = []
+    hoisted_tool_result_preserves_verify_failure_signal = _tool_result_preserves_verify_failure_signal
     for tid, idx, first_line in _verify_candidates_preserve_failure_context(evidence):
         is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
-        if not _tool_result_preserves_verify_failure_signal(is_err, body):
+        if not hoisted_tool_result_preserves_verify_failure_signal(is_err, body):
             continue
         verify_fails.append(first_line)
         fail_indices.append(idx)
