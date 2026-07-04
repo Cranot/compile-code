@@ -133,12 +133,13 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
         return
     hoisted_json_dumps = json.dumps
     hoisted_tool_result_body_preserves_searchable_text = _tool_result_body_preserves_searchable_text
+    hoisted_ledger_field = _ledger_field
     for block in content:
-        if not isinstance(block, dict) or _ledger_field(block, "type") != "tool_result":
+        if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_result":
             continue
-        raw = _ledger_field(block, "content")
+        raw = hoisted_ledger_field(block, "content")
         body = hoisted_tool_result_body_preserves_searchable_text(raw, hoisted_json_dumps)
-        evidence.results[_ledger_field(block, "tool_use_id")] = (bool(_ledger_field(block, "is_error")), body)
+        evidence.results[hoisted_ledger_field(block, "tool_use_id")] = (bool(hoisted_ledger_field(block, "is_error")), body)
 
 
 def _retry_key_preserving_single_pass_tool_evidence(block: dict[str, object]) -> tuple[str, str] | None:
