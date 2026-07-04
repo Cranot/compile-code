@@ -34,6 +34,7 @@ touches the product: it reads ledgers only and prints a summary.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import os
 import re
@@ -364,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
     if retry_clusters:
-        ranked = sorted(retry_clusters.items(), key=lambda kv: len(kv[1]), reverse=True)[: ns.top]
+        ranked = heapq.nlargest(ns.top, retry_clusters.items(), key=lambda kv: len(kv[1]))
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
