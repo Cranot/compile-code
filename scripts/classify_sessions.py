@@ -237,8 +237,9 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     verify_fails: list[str] = []
     fail_indices: list[int] = []
     hoisted_tool_result_preserves_verify_failure_signal = _tool_result_preserves_verify_failure_signal
+    results = evidence.results
     for tid, idx, first_line in _verify_candidates_preserve_failure_context(evidence):
-        is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
+        is_err, body = results[tid] if tid in results else (False, "")
         if not hoisted_tool_result_preserves_verify_failure_signal(is_err, body):
             continue
         verify_fails.append(first_line)
