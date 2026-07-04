@@ -180,15 +180,17 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     # Verify-fail aftermath: a verify-shaped Bash step failed at index F and at
     # least one tool call or prompt came after the earliest such F. Using the
     # first failure keeps the signature "the session continued past a failure".
-    fail_indices: list[int] = []
     verify_fails: list[str] = []
-    for tid, (idx, cmd) in evidence.tool_uses.items():
-        if not VERIFY_RE.search(cmd):
-            continue
+    fail_indices: list[int] = []
+    verify_candidates: list[tuple[object, int, str]] = [
+        (tid, idx, cmd.strip().splitlines()[0][:80] if cmd.strip() else "(empty)")
+        for tid, (idx, cmd) in evidence.tool_uses.items()
+        if VERIFY_RE.search(cmd)
+    ]
+    for tid, idx, first_line in verify_candidates:
         is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
         if not (is_err or any(marker in body for marker in FAIL_MARKERS)):
             continue
-        first_line = cmd.strip().splitlines()[0][:80] if cmd.strip() else "(empty)"
         verify_fails.append(first_line)
         fail_indices.append(idx)
     # Guard the empty case explicitly: min() on an empty list would otherwise
