@@ -221,16 +221,21 @@ def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> boo
     return is_err or bool(FAIL_RE.search(body))
 
 
+def _verify_candidate_preserves_failure_context(item: tuple[object, tuple[int, str]]) -> tuple[object, int, str] | None:
+    """Return one verify candidate only when command text can explain failure."""
+    tid, (idx, cmd) = item
+    if not VERIFY_RE.search(cmd):
+        return None
+    return tid, idx, _first_verify_line_preserves_failure_signal(cmd)
+
+
 def _verify_candidates_preserve_failure_context(evidence: SessionEvidence) -> list[tuple[object, int, str]]:
     """Return verify-shaped tool calls with the display text needed on failure."""
-    verify_candidates: list[tuple[object, int, str]] = []
-    hoisted_VERIFY_RE_search = VERIFY_RE.search
-    hoisted_first_verify_line_preserves_failure_signal = _first_verify_line_preserves_failure_signal
-    for tid, (idx, cmd) in evidence.tool_uses.items():
-        if not hoisted_VERIFY_RE_search(cmd):
-            continue
-        verify_candidates.append((tid, idx, hoisted_first_verify_line_preserves_failure_signal(cmd)))
-    return verify_candidates
+    return [
+        candidate
+        for candidate in map(_verify_candidate_preserves_failure_context, evidence.tool_uses.items())
+        if candidate is not None
+    ]
 
 
 def _failed_verify_candidate_preserves_signal_and_position(
