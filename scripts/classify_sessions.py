@@ -193,11 +193,11 @@ def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str
     # first failure keeps the signature "the session continued past a failure".
     verify_fails: list[str] = []
     fail_indices: list[int] = []
-    verify_candidates: list[tuple[object, int, str]] = [
-        (tid, idx, _first_verify_line_preserves_failure_signal(cmd))
-        for tid, (idx, cmd) in evidence.tool_uses.items()
-        if VERIFY_RE.search(cmd)
-    ]
+    verify_candidates: list[tuple[object, int, str]] = []
+    for tid, (idx, cmd) in evidence.tool_uses.items():
+        if not VERIFY_RE.search(cmd):
+            continue
+        verify_candidates.append((tid, idx, _first_verify_line_preserves_failure_signal(cmd)))
     for tid, idx, first_line in verify_candidates:
         is_err, body = evidence.results[tid] if tid in evidence.results else (False, "")
         if not (is_err or any(marker in body for marker in FAIL_MARKERS)):
