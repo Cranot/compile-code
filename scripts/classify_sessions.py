@@ -37,7 +37,6 @@ import argparse
 import heapq
 import json
 import os
-import re
 import sys
 from collections.abc import Callable
 from collections import Counter, defaultdict
@@ -47,9 +46,40 @@ from pathlib import Path
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
 # must clean up. Kept broad on purpose: this repo's gate is check.py, the
 # kernel's is `roam verify`, and CI shells out to pytest/ruff directly.
-VERIFY_RE = re.compile(r"\b(?:check\.py|roam\s+verify|pytest|ruff(?:\s+check|\s+format)?|verify)\b")
+_VERIFY_TOKENS = ("check.py", "pytest", "ruff", "verify")
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
+
+
+def _is_word_char(ch: str) -> bool:
+    """Return True for characters matched by the regex ``\\w`` shortcut."""
+    return ch.isalnum() or ch == "_"
+
+
+def _has_word_boundary(text: str, start: int, end: int) -> bool:
+    """Return True when ``text[start:end]`` has non-word neighbours on both sides."""
+    left_ok = start == 0 or not _is_word_char(text[start - 1])
+    right_ok = end == len(text) or not _is_word_char(text[end])
+    return left_ok and right_ok
+
+
+def _command_contains_verify_signal(cmd: str) -> bool:
+    """Return True when cmd contains a verify-shaped keyword.
+
+    Equivalent to the previous regex alternation but avoids its O(text*N)
+    backtracking cost: a fast substring prefilter rejects most commands, and
+    the few survivors confirm the same word-boundary semantics locally.
+    """
+    if not any(token in cmd for token in _VERIFY_TOKENS):
+        return False
+    for token in _VERIFY_TOKENS:
+        idx = cmd.find(token)
+        while idx != -1:
+            if _has_word_boundary(cmd, idx, idx + len(token)):
+                return True
+            idx = cmd.find(token, idx + 1)
+    return False
+
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
 
@@ -232,7 +262,7 @@ def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> boo
 def _verify_candidate_preserves_failure_context(item: tuple[object, tuple[int, str]]) -> tuple[object, int, str] | None:
     """Return one verify candidate only when command text can explain failure."""
     tid, (idx, cmd) = item
-    if not VERIFY_RE.search(cmd):
+    if not _command_contains_verify_signal(cmd):
         return None
     return tid, idx, _first_verify_line_preserves_failure_signal(cmd)
 
