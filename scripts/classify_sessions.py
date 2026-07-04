@@ -37,6 +37,7 @@ import argparse
 import heapq
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from collections import Counter, defaultdict
@@ -47,38 +48,18 @@ from pathlib import Path
 # must clean up. Kept broad on purpose: this repo's gate is check.py, the
 # kernel's is `roam verify`, and CI shells out to pytest/ruff directly.
 _VERIFY_TOKENS = ("check.py", "pytest", "ruff", "verify")
+# Single regex scan that treats each token as a whole word. Using ``re.escape``
+# keeps the tokens literal, so the alternation has no backtracking traps.
+_VERIFY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(token) for token in _VERIFY_TOKENS) + r")\b"
+)
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
 
 
-def _is_word_char(ch: str) -> bool:
-    """Return True for characters matched by the regex ``\\w`` shortcut."""
-    return ch.isalnum() or ch == "_"
-
-
-def _has_word_boundary(text: str, start: int, end: int) -> bool:
-    """Return True when ``text[start:end]`` has non-word neighbours on both sides."""
-    left_ok = start == 0 or not _is_word_char(text[start - 1])
-    right_ok = end == len(text) or not _is_word_char(text[end])
-    return left_ok and right_ok
-
-
 def _command_contains_verify_signal(cmd: str) -> bool:
-    """Return True when cmd contains a verify-shaped keyword.
-
-    Equivalent to the previous regex alternation but avoids its O(text*N)
-    backtracking cost: a fast substring prefilter rejects most commands, and
-    the few survivors confirm the same word-boundary semantics locally.
-    """
-    if not any(token in cmd for token in _VERIFY_TOKENS):
-        return False
-    for token in _VERIFY_TOKENS:
-        idx = cmd.find(token)
-        while idx != -1:
-            if _has_word_boundary(cmd, idx, idx + len(token)):
-                return True
-            idx = cmd.find(token, idx + 1)
-    return False
+    """Return True when cmd contains a verify-shaped keyword as a whole word."""
+    return bool(_VERIFY_RE.search(cmd))
 
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
