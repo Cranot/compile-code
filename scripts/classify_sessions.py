@@ -50,7 +50,6 @@ from pathlib import Path
 VERIFY_RE = re.compile(r"\b(?:check\.py|roam\s+verify|pytest|ruff(?:\s+check|\s+format)?|verify)\b")
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
-FAIL_RE = re.compile("|".join(re.escape(marker) for marker in FAIL_MARKERS))
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
 
@@ -107,6 +106,15 @@ def _tool_result_body_preserves_searchable_text(raw: object, json_dumps: Callabl
     if isinstance(raw, str):
         return raw
     return json_dumps(raw) if raw else ""
+
+
+def _result_body_contains_failure_marker(body: str) -> bool:
+    """Return True when a known literal failure marker appears in the body.
+
+    Using plain substring search avoids the O(text * N) backtracking cost of a
+    regex alternation built from the same fixed markers.
+    """
+    return any(marker in body for marker in FAIL_MARKERS)
 
 
 def _iter_records(path: Path):
@@ -218,7 +226,7 @@ def _first_verify_line_preserves_failure_signal(command: str) -> str:
 
 
 def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> bool:
-    return is_err or bool(FAIL_RE.search(body))
+    return is_err or _result_body_contains_failure_marker(body)
 
 
 def _verify_candidate_preserves_failure_context(item: tuple[object, tuple[int, str]]) -> tuple[object, int, str] | None:
