@@ -48,6 +48,7 @@ from pathlib import Path
 VERIFY_RE = re.compile(r"\b(?:check\.py|roam\s+verify|pytest|ruff(?:\s+check|\s+format)?|verify)\b")
 # Result-content fallback for tools that report failure without a nonzero exit.
 FAIL_MARKERS = ("Traceback", "BLOCKED", "FAILED", "FAIL:", "tests failed", "error:")
+FAIL_RE = re.compile("|".join(re.escape(marker) for marker in FAIL_MARKERS))
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
 
@@ -188,7 +189,7 @@ def _first_verify_line_preserves_failure_signal(command: str) -> str:
 
 
 def _tool_result_preserves_verify_failure_signal(is_err: bool, body: str) -> bool:
-    return is_err or any(marker in body for marker in FAIL_MARKERS)
+    return is_err or bool(FAIL_RE.search(body))
 
 
 def _verify_failures_with_aftermath(evidence: SessionEvidence) -> tuple[list[str], bool]:
