@@ -151,9 +151,8 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
             evidence.tool_uses[_ledger_field(block, "id")] = (idx, key)
 
 
-def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
-    """Preserve one-pass ledger scanning while separating retry evidence rules."""
-    evidence = SessionEvidence()
+def _iter_typed_records(path: Path):
+    """Yield (index, role, content) for each user/assistant turn in a ledger."""
     for idx, rec in enumerate(_iter_records(path)):
         if not isinstance(rec, dict):
             continue
@@ -164,6 +163,13 @@ def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
         if not isinstance(msg, dict):
             continue
         content = _ledger_field(msg, "content")
+        yield idx, rtype, content
+
+
+def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
+    """Preserve one-pass ledger scanning while separating retry evidence rules."""
+    evidence = SessionEvidence()
+    for idx, rtype, content in _iter_typed_records(path):
         if rtype == "user":
             _index_user_turn_for_retry_evidence(evidence, idx, content)
         else:
