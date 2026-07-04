@@ -338,12 +338,17 @@ def _classify_verify_failure(output: str, rc: int) -> str:
     the roam exit code so non-gate failures (missing/stale index, bad args)
     still get a meaningful label rather than a generic "verify failure".
     """
+    lines = output.splitlines()
+    section_at: dict[int, str] = {
+        i: match.group(1).strip()
+        for i, line in enumerate(lines)
+        if (match := _VERIFY_SECTION.match(line))
+    }
     failing: list[str] = []
     current: str | None = None
-    for line in output.splitlines():
-        section = _VERIFY_SECTION.match(line)
-        if section:
-            current = section.group(1).strip()
+    for i, line in enumerate(lines):
+        if i in section_at:
+            current = section_at[i]
             continue
         if current and _VERIFY_FAIL_LINE.match(line):
             failing.append(current)
