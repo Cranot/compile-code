@@ -326,8 +326,11 @@ def _failing_files(output: str) -> list[str]:
     failing: list[str] = []
     for line in output.splitlines():
         match = _VERIFY_FAIL_LINE.match(line)
-        if match and match.group(1) not in failing:
-            failing.append(match.group(1))
+        if not match:
+            continue
+        failed_file = match.group(1)
+        if failed_file not in failing:
+            failing.append(failed_file)
     return failing
 
 
