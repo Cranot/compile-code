@@ -80,8 +80,10 @@ def _ledger_field(obj: dict[str, object], key: str, default: object = None) -> o
     return obj[key] if key in obj else default
 
 
-def _ledger_str_field(obj: dict[str, object], key: str) -> str:
-    value = _ledger_field(obj, key, "")
+def _ledger_str_field(
+    obj: dict[str, object], key: str, ledger_field: Callable[..., object] = _ledger_field
+) -> str:
+    value = ledger_field(obj, key, "")
     return value if isinstance(value, str) else ""
 
 
@@ -176,9 +178,9 @@ def _retry_key_preserving_single_pass_tool_evidence(
     inp = ledger_field(block, "input", {})
     input_obj = inp if isinstance(inp, dict) else {}
     if name == "Bash":
-        return "bash", _ledger_str_field(input_obj, "command")
+        return "bash", _ledger_str_field(input_obj, "command", ledger_field)
     if name == "Read":
-        return "read", _ledger_str_field(input_obj, "file_path")
+        return "read", _ledger_str_field(input_obj, "file_path", ledger_field)
     return None
 
 
