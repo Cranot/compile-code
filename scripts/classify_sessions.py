@@ -147,13 +147,13 @@ def _iter_records(path: Path):
 
 def _tool_result_block_to_searchable_evidence(block: object) -> tuple[object, tuple[bool, str]] | None:
     """Return one tool_result block as searchable retry evidence, or None."""
-    hoisted_ledger_field = _ledger_field
+    hoisted = _ledger_field
     hoisted_tool_result_body_preserves_searchable_text = _tool_result_body_preserves_searchable_text
-    if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_result":
+    if not isinstance(block, dict) or hoisted(block, "type") != "tool_result":
         return None
-    raw = hoisted_ledger_field(block, "content")
+    raw = hoisted(block, "content")
     body = hoisted_tool_result_body_preserves_searchable_text(raw)
-    return hoisted_ledger_field(block, "tool_use_id"), (bool(hoisted_ledger_field(block, "is_error")), body)
+    return hoisted(block, "tool_use_id"), (bool(hoisted(block, "is_error")), body)
 
 
 def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
