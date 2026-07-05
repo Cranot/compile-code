@@ -219,15 +219,16 @@ def _classifiable_turn_role_and_content(
     rec: object, ledger_field: Callable[..., object] = _ledger_field
 ) -> tuple[str, object] | None:
     """Return (role, content) only for records shaped like user/assistant turns."""
+    hoisted = ledger_field
     if not isinstance(rec, dict):
         return None
-    rtype = ledger_field(rec, "type")
+    rtype = hoisted(rec, "type")
     if not isinstance(rtype, str) or rtype not in ("user", "assistant"):
         return None
-    msg = ledger_field(rec, "message")
+    msg = hoisted(rec, "message")
     if not isinstance(msg, dict):
         return None
-    return rtype, ledger_field(msg, "content")
+    return rtype, hoisted(msg, "content")
 
 
 def _iter_typed_records(path: Path):
