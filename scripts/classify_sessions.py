@@ -208,11 +208,11 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
     """Index assistant tool calls that can prove repeated work or verify cleanup."""
     if not isinstance(content, list):
         return
-    hoisted_ledger_field = _ledger_field
+    hoisted = _ledger_field
     for block in content:
-        if not isinstance(block, dict) or hoisted_ledger_field(block, "type") != "tool_use":
+        if not isinstance(block, dict) or hoisted(block, "type") != "tool_use":
             continue
-        _record_tool_use_without_rescanning(evidence, idx, block, ledger_field=hoisted_ledger_field)
+        _record_tool_use_without_rescanning(evidence, idx, block, ledger_field=hoisted)
 
 
 def _iter_typed_records(path: Path):
