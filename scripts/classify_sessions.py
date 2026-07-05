@@ -221,17 +221,17 @@ def _iter_typed_records(
     ledger_field: Callable[..., object] = _ledger_field,
 ):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
-    hoisted_ledger_field = ledger_field
+    hoisted = ledger_field
     for idx, rec in enumerate(_iter_records(path)):
         if not isinstance(rec, dict):
             continue
-        rtype = hoisted_ledger_field(rec, "type")
+        rtype = hoisted(rec, "type")
         if rtype not in ("user", "assistant"):
             continue
-        msg = hoisted_ledger_field(rec, "message")
+        msg = hoisted(rec, "message")
         if not isinstance(msg, dict):
             continue
-        content = hoisted_ledger_field(msg, "content")
+        content = hoisted(msg, "content")
         if not isinstance(rtype, str):
             continue
         yield idx, rtype, content
