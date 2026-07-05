@@ -213,24 +213,28 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
         _record_tool_use_without_rescanning(evidence, idx, block, ledger_field=hoisted)
 
 
-def _classifiable_turn_role_and_content(rec: object) -> tuple[str, object] | None:
+def _classifiable_turn_role_and_content(
+    rec: object,
+    *,
+    ledger_field: Callable[..., object] = _ledger_field,
+) -> tuple[str, object] | None:
     """Return (role, content) only for records shaped like user/assistant turns."""
-    hoisted = _ledger_field
     if not isinstance(rec, dict):
         return None
-    rtype = hoisted(rec, "type")
+    rtype = ledger_field(rec, "type")
     if not isinstance(rtype, str) or rtype not in ("user", "assistant"):
         return None
-    msg = hoisted(rec, "message")
+    msg = ledger_field(rec, "message")
     if not isinstance(msg, dict):
         return None
-    return rtype, hoisted(msg, "content")
+    return rtype, ledger_field(msg, "content")
 
 
 def _iter_typed_records(path: Path):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
+    hoisted = _ledger_field
     for idx, rec in enumerate(_iter_records(path)):
-        turn = _classifiable_turn_role_and_content(rec)
+        turn = _classifiable_turn_role_and_content(rec, ledger_field=hoisted)
         if turn is None:
             continue
         rtype, content = turn
