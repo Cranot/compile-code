@@ -233,8 +233,9 @@ def _classifiable_turn_role_and_content(
 
 def _iter_typed_records(path: Path):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
+    hoisted = _ledger_field
     for idx, rec in enumerate(_iter_records(path)):
-        turn = _classifiable_turn_role_and_content(rec)
+        turn = _classifiable_turn_role_and_content(rec, ledger_field=hoisted)
         if turn is None:
             continue
         rtype, content = turn
