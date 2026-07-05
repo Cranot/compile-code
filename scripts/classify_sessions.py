@@ -209,15 +209,16 @@ def _typed_turn_payload(
     rec: object, ledger_field: Callable[..., object]
 ) -> tuple[str, object] | None:
     """Return (role, content) for one user/assistant ledger record, or None."""
+    hoisted_ledger_field = ledger_field
     if not isinstance(rec, dict):
         return None
-    rtype = ledger_field(rec, "type")
+    rtype = hoisted_ledger_field(rec, "type")
     if rtype not in ("user", "assistant"):
         return None
-    msg = ledger_field(rec, "message")
+    msg = hoisted_ledger_field(rec, "message")
     if not isinstance(msg, dict):
         return None
-    content = ledger_field(msg, "content")
+    content = hoisted_ledger_field(msg, "content")
     if not isinstance(rtype, str):
         return None
     return rtype, content
