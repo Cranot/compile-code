@@ -205,33 +205,22 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
         _record_tool_use_without_rescanning(evidence, idx, block)
 
 
-def _typed_turn_payload(
-    rec: object, ledger_field: Callable[..., object]
-) -> tuple[str, object] | None:
-    """Return (role, content) for one user/assistant ledger record, or None."""
-    hoisted_ledger_field = ledger_field
-    if not isinstance(rec, dict):
-        return None
-    rtype = hoisted_ledger_field(rec, "type")
-    if rtype not in ("user", "assistant"):
-        return None
-    msg = hoisted_ledger_field(rec, "message")
-    if not isinstance(msg, dict):
-        return None
-    content = hoisted_ledger_field(msg, "content")
-    if not isinstance(rtype, str):
-        return None
-    return rtype, content
-
-
 def _iter_typed_records(path: Path):
     """Yield (index, role, content) for each user/assistant turn in a ledger."""
     hoisted_ledger_field = _ledger_field
     for idx, rec in enumerate(_iter_records(path)):
-        payload = _typed_turn_payload(rec, hoisted_ledger_field)
-        if payload is not None:
-            rtype, content = payload
-            yield idx, rtype, content
+        if not isinstance(rec, dict):
+            continue
+        rtype = hoisted_ledger_field(rec, "type")
+        if rtype not in ("user", "assistant"):
+            continue
+        msg = hoisted_ledger_field(rec, "message")
+        if not isinstance(msg, dict):
+            continue
+        content = hoisted_ledger_field(msg, "content")
+        if not isinstance(rtype, str):
+            continue
+        yield idx, rtype, content
 
 
 def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
