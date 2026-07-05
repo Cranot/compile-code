@@ -222,14 +222,12 @@ def _iter_typed_records(path: Path):
         if not isinstance(rec, dict):
             continue
         rtype = hoisted(rec, "type")
-        if rtype not in ("user", "assistant"):
+        if not isinstance(rtype, str) or rtype not in ("user", "assistant"):
             continue
         msg = hoisted(rec, "message")
         if not isinstance(msg, dict):
             continue
         content = hoisted(msg, "content")
-        if not isinstance(rtype, str):
-            continue
         yield idx, rtype, content
 
 
