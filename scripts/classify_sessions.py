@@ -143,14 +143,14 @@ def _iter_records(path: Path):
         return
 
 
-def _tool_result_block_to_searchable_evidence(block: object) -> tuple[object, tuple[bool, str]] | None:
+def _tool_result_block_to_searchable_evidence(
+    block: object, *, hoisted: Callable[..., object]
+) -> tuple[object, tuple[bool, str]] | None:
     """Return one tool_result block as searchable retry evidence, or None."""
-    hoisted = _ledger_field
-    hoisted_tool_result_body_preserves_searchable_text = _tool_result_body_preserves_searchable_text
     if not isinstance(block, dict) or hoisted(block, "type") != "tool_result":
         return None
     raw = hoisted(block, "content")
-    body = hoisted_tool_result_body_preserves_searchable_text(raw)
+    body = _tool_result_body_preserves_searchable_text(raw)
     return hoisted(block, "tool_use_id"), (bool(hoisted(block, "is_error")), body)
 
 
@@ -161,8 +161,9 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
         evidence.prompts.append((idx, text))
     if not isinstance(content, list):
         return
+    hoisted = _ledger_field
     for block in content:
-        item = _tool_result_block_to_searchable_evidence(block)
+        item = _tool_result_block_to_searchable_evidence(block, hoisted=hoisted)
         if item is not None:
             tool_use_id, result = item
             evidence.results[tool_use_id] = result
