@@ -358,16 +358,16 @@ def _gather(paths: list[Path]) -> list[Path]:
     return files
 
 
-def _ordered_ledgers(files: list[Path], limit: int) -> list[Path]:
-    """Return files in deterministic order while bounding work to the cap.
+def _capped_ledgers(files: list[Path], limit: int) -> list[Path]:
+    """Bound files to a cap using direct selection.
 
-    Trade-off: total deterministic order vs. bounded selection work.
+    Trade-off: deterministic capped selection vs. pass-through iteration.
     When a cap is given we need only the `limit` smallest paths, so
-    direct-select with heapq.nsmallest avoids a full sort. Uncapped, every
-    file is processed and the total order is what we pay for."""
+    direct-select with heapq.nsmallest avoids a full sort. Uncapped, the
+    caller only iterates, so we return the input unchanged."""
     if limit > 0:
         return heapq.nsmallest(limit, files)
-    return sorted(files)
+    return files
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -381,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _ordered_ledgers(_gather(ns.paths), ns.limit)
+    files = _capped_ledgers(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
