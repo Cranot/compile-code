@@ -358,6 +358,15 @@ def _gather(paths: list[Path]) -> list[Path]:
     return files
 
 
+def _ordered_ledgers(files: list[Path], limit: int) -> list[Path]:
+    """Deterministic scan order: a cap needs only the `limit` smallest paths,
+    so avoid a full sort; uncapped, every file is processed and the total
+    order is what we pay for."""
+    if limit:
+        return heapq.nsmallest(limit, files)
+    return sorted(files)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -369,11 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _gather(ns.paths)
-    if ns.limit:
-        files = heapq.nsmallest(ns.limit, files)
-    else:
-        files = sorted(files)
+    files = _ordered_ledgers(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
