@@ -214,25 +214,29 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
         _record_tool_use_without_rescanning(evidence, idx, block, hoisted=hoisted)
 
 
-def _iter_typed_records(path: Path, *, hoisted: Callable[..., object]):
-    """Yield (index, role, content) for each user/assistant turn in a ledger."""
+def _iter_typed_records(path: Path):
+    """Yield (index, role, content) for each user/assistant turn in a ledger.
+
+    Field reads are inline subscripts (the ``_ledger_field`` idiom) because the
+    per-record lookups can never be hoisted — only a callee binding could be,
+    and routing them through one just recreates an invariant call in the loop.
+    """
     for idx, rec in enumerate(_iter_records(path)):
         if not isinstance(rec, dict):
             continue
-        rtype = hoisted(rec, "type")
-        if not isinstance(rtype, str) or rtype not in ("user", "assistant"):
+        rtype = rec["type"] if "type" in rec else None
+        if rtype not in ("user", "assistant"):
             continue
-        msg = hoisted(rec, "message")
+        msg = rec["message"] if "message" in rec else None
         if not isinstance(msg, dict):
             continue
-        yield idx, rtype, hoisted(msg, "content")
+        yield idx, rtype, msg["content"] if "content" in msg else None
 
 
 def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
     """Preserve one-pass ledger scanning while separating retry evidence rules."""
     evidence = SessionEvidence()
-    hoisted = _ledger_field
-    for idx, rtype, content in _iter_typed_records(path, hoisted=hoisted):
+    for idx, rtype, content in _iter_typed_records(path):
         if rtype == "user":
             _index_user_turn_for_retry_evidence(evidence, idx, content)
         else:
