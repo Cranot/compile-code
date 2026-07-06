@@ -413,17 +413,29 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 0
 
+    _print_prose_report(sessions, flagged, bucket_totals, retry_clusters, ns.top)
+    return 0
+
+
+def _print_prose_report(
+    sessions: list[dict[str, object]],
+    flagged: list[dict[str, object]],
+    bucket_totals: dict[str, int],
+    retry_clusters: dict[str, list[str]],
+    top: int,
+) -> None:
+    """Emit the human-readable report for the CLI."""
     print(f"[classify] scanned {len(sessions)} session ledger(s); {len(flagged)} retry-like (compiler miss).")
     print("[classify] bucket hits:")
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
     if retry_clusters:
-        ranked = heapq.nlargest(ns.top, retry_clusters.items(), key=lambda kv: len(kv[1]))
+        ranked = heapq.nlargest(top, retry_clusters.items(), key=lambda kv: len(kv[1]))
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
-    print(f"[classify] top {min(ns.top, len(flagged))} retry-like session(s):")
-    for s in heapq.nlargest(ns.top, flagged, key=lambda s: sum(s["buckets"].values())):
+    print(f"[classify] top {min(top, len(flagged))} retry-like session(s):")
+    for s in heapq.nlargest(top, flagged, key=lambda s: sum(s["buckets"].values())):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
         for cmd, n in heapq.nlargest(2, s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1]):
@@ -432,7 +444,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
-    return 0
 
 
 if __name__ == "__main__":
