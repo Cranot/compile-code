@@ -80,7 +80,7 @@ def _ledger_field(obj: dict[str, object], key: str, default: object = None) -> o
     return obj[key] if key in obj else default
 
 
-def _ledger_str_field(obj: dict[str, object], key: str, hoisted: Callable[..., object] = _ledger_field) -> str:
+def _ledger_str_field(obj: dict[str, object], key: str, hoisted: Callable[..., object]) -> str:
     value = hoisted(obj, key, "")
     return value if isinstance(value, str) else ""
 
@@ -169,7 +169,7 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
 
 
 def _retry_key_preserving_single_pass_tool_evidence(
-    block: dict[str, object], hoisted: Callable[..., object] = _ledger_field
+    block: dict[str, object], hoisted: Callable[..., object]
 ) -> tuple[str, str] | None:
     """Return the retry-evidence bucket/key for Bash and Read tool calls."""
     name = hoisted(block, "name")
@@ -187,7 +187,7 @@ def _record_tool_use_without_rescanning(
     idx: int,
     block: dict[str, object],
     *,
-    hoisted: Callable[..., object] = _ledger_field,
+    hoisted: Callable[..., object],
 ) -> None:
     """Record retry evidence for one tool call while preserving the ledger scan."""
     retry_key = _retry_key_preserving_single_pass_tool_evidence(block, hoisted)
