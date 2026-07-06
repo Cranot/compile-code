@@ -365,7 +365,7 @@ def _ordered_ledgers(files: list[Path], limit: int) -> list[Path]:
     When a cap is given we need only the `limit` smallest paths, so
     direct-select with heapq.nsmallest avoids a full sort. Uncapped, every
     file is processed and the total order is what we pay for."""
-    if limit:
+    if limit > 0:
         return heapq.nsmallest(limit, files)
     return sorted(files)
 
