@@ -80,8 +80,8 @@ def _ledger_field(obj: dict[str, object], key: str, default: object = None) -> o
     return obj[key] if key in obj else default
 
 
-def _ledger_str_field(obj: dict[str, object], key: str, ledger_field: Callable[..., object] = _ledger_field) -> str:
-    value = ledger_field(obj, key, "")
+def _ledger_str_field(obj: dict[str, object], key: str, hoisted: Callable[..., object] = _ledger_field) -> str:
+    value = hoisted(obj, key, "")
     return value if isinstance(value, str) else ""
 
 
@@ -169,16 +169,16 @@ def _index_user_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, con
 
 
 def _retry_key_preserving_single_pass_tool_evidence(
-    block: dict[str, object], ledger_field: Callable[..., object] = _ledger_field
+    block: dict[str, object], hoisted: Callable[..., object] = _ledger_field
 ) -> tuple[str, str] | None:
     """Return the retry-evidence bucket/key for Bash and Read tool calls."""
-    name = ledger_field(block, "name")
-    inp = ledger_field(block, "input", {})
+    name = hoisted(block, "name")
+    inp = hoisted(block, "input", {})
     input_obj = inp if isinstance(inp, dict) else {}
     if name == "Bash":
-        return "bash", _ledger_str_field(input_obj, "command", ledger_field)
+        return "bash", _ledger_str_field(input_obj, "command", hoisted)
     if name == "Read":
-        return "read", _ledger_str_field(input_obj, "file_path", ledger_field)
+        return "read", _ledger_str_field(input_obj, "file_path", hoisted)
     return None
 
 
@@ -187,10 +187,10 @@ def _record_tool_use_without_rescanning(
     idx: int,
     block: dict[str, object],
     *,
-    ledger_field: Callable[..., object] = _ledger_field,
+    hoisted: Callable[..., object] = _ledger_field,
 ) -> None:
     """Record retry evidence for one tool call while preserving the ledger scan."""
-    retry_key = _retry_key_preserving_single_pass_tool_evidence(block, ledger_field)
+    retry_key = _retry_key_preserving_single_pass_tool_evidence(block, hoisted)
     if retry_key is None:
         return
     bucket, key = retry_key
@@ -199,7 +199,7 @@ def _record_tool_use_without_rescanning(
     else:
         evidence.read_keys.append((idx, key))
     if key:
-        evidence.tool_uses[ledger_field(block, "id")] = (idx, key)
+        evidence.tool_uses[hoisted(block, "id")] = (idx, key)
 
 
 def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int, content: object) -> None:
@@ -210,7 +210,7 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
     for block in content:
         if not isinstance(block, dict) or hoisted(block, "type") != "tool_use":
             continue
-        _record_tool_use_without_rescanning(evidence, idx, block, ledger_field=hoisted)
+        _record_tool_use_without_rescanning(evidence, idx, block, hoisted=hoisted)
 
 
 def _classifiable_turn_role_and_content(
