@@ -359,9 +359,12 @@ def _gather(paths: list[Path]) -> list[Path]:
 
 
 def _ordered_ledgers(files: list[Path], limit: int) -> list[Path]:
-    """Deterministic scan order: a cap needs only the `limit` smallest paths,
-    so avoid a full sort; uncapped, every file is processed and the total
-    order is what we pay for."""
+    """Return files in deterministic order while bounding work to the cap.
+
+    Trade-off: total deterministic order vs. bounded selection work.
+    When a cap is given we need only the `limit` smallest paths, so
+    direct-select with heapq.nsmallest avoids a full sort. Uncapped, every
+    file is processed and the total order is what we pay for."""
     if limit:
         return heapq.nsmallest(limit, files)
     return sorted(files)
