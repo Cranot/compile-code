@@ -347,14 +347,14 @@ def _gather(paths: list[Path]) -> list[Path]:
         files: list[Path] = []
         for p in paths:
             if p.is_dir():
-                files.extend(sorted(p.rglob("*.jsonl")))
+                files.extend(p.rglob("*.jsonl"))
             elif p.suffix == ".jsonl":
                 files.append(p)
         return files
     files = []
     for d in _default_scan_dirs():
         if d.is_dir():
-            files.extend(sorted(d.rglob("*.jsonl")))
+            files.extend(d.rglob("*.jsonl"))
     return files
 
 
@@ -371,7 +371,9 @@ def main(argv: list[str] | None = None) -> int:
 
     files = _gather(ns.paths)
     if ns.limit:
-        files = files[: ns.limit]
+        files = heapq.nsmallest(ns.limit, files)
+    else:
+        files = sorted(files)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
