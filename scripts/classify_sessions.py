@@ -359,15 +359,14 @@ def _gather(paths: list[Path]) -> list[Path]:
 
 
 def _capped_ledgers(files: list[Path], limit: int) -> list[Path]:
-    """Bound files to a cap using direct selection.
+    """Return the `limit` smallest paths, or all paths if no cap is requested.
 
-    Trade-off: deterministic capped selection vs. pass-through iteration.
-    When a cap is given we need only the `limit` smallest paths, so
-    direct-select with heapq.nsmallest avoids a full sort. Uncapped, the
-    caller only iterates, so we return the input unchanged."""
-    if limit > 0:
-        return heapq.nsmallest(limit, files)
-    return files
+    Conservation law: deterministic bounded selection costs O(n log k),
+    but when no cap is requested the caller only iterates, so we avoid
+    paying O(n log n) for a full sort and preserve the input order."""
+    if limit <= 0:
+        return files
+    return heapq.nsmallest(limit, files)
 
 
 def main(argv: list[str] | None = None) -> int:
