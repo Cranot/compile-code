@@ -216,7 +216,7 @@ def _index_assistant_turn_for_retry_evidence(evidence: SessionEvidence, idx: int
 def _classifiable_turn_role_and_content(
     rec: object,
     *,
-    hoisted: Callable[..., object] = _ledger_field,
+    hoisted: Callable[..., object],
 ) -> tuple[str, object] | None:
     """Return (role, content) only for records shaped like user/assistant turns."""
     if not isinstance(rec, dict):
