@@ -39,7 +39,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -131,16 +131,28 @@ def _iter_records(path: Path):
     """Yield parsed JSON records from a session ledger, skipping bad lines."""
     try:
         with path.open(encoding="utf-8", errors="ignore") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            yield from _parse_json_lines(fh)
     except OSError:
         return
+
+
+def _parse_json_lines(lines: Iterable[str]):
+    """Yield parsed records from an iterable of ledger lines."""
+    for line in lines:
+        rec = _try_load_json_line(line)
+        if rec is not None:
+            yield rec
+
+
+def _try_load_json_line(line: str) -> object | None:
+    """Parse one stripped ledger line, returning None for blanks or bad JSON."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
 
 
 def _tool_result_block_to_searchable_evidence(
@@ -222,15 +234,22 @@ def _iter_typed_records(path: Path):
     and routing them through one just recreates an invariant call in the loop.
     """
     for idx, rec in enumerate(_iter_records(path)):
-        if not isinstance(rec, dict):
-            continue
-        rtype = rec["type"] if "type" in rec else None
-        if rtype not in ("user", "assistant"):
-            continue
-        msg = rec["message"] if "message" in rec else None
-        if not isinstance(msg, dict):
-            continue
-        yield idx, rtype, msg["content"] if "content" in msg else None
+        turn = _as_typed_turn(rec)
+        if turn is not None:
+            yield idx, *turn
+
+
+def _as_typed_turn(rec: object) -> tuple[str, object] | None:
+    """Return (role, content) for a user/assistant record, or None."""
+    if not isinstance(rec, dict):
+        return None
+    rtype = rec["type"] if "type" in rec else None
+    if rtype not in ("user", "assistant"):
+        return None
+    msg = rec["message"] if "message" in rec else None
+    if not isinstance(msg, dict):
+        return None
+    return rtype, msg["content"] if "content" in msg else None
 
 
 def _collect_retry_evidence_in_one_scan(path: Path) -> SessionEvidence:
