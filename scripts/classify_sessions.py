@@ -393,8 +393,8 @@ def _limit_requires_bounded_discovery(limit: int) -> bool:
     return limit > 0
 
 
-def _materialize_scan_paths_in_global_order(files: Iterable[Path]) -> list[Path]:
-    """Return all discovered paths in deterministic global order."""
+def _materialize_uncapped_scan_paths_in_global_order(files: Iterable[Path]) -> list[Path]:
+    """Return all discovered paths in deterministic order for uncapped scans."""
     return sorted(files)
 
 
@@ -408,7 +408,7 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
     in deterministic global order.
     """
     if not _limit_requires_bounded_discovery(limit):
-        return _materialize_scan_paths_in_global_order(files)
+        return _materialize_uncapped_scan_paths_in_global_order(files)
     return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
 
 
