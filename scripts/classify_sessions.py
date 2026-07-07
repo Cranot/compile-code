@@ -383,14 +383,9 @@ def _iter_scan_paths_for_limited_discovery(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _direct_select_scan_paths_to_preserve_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return the first discovered scan paths without consuming the whole tree."""
-    return list(islice(files, limit))
-
-
-def _limit_requires_bounded_discovery(limit: int) -> bool:
-    """Return True when ``--limit`` must stop discovery before exhausting files."""
-    return limit > 0
+def _islice_stop_to_preserve_limit_semantics(limit: int) -> int | None:
+    """Return the direct-selection stop while preserving ``--limit=0`` as uncapped."""
+    return limit if limit > 0 else None
 
 
 def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
@@ -398,12 +393,10 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
 
     Conservation law: deterministic global ordering trades off against bounded
     discovery work. This scanner favors bounded work and first-discovered
-    order: capped scans use direct selection (``islice``), and uncapped scans
-    materialize the same stream without imposing a full-tree sort.
+    order: capped and uncapped scans both use direct selection (``islice``),
+    with an open-ended stop for the uncapped case instead of a full-tree sort.
     """
-    if _limit_requires_bounded_discovery(limit):
-        return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
-    return list(files)
+    return list(islice(files, _islice_stop_to_preserve_limit_semantics(limit)))
 
 
 def main(argv: list[str] | None = None) -> int:
