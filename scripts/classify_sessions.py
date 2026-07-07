@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from heapq import nlargest
 from itertools import islice
 from pathlib import Path
+from typing import TypeVar
 
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
 # must clean up. Kept broad on purpose: this repo's gate is check.py, the
@@ -63,6 +64,7 @@ def _command_contains_verify_signal(cmd: str) -> bool:
 
 
 BUCKETS = ("repeated_tool_use", "repeated_prompt", "verify_fail_aftermath")
+_T = TypeVar("_T")
 
 
 @dataclass
@@ -410,9 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_scan_paths_to_keep_limit_a_discovery_cap(
-        _iter_scan_paths_for_limited_discovery(ns.paths), ns.limit
-    )
+    files = _select_scan_paths_to_keep_limit_a_discovery_cap(_iter_scan_paths_for_limited_discovery(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
@@ -452,11 +452,16 @@ def _retry_cluster_size(item: tuple[str, list[str]]) -> int:
     return len(item[1])
 
 
-def _direct_select_retry_clusters_to_bound_report_work(
-    retry_clusters: dict[str, list[str]], top: int
-) -> list[tuple[str, list[str]]]:
-    """Return visible retry clusters without fully ordering every cluster."""
-    return nlargest(top, retry_clusters.items(), key=_retry_cluster_size)
+def _direct_select_top_rows_to_keep_report_work_bounded(
+    items: Iterable[_T], top: int, key: Callable[[_T], int]
+) -> list[_T]:
+    """Return visible report rows without fully ordering every candidate.
+
+    Conservation law: deterministic global ordering trades off against bounded
+    report work. Top-N direct selection keeps ``--top`` proportional to the rows
+    shown instead of sorting all candidates before slicing.
+    """
+    return nlargest(top, items, key=key)
 
 
 def _session_retry_signal_count(session: dict[str, object]) -> int:
@@ -464,21 +469,9 @@ def _session_retry_signal_count(session: dict[str, object]) -> int:
     return sum(session["buckets"].values())
 
 
-def _direct_select_retry_sessions_to_bound_report_work(
-    flagged: list[dict[str, object]], top: int
-) -> list[dict[str, object]]:
-    """Return visible retry-like sessions without fully ordering every session."""
-    return nlargest(top, flagged, key=_session_retry_signal_count)
-
-
 def _repeat_count(item: tuple[str, int]) -> int:
     """Return the ranking signal for repeated command/read rows."""
     return item[1]
-
-
-def _direct_select_repeat_rows_to_bound_report_work(counts: dict[str, int], top: int) -> list[tuple[str, int]]:
-    """Return visible repeat rows without fully ordering every repeated item."""
-    return nlargest(top, counts.items(), key=_repeat_count)
 
 
 def _report_bound_preserves_direct_selection(top: int) -> int:
@@ -500,17 +493,23 @@ def _print_prose_report(
         print(f"  {b:22s} {bucket_totals[b]}")
     visible_top = _report_bound_preserves_direct_selection(top)
     if retry_clusters:
-        ranked = _direct_select_retry_clusters_to_bound_report_work(retry_clusters, visible_top)
+        ranked = _direct_select_top_rows_to_keep_report_work_bounded(
+            retry_clusters.items(), visible_top, _retry_cluster_size
+        )
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
     print(f"[classify] top {min(visible_top, len(flagged))} retry-like session(s):")
-    for s in _direct_select_retry_sessions_to_bound_report_work(flagged, visible_top):
+    for s in _direct_select_top_rows_to_keep_report_work_bounded(flagged, visible_top, _session_retry_signal_count):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
-        for cmd, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["bash_repeats"], min(2, visible_top)):
+        for cmd, n in _direct_select_top_rows_to_keep_report_work_bounded(
+            s["counts"]["bash_repeats"].items(), min(2, visible_top), _repeat_count
+        ):
             print(f"        bash x{n}: {cmd[:70]}")
-        for fp, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["read_repeats"], min(2, visible_top)):
+        for fp, n in _direct_select_top_rows_to_keep_report_work_bounded(
+            s["counts"]["read_repeats"].items(), min(2, visible_top), _repeat_count
+        ):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
