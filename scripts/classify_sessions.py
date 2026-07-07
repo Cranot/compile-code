@@ -467,6 +467,11 @@ def _direct_select_repeat_rows_to_bound_report_work(counts: dict[str, int], top:
     return nlargest(top, counts.items(), key=_repeat_count)
 
 
+def _report_bound_preserves_direct_selection(top: int) -> int:
+    """Return a nonnegative report cap so top-N selection stays bounded."""
+    return max(0, top)
+
+
 def _print_prose_report(
     sessions: list[dict[str, object]],
     flagged: list[dict[str, object]],
@@ -479,18 +484,19 @@ def _print_prose_report(
     print("[classify] bucket hits:")
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
+    visible_top = _report_bound_preserves_direct_selection(top)
     if retry_clusters:
-        ranked = _direct_select_retry_clusters_to_bound_report_work(retry_clusters, top)
+        ranked = _direct_select_retry_clusters_to_bound_report_work(retry_clusters, visible_top)
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
-    print(f"[classify] top {min(top, len(flagged))} retry-like session(s):")
-    for s in _direct_select_retry_sessions_to_bound_report_work(flagged, top):
+    print(f"[classify] top {min(visible_top, len(flagged))} retry-like session(s):")
+    for s in _direct_select_retry_sessions_to_bound_report_work(flagged, visible_top):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
-        for cmd, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["bash_repeats"], 2):
+        for cmd, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["bash_repeats"], min(2, visible_top)):
             print(f"        bash x{n}: {cmd[:70]}")
-        for fp, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["read_repeats"], 2):
+        for fp, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["read_repeats"], min(2, visible_top)):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
