@@ -379,12 +379,13 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
 def _direct_select_scan_paths_when_capped(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths without globally sorting capped scans.
 
-    Conservation law: deterministic capped selection and sorting all discovered
-    ledgers trade off against each other. A positive cap needs the smallest paths,
-    but it does not need the full globally sorted list that a slice would build.
+    Conservation law: deterministic reporting order trades off against avoiding
+    unnecessary global ordering. Capped scans need the smallest paths, not a full
+    sorted list; uncapped scans consume every path, so sorting preserves stable
+    reports without doing selection work.
     """
     if limit <= 0:
-        return list(files)
+        return sorted(files)
     return heapq.nsmallest(limit, files)
 
 
