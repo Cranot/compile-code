@@ -385,11 +385,16 @@ def _select_scan_paths_to_bound_capped_work(files: Iterable[Path], limit: int) -
     without pretending to be selection.
     """
     if limit <= 0:
-        return sorted(files)
-    return _direct_select_scan_paths_to_keep_capped_work_bounded(files, limit)
+        return _order_all_scan_paths_for_stable_uncapped_reports(files)
+    return _direct_select_capped_scan_paths_to_keep_startup_bounded(files, limit)
 
 
-def _direct_select_scan_paths_to_keep_capped_work_bounded(files: Iterable[Path], limit: int) -> list[Path]:
+def _order_all_scan_paths_for_stable_uncapped_reports(files: Iterable[Path]) -> list[Path]:
+    """Return every scan path in stable report order when no cap is applied."""
+    return sorted(files)
+
+
+def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
     """Return the deterministic capped subset without sorting every path."""
     return nsmallest(limit, files)
 
