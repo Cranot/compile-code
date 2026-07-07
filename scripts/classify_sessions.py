@@ -34,7 +34,6 @@ touches the product: it reads ledgers only and prints a summary.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 import os
 import re
@@ -43,6 +42,7 @@ from collections.abc import Callable, Iterable
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from heapq import nlargest
+from itertools import islice
 from pathlib import Path
 
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
@@ -379,7 +379,7 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
 
 def _direct_select_scan_prefix_to_bound_discovery_work(files: Iterable[Path], limit: int) -> list[Path]:
     """Return the first ``limit`` paths without scanning the whole ledger tree."""
-    return list(itertools.islice(files, limit))
+    return list(islice(files, limit))
 
 
 def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: int) -> list[Path]:
