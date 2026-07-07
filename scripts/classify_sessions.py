@@ -392,7 +392,7 @@ def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Pat
     Conservation law: deterministic reporting order trades off against bounded
     startup work. Capped scans need the smallest paths, not a full sorted list.
     """
-    return nsmallest(limit, files)
+    return nsmallest(limit, iter(files))
 
 
 def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
