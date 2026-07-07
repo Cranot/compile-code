@@ -371,7 +371,13 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
 
 
 def _gather(paths: list[Path]) -> Iterable[Path]:
-    """Yield CLI-resolved .jsonl files, or fall back to default scan dirs."""
+    """Yield CLI-resolved .jsonl files, or fall back to default scan dirs.
+
+    Conservation law: deterministic global ordering trades off against bounded
+    discovery work. Paths are yielded in filesystem discovery order (no full
+    sort), so a caller that only needs the first N can cap with ``islice``
+    instead of sorting the entire tree.
+    """
     sources = paths if paths else _default_scan_dirs()
     for p in sources:
         yield from _expand_jsonl_source(p)
