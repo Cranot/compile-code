@@ -362,11 +362,12 @@ def _select_ledgers_without_global_sort(files: list[Path], limit: int) -> list[P
     """Return the `limit` smallest paths, or all paths if no cap is requested.
 
     Conservation law: total deterministic order and work-efficient selection
-    cannot both be maximized. When capped we need only the `limit` smallest
-    paths, so direct-select with heapq.nsmallest gives bounded order for
-    O(n log k). When uncapped the caller only iterates, so we preserve the
-    input order and avoid paying O(n log n) for a full sort."""
-    if limit <= 0:
+    cannot both be maximized. When the cap is binding we need only the
+    `limit` smallest paths, so direct-select with heapq.nsmallest gives
+    bounded order for O(n log k). When uncapped or the cap covers every file,
+    the caller only iterates, so we preserve the input order and avoid paying
+    O(n log n) for a full sort."""
+    if limit <= 0 or limit >= len(files):
         return files
     return heapq.nsmallest(limit, files)
 
