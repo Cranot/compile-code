@@ -386,10 +386,9 @@ def _bound_ledger_scan_work(files: list[Path], limit: int) -> list[Path]:
     `limit` smallest paths, so direct-select with heapq.nsmallest gives
     bounded order for O(n log k). When the scan is uncapped, the caller only
     iterates, so we preserve the input order and avoid paying O(n log n) for a
-    full sort."""
-    if limit <= 0:
-        return files
-    if limit >= len(files):
+    full sort.
+    """
+    if limit <= 0 or limit >= len(files):
         return files
     return heapq.nsmallest(limit, files)
 
