@@ -34,6 +34,7 @@ touches the product: it reads ledgers only and prints a summary.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import re
@@ -387,17 +388,20 @@ def _direct_select_scan_prefix_to_bound_startup_work(files: Iterable[Path], limi
 
 
 def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while keeping capped startup work bounded.
+    """Return scan paths while avoiding global sort work unless the cap binds.
 
-    Conservation law: deterministic reporting order trades off against bounded
-    startup work. Only uncapped scans consume every file and pay for complete
-    ordering; capped scans direct-select the requested display prefix.
+    Conservation law: deterministic global ordering trades off against bounded
+    startup work. Uncapped and nonbinding capped scans keep discovery order;
+    binding capped scans direct-select the requested display prefix.
     """
     if limit <= 0:
-        # Uncapped: pay for complete ordering so reports are deterministic.
-        return sorted(files, key=_scan_path_key_preserves_display_order)
-    # Capped: bound startup work by direct-selecting the display prefix.
-    return _direct_select_scan_prefix_to_bound_startup_work(files, limit)
+        return list(files)
+    iterator = iter(files)
+    probe = list(itertools.islice(iterator, limit + 1))
+    if len(probe) <= limit:
+        return probe
+    # Capped and binding: bound startup work by direct-selecting the display prefix.
+    return _direct_select_scan_prefix_to_bound_startup_work(itertools.chain(probe, iterator), limit)
 
 
 def main(argv: list[str] | None = None) -> int:
