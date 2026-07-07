@@ -42,7 +42,7 @@ import sys
 from collections.abc import Callable, Iterable
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from heapq import nlargest, nsmallest
+from heapq import nlargest
 from pathlib import Path
 
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
@@ -377,32 +377,16 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _scan_path_key_preserves_display_order(path: Path) -> str:
-    """Return the path ordering key users see in reports."""
-    return str(path)
+def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return scan paths while keeping ``--limit`` a real discovery cap.
 
-
-def _direct_select_scan_prefix_to_bound_startup_work(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return the requested display prefix without sorting every path."""
-    return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
-
-
-def _select_scan_paths_to_balance_stable_reports_and_bounded_startup(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while avoiding global sort work.
-
-    Conservation law: deterministic report order trades off against bounded
-    startup work. Whole-set scans (uncapped or nonbinding capped) keep
-    discovery order because every path must be processed anyway; binding capped
-    scans direct-select the requested display prefix to bound filesystem work.
+    Conservation law: deterministic global ordering trades off against bounded
+    discovery work. A binding limit cannot provide both, so capped scans keep
+    the first discovered paths and avoid consuming the rest of the ledger tree.
     """
     if limit <= 0:
         return list(files)
-    iterator = iter(files)
-    probe = list(itertools.islice(iterator, limit + 1))
-    if len(probe) <= limit:
-        return probe
-    # Capped and binding: bound startup work by direct-selecting the display prefix.
-    return _direct_select_scan_prefix_to_bound_startup_work(itertools.chain(probe, iterator), limit)
+    return list(itertools.islice(files, limit))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -416,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_scan_paths_to_balance_stable_reports_and_bounded_startup(_gather(ns.paths), ns.limit)
+    files = _select_scan_paths_to_keep_limit_a_work_cap(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
