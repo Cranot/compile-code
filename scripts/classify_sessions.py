@@ -377,6 +377,11 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
+def _direct_select_scan_prefix_to_bound_discovery_work(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return the first ``limit`` paths without scanning the whole ledger tree."""
+    return list(itertools.islice(files, limit))
+
+
 def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths while keeping ``--limit`` a real discovery cap.
 
@@ -386,7 +391,7 @@ def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: in
     """
     if limit <= 0:
         return list(files)
-    return list(itertools.islice(files, limit))
+    return _direct_select_scan_prefix_to_bound_discovery_work(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
