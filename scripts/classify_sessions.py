@@ -446,6 +446,40 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _retry_cluster_size(item: tuple[str, list[str]]) -> int:
+    """Return the ranking signal for a prompt retry cluster."""
+    return len(item[1])
+
+
+def _direct_select_retry_clusters_to_bound_report_work(
+    retry_clusters: dict[str, list[str]], top: int
+) -> list[tuple[str, list[str]]]:
+    """Return visible retry clusters without fully ordering every cluster."""
+    return nlargest(top, retry_clusters.items(), key=_retry_cluster_size)
+
+
+def _session_retry_signal_count(session: dict[str, object]) -> int:
+    """Return the ranking signal for retry-like sessions."""
+    return sum(session["buckets"].values())
+
+
+def _direct_select_retry_sessions_to_bound_report_work(
+    flagged: list[dict[str, object]], top: int
+) -> list[dict[str, object]]:
+    """Return visible retry-like sessions without fully ordering every session."""
+    return nlargest(top, flagged, key=_session_retry_signal_count)
+
+
+def _repeat_count(item: tuple[str, int]) -> int:
+    """Return the ranking signal for repeated command/read rows."""
+    return item[1]
+
+
+def _direct_select_repeat_rows_to_bound_report_work(counts: dict[str, int], top: int) -> list[tuple[str, int]]:
+    """Return visible repeat rows without fully ordering every repeated item."""
+    return nlargest(top, counts.items(), key=_repeat_count)
+
+
 def _print_prose_report(
     sessions: list[dict[str, object]],
     flagged: list[dict[str, object]],
@@ -459,17 +493,17 @@ def _print_prose_report(
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
     if retry_clusters:
-        ranked = nlargest(top, retry_clusters.items(), key=lambda kv: len(kv[1]))
+        ranked = _direct_select_retry_clusters_to_bound_report_work(retry_clusters, top)
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
     print(f"[classify] top {min(top, len(flagged))} retry-like session(s):")
-    for s in nlargest(top, flagged, key=lambda s: sum(s["buckets"].values())):
+    for s in _direct_select_retry_sessions_to_bound_report_work(flagged, top):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
-        for cmd, n in nlargest(2, s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1]):
+        for cmd, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["bash_repeats"], 2):
             print(f"        bash x{n}: {cmd[:70]}")
-        for fp, n in nlargest(2, s["counts"]["read_repeats"].items(), key=lambda kv: kv[1]):
+        for fp, n in _direct_select_repeat_rows_to_bound_report_work(s["counts"]["read_repeats"], 2):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
