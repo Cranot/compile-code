@@ -389,7 +389,9 @@ def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], lim
     ordering; capped scans direct-select the requested display prefix.
     """
     if limit <= 0:
+        # Uncapped: pay for complete ordering so reports are deterministic.
         return sorted(files, key=_scan_path_key_preserves_display_order)
+    # Capped: bound startup work by direct-selecting the display prefix.
     return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
 
 
