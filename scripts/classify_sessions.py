@@ -370,19 +370,20 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _iter_scan_paths_preserving_discovery_cap(paths: list[Path]) -> Iterable[Path]:
+def _iter_scan_paths_for_limited_discovery(paths: list[Path]) -> Iterable[Path]:
     """Yield CLI-resolved .jsonl files lazily, or fall back to default scan dirs.
 
     Conservation law: deterministic global ordering trades off against bounded
-    discovery work. This iterator keeps discovery lazy so a caller that only
-    needs the first N paths can stop before walking the entire ledger tree.
+    discovery work. This iterator stays lazy so a caller can use direct
+    selection (``itertools.islice``) to stop after the first N paths instead of
+    walking the whole ledger tree and sorting it.
     """
     sources = paths if paths else _default_scan_dirs()
     for p in sources:
         yield from _expand_jsonl_source(p)
 
 
-def _direct_select_scan_paths_to_preserve_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
+def _direct_select_scan_paths(files: Iterable[Path], limit: int) -> list[Path]:
     """Return the first discovered scan paths without consuming the whole tree."""
     return list(islice(files, limit))
 
@@ -391,12 +392,13 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
     """Return scan paths while keeping ``--limit`` a real discovery cap.
 
     Conservation law: deterministic global ordering trades off against bounded
-    discovery work. A binding limit cannot provide both, so capped scans keep
-    the first discovered paths and avoid consuming the rest of the ledger tree.
+    discovery work. A binding limit cannot provide both, so capped scans use
+    direct selection (``islice``) to keep the first discovered paths without
+    fully sorting the ledger tree. Uncapped scans materialize the whole stream.
     """
     if limit <= 0:
         return list(files)
-    return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
+    return _direct_select_scan_paths(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -411,7 +413,7 @@ def main(argv: list[str] | None = None) -> int:
     ns = ap.parse_args(argv)
 
     files = _select_scan_paths_to_keep_limit_a_discovery_cap(
-        _iter_scan_paths_preserving_discovery_cap(ns.paths), ns.limit
+        _iter_scan_paths_for_limited_discovery(ns.paths), ns.limit
     )
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
