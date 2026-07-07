@@ -388,19 +388,19 @@ def _direct_select_scan_prefix_to_bound_startup_work(files: Iterable[Path], limi
 
 
 def _select_scan_paths_to_balance_stable_reports_and_bounded_startup(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while avoiding global sort work for capped scans.
+    """Return scan paths while avoiding global sort work.
 
-    Conservation law: stable report order trades off against bounded startup
-    work. Uncapped and nonbinding capped scans have already materialized the
-    full scan set; binding capped scans direct-select the requested display
-    prefix.
+    Conservation law: deterministic report order trades off against bounded
+    startup work. Whole-set scans (uncapped or nonbinding capped) keep
+    discovery order because every path must be processed anyway; binding capped
+    scans direct-select the requested display prefix to bound filesystem work.
     """
     if limit <= 0:
-        return sorted(files, key=_scan_path_key_preserves_display_order)
+        return list(files)
     iterator = iter(files)
     probe = list(itertools.islice(iterator, limit + 1))
     if len(probe) <= limit:
-        return sorted(probe, key=_scan_path_key_preserves_display_order)
+        return probe
     # Capped and binding: bound startup work by direct-selecting the display prefix.
     return _direct_select_scan_prefix_to_bound_startup_work(itertools.chain(probe, iterator), limit)
 
