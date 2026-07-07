@@ -395,11 +395,12 @@ def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Pat
     return nsmallest(limit, files)
 
 
-def _scan_paths_without_unbounded_capped_sort(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths using full stability only when no cap bounds the work.
+def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return scan paths while keeping capped startup work bounded.
 
     Conservation law: deterministic reporting order trades off against bounded
-    startup work, so only uncapped scans pay for complete ordering.
+    startup work. Only uncapped scans pay for complete ordering; capped scans
+    direct-select the requested prefix.
     """
     if limit <= 0:
         return _order_all_scan_paths_for_stable_uncapped_reports(files)
@@ -417,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _scan_paths_without_unbounded_capped_sort(_gather(ns.paths), ns.limit)
+    files = _select_scan_paths_to_keep_capped_startup_bounded(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
