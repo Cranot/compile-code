@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import heapq
-import itertools
 import json
 import os
 import re
@@ -380,18 +379,13 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
 def _direct_select_scan_paths_when_capped(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths without globally sorting capped scans.
 
-    Conservation law: total deterministic order and work-efficient selection
-    cannot both be maximized. Probe one past the cap so uncapped or nonbinding
-    scans keep discovery order; when the cap excludes records, direct-select
-    gives the `limit` smallest paths without paying for a global sort.
+    Conservation law: deterministic capped selection and sorting all discovered
+    ledgers trade off against each other. A positive cap needs the smallest paths,
+    but it does not need the full globally sorted list that a slice would build.
     """
     if limit <= 0:
         return list(files)
-    iterator = iter(files)
-    probe = list(itertools.islice(iterator, limit + 1))
-    if len(probe) <= limit:
-        return probe
-    return heapq.nsmallest(limit, itertools.chain(probe, iterator))
+    return heapq.nsmallest(limit, files)
 
 
 def main(argv: list[str] | None = None) -> int:
