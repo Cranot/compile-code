@@ -372,9 +372,15 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
 
 
 def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
-    """Preserve deterministic path selection without sorting every capped scan."""
+    """Return ledger paths without a full global sort.
+
+    Conservation law: deterministic global ordering trades off against bounded
+    discovery work. Capped scans preserve sorted-path semantics via direct
+    selection (``nsmallest``); uncapped scans accept the natural expansion
+    order so we do not sort the whole ledger tree just to iterate it.
+    """
     if limit <= 0:
-        return sorted(files, key=os.fspath)
+        return list(files)
     return nsmallest(limit, files, key=os.fspath)
 
 
