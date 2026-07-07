@@ -372,11 +372,6 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _direct_selection_stop_preserves_uncapped_limit(limit: int) -> int | None:
-    """Return the islice stop while keeping ``--limit=0`` uncapped."""
-    return limit if limit > 0 else None
-
-
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     """Resolve CLI paths to .jsonl files, capped by ``limit`` (0 = uncapped).
 
@@ -387,7 +382,7 @@ def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     """
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
-    return list(islice(files, _direct_selection_stop_preserves_uncapped_limit(limit)))
+    return list(islice(files, limit if limit > 0 else None))
 
 
 def main(argv: list[str] | None = None) -> int:
