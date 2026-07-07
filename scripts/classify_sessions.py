@@ -383,7 +383,7 @@ def _iter_scan_paths_for_limited_discovery(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _direct_select_scan_paths(files: Iterable[Path], limit: int) -> list[Path]:
+def _direct_select_scan_paths_to_preserve_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
     """Return the first discovered scan paths without consuming the whole tree."""
     return list(islice(files, limit))
 
@@ -398,7 +398,7 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
     """
     if limit <= 0:
         return list(files)
-    return _direct_select_scan_paths(files, limit)
+    return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
