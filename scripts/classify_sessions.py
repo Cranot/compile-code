@@ -34,7 +34,6 @@ touches the product: it reads ledgers only and prints a summary.
 from __future__ import annotations
 
 import argparse
-import heapq
 import json
 import os
 import re
@@ -42,6 +41,7 @@ import sys
 from collections.abc import Callable, Iterable
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from heapq import nlargest, nsmallest
 from pathlib import Path
 
 # Commands whose nonzero exit (or printed failure) is a verify signal the agent
@@ -376,17 +376,17 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _direct_select_scan_paths_when_capped(files: Iterable[Path], limit: int) -> list[Path]:
+def _select_scan_paths_to_bound_capped_work(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths without globally sorting capped scans.
 
-    Conservation law: deterministic reporting order trades off against avoiding
-    unnecessary global ordering. Capped scans need the smallest paths, not a full
-    sorted list; uncapped scans consume every path, so sorting preserves stable
-    reports without doing selection work.
+    Conservation law: deterministic reporting order trades off against bounded
+    startup work. Capped scans need the smallest paths, not a full sorted list;
+    uncapped scans consume every path, so sorting preserves stable reports
+    without pretending to be selection.
     """
     if limit <= 0:
         return sorted(files)
-    return heapq.nsmallest(limit, files)
+    return nsmallest(limit, files)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -400,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _direct_select_scan_paths_when_capped(_gather(ns.paths), ns.limit)
+    files = _select_scan_paths_to_bound_capped_work(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
@@ -448,17 +448,17 @@ def _print_prose_report(
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
     if retry_clusters:
-        ranked = heapq.nlargest(top, retry_clusters.items(), key=lambda kv: len(kv[1]))
+        ranked = nlargest(top, retry_clusters.items(), key=lambda kv: len(kv[1]))
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
     print(f"[classify] top {min(top, len(flagged))} retry-like session(s):")
-    for s in heapq.nlargest(top, flagged, key=lambda s: sum(s["buckets"].values())):
+    for s in nlargest(top, flagged, key=lambda s: sum(s["buckets"].values())):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
-        for cmd, n in heapq.nlargest(2, s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1]):
+        for cmd, n in nlargest(2, s["counts"]["bash_repeats"].items(), key=lambda kv: kv[1]):
             print(f"        bash x{n}: {cmd[:70]}")
-        for fp, n in heapq.nlargest(2, s["counts"]["read_repeats"].items(), key=lambda kv: kv[1]):
+        for fp, n in nlargest(2, s["counts"]["read_repeats"].items(), key=lambda kv: kv[1]):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
             print(f"        verify-fail: {s['counts']['verify_fails'][0]}")
