@@ -397,14 +397,13 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
     """Return scan paths while keeping ``--limit`` a real discovery cap.
 
     Conservation law: deterministic global ordering trades off against bounded
-    discovery work. A binding limit cannot provide both, so capped scans use
-    direct selection (``islice``) to keep the first discovered paths without
-    fully sorting the ledger tree. Uncapped scans materialize the whole stream
-    in deterministic global order.
+    discovery work. This scanner favors bounded work and first-discovered
+    order: capped scans use direct selection (``islice``), and uncapped scans
+    materialize the same stream without imposing a full-tree sort.
     """
-    if not _limit_requires_bounded_discovery(limit):
-        return sorted(files)
-    return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
+    if _limit_requires_bounded_discovery(limit):
+        return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
+    return list(files)
 
 
 def main(argv: list[str] | None = None) -> int:
