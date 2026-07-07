@@ -372,33 +372,17 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _iter_scan_paths_for_limited_discovery(paths: list[Path]) -> Iterable[Path]:
-    """Yield CLI-resolved .jsonl files lazily, or fall back to default scan dirs.
+def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
+    """Resolve CLI paths to .jsonl files, capped by ``limit`` (0 = uncapped).
 
     Conservation law: deterministic global ordering trades off against bounded
-    discovery work. This iterator stays lazy so a caller can use direct
-    selection (``itertools.islice``) to stop after the first N paths instead of
-    walking the whole ledger tree and sorting it.
+    discovery work. This scanner uses lazy expansion and direct selection
+    (``itertools.islice``) so ``--limit`` bounds the filesystem walk instead of
+    sorting the whole ledger tree before slicing.
     """
     sources = paths if paths else _default_scan_dirs()
-    for p in sources:
-        yield from _expand_jsonl_source(p)
-
-
-def _islice_stop_to_preserve_limit_semantics(limit: int) -> int | None:
-    """Return the direct-selection stop while preserving ``--limit=0`` as uncapped."""
-    return limit if limit > 0 else None
-
-
-def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while keeping ``--limit`` a real discovery cap.
-
-    Conservation law: deterministic global ordering trades off against bounded
-    discovery work. This scanner favors bounded work and first-discovered
-    order: capped and uncapped scans both use direct selection (``islice``),
-    with an open-ended stop for the uncapped case instead of a full-tree sort.
-    """
-    return list(islice(files, _islice_stop_to_preserve_limit_semantics(limit)))
+    files = (f for p in sources for f in _expand_jsonl_source(p))
+    return list(islice(files, limit if limit > 0 else None))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -412,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_scan_paths_to_keep_limit_a_discovery_cap(_iter_scan_paths_for_limited_discovery(ns.paths), ns.limit)
+    files = _discover_session_ledgers(ns.paths, ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
