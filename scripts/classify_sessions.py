@@ -376,26 +376,22 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _select_scan_paths_to_bound_capped_work(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths without globally sorting capped scans.
+def _order_all_scan_paths_for_stable_uncapped_reports(files: Iterable[Path]) -> list[Path]:
+    """Return every scan path in stable report order when no cap is applied.
 
     Conservation law: deterministic reporting order trades off against bounded
-    startup work. Capped scans need the smallest paths, not a full sorted list;
-    uncapped scans consume every path, so sorting preserves stable reports
-    without pretending to be selection.
+    startup work. Uncapped scans consume every path, so sorting preserves stable
+    complete reports.
     """
-    if limit <= 0:
-        return _order_all_scan_paths_for_stable_uncapped_reports(files)
-    return _direct_select_capped_scan_paths_to_keep_startup_bounded(files, limit)
-
-
-def _order_all_scan_paths_for_stable_uncapped_reports(files: Iterable[Path]) -> list[Path]:
-    """Return every scan path in stable report order when no cap is applied."""
     return sorted(files)
 
 
 def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return the deterministic capped subset without sorting every path."""
+    """Return the deterministic capped subset without sorting every path.
+
+    Conservation law: deterministic reporting order trades off against bounded
+    startup work. Capped scans need the smallest paths, not a full sorted list.
+    """
     return nsmallest(limit, files)
 
 
@@ -410,7 +406,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_scan_paths_to_bound_capped_work(_gather(ns.paths), ns.limit)
+    sources = _gather(ns.paths)
+    if ns.limit <= 0:
+        files = _order_all_scan_paths_for_stable_uncapped_reports(sources)
+    else:
+        files = _direct_select_capped_scan_paths_to_keep_startup_bounded(sources, ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
