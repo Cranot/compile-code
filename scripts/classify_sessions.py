@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+import itertools
 import json
 import os
 import re
@@ -360,37 +361,37 @@ def _default_scan_dirs() -> list[Path]:
     return dirs
 
 
-def _expand_jsonl_source(path: Path) -> list[Path]:
-    """Return the .jsonl file(s) represented by a single source path."""
+def _expand_jsonl_source(path: Path) -> Iterable[Path]:
+    """Yield the .jsonl file(s) represented by a single source path."""
     if path.is_dir():
-        return list(path.rglob("*.jsonl"))
+        yield from path.rglob("*.jsonl")
+        return
     if path.suffix == ".jsonl":
-        return [path]
-    return []
+        yield path
 
 
-def _gather(paths: list[Path]) -> list[Path]:
-    """Resolve CLI paths to .jsonl files, or fall back to default scan dirs."""
+def _gather(paths: list[Path]) -> Iterable[Path]:
+    """Yield CLI-resolved .jsonl files, or fall back to default scan dirs."""
     sources = paths if paths else _default_scan_dirs()
-    files: list[Path] = []
     for p in sources:
-        files.extend(_expand_jsonl_source(p))
-    return files
+        yield from _expand_jsonl_source(p)
 
 
-def _avoid_global_sort_for_limited_scan(files: list[Path], limit: int) -> list[Path]:
+def _avoid_global_sort_for_limited_scan(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths while preserving the direct-select invariant.
 
     Conservation law: total deterministic order and work-efficient selection
-    cannot both be maximized. When the cap is binding we need only the
-    `limit` smallest paths, so direct-select with heapq.nsmallest gives
-    bounded order for O(n log k). When the scan is uncapped, the caller only
-    iterates, so we preserve the input order and avoid paying O(n log n) for a
-    full sort.
+    cannot both be maximized. Probe one past the cap so uncapped or nonbinding
+    scans keep discovery order; when the cap excludes records, direct-select
+    gives the `limit` smallest paths without paying for a global sort.
     """
-    if limit <= 0 or limit >= len(files):
-        return files
-    return heapq.nsmallest(limit, files)
+    if limit <= 0:
+        return list(files)
+    iterator = iter(files)
+    probe = list(itertools.islice(iterator, limit + 1))
+    if len(probe) <= limit:
+        return probe
+    return heapq.nsmallest(limit, itertools.chain(probe, iterator))
 
 
 def main(argv: list[str] | None = None) -> int:
