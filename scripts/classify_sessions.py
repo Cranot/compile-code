@@ -377,7 +377,7 @@ def _gather(paths: list[Path]) -> list[Path]:
     return files
 
 
-def _select_ledgers_without_global_sort(files: list[Path], limit: int) -> list[Path]:
+def _bound_ledger_scan_work(files: list[Path], limit: int) -> list[Path]:
     """Return the `limit` smallest paths, or all paths if no cap is requested.
 
     Conservation law: total deterministic order and work-efficient selection
@@ -402,7 +402,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_ledgers_without_global_sort(_gather(ns.paths), ns.limit)
+    files = _bound_ledger_scan_work(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
