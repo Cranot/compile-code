@@ -388,6 +388,11 @@ def _direct_select_scan_paths_to_preserve_discovery_cap(files: Iterable[Path], l
     return list(islice(files, limit))
 
 
+def _limit_requires_bounded_discovery(limit: int) -> bool:
+    """Return True when ``--limit`` must stop discovery before exhausting files."""
+    return limit > 0
+
+
 def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths while keeping ``--limit`` a real discovery cap.
 
@@ -396,7 +401,7 @@ def _select_scan_paths_to_keep_limit_a_discovery_cap(files: Iterable[Path], limi
     direct selection (``islice``) to keep the first discovered paths without
     fully sorting the ledger tree. Uncapped scans materialize the whole stream.
     """
-    if limit <= 0:
+    if not _limit_requires_bounded_discovery(limit):
         return list(files)
     return _direct_select_scan_paths_to_preserve_discovery_cap(files, limit)
 
