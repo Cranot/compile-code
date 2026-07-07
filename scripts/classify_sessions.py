@@ -381,6 +381,18 @@ def _scan_path_key_preserves_display_order(path: Path) -> str:
     return str(path)
 
 
+def _direct_select_capped_scan_paths_to_keep_startup_bounded(
+    files: Iterable[Path], limit: int
+) -> list[Path]:
+    """Return the capped prefix in display order without paying for a full sort.
+
+    Conservation law: deterministic reporting order trades off against bounded
+    startup work. Capped scans only need the smallest ``limit`` paths, so a
+    direct selection avoids the O(N log N) cost of sorting the entire set.
+    """
+    return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
+
+
 def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths while keeping capped startup work bounded.
 
@@ -390,7 +402,7 @@ def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], lim
     """
     if limit <= 0:
         return sorted(files, key=_scan_path_key_preserves_display_order)
-    return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
+    return _direct_select_capped_scan_paths_to_keep_startup_bounded(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
