@@ -387,8 +387,8 @@ def _direct_select_scan_prefix_to_bound_startup_work(files: Iterable[Path], limi
     return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
 
 
-def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while avoiding global sort work unless the cap binds.
+def _select_scan_paths_preserving_limit_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return scan paths while avoiding global sort work for capped scans.
 
     Conservation law: deterministic global ordering trades off against bounded
     startup work. Uncapped and nonbinding capped scans keep discovery order;
@@ -415,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _select_scan_paths_to_keep_capped_startup_bounded(_gather(ns.paths), ns.limit)
+    files = _select_scan_paths_preserving_limit_without_global_sort(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
