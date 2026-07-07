@@ -377,8 +377,8 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
-def _avoid_global_sort_for_limited_scan(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return scan paths while preserving the direct-select invariant.
+def _direct_select_scan_paths_when_capped(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return scan paths without globally sorting capped scans.
 
     Conservation law: total deterministic order and work-efficient selection
     cannot both be maximized. Probe one past the cap so uncapped or nonbinding
@@ -405,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of prose.")
     ns = ap.parse_args(argv)
 
-    files = _avoid_global_sort_for_limited_scan(_gather(ns.paths), ns.limit)
+    files = _direct_select_scan_paths_when_capped(_gather(ns.paths), ns.limit)
     if not files:
         print("[classify] no session ledgers found (pass a path or set CLAUDE_PROFILE_DIR).", file=sys.stderr)
         return 1
