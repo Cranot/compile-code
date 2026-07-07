@@ -383,6 +383,16 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
+def _materialize_complete_scan_when_no_work_cap(files: Iterable[Path]) -> list[Path]:
+    """Return every scan path when the caller chose complete discovery."""
+    return list(files)
+
+
+def _direct_select_scan_paths_to_preserve_limit_work_cap(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return the first discovered scan paths without consuming the whole tree."""
+    return list(islice(files, limit))
+
+
 def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: int) -> list[Path]:
     """Return scan paths while keeping ``--limit`` a real discovery cap.
 
@@ -390,7 +400,9 @@ def _select_scan_paths_to_keep_limit_a_work_cap(files: Iterable[Path], limit: in
     discovery work. A binding limit cannot provide both, so capped scans keep
     the first discovered paths and avoid consuming the rest of the ledger tree.
     """
-    return list(files) if limit <= 0 else list(islice(files, limit))
+    if limit <= 0:
+        return _materialize_complete_scan_when_no_work_cap(files)
+    return _direct_select_scan_paths_to_preserve_limit_work_cap(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
