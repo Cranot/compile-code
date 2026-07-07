@@ -379,15 +379,17 @@ def _gather(paths: list[Path]) -> list[Path]:
 
 
 def _bound_ledger_scan_work(files: list[Path], limit: int) -> list[Path]:
-    """Return the `limit` smallest paths, or all paths if no cap is requested.
+    """Return bounded ledger paths without full-sorting an unbounded scan.
 
     Conservation law: total deterministic order and work-efficient selection
     cannot both be maximized. When the cap is binding we need only the
     `limit` smallest paths, so direct-select with heapq.nsmallest gives
-    bounded order for O(n log k). When uncapped or the cap covers every file,
-    the caller only iterates, so we preserve the input order and avoid paying
-    O(n log n) for a full sort."""
-    if limit <= 0 or limit >= len(files):
+    bounded order for O(n log k). When the scan is uncapped, the caller only
+    iterates, so we preserve the input order and avoid paying O(n log n) for a
+    full sort."""
+    if limit <= 0:
+        return files
+    if limit >= len(files):
         return files
     return heapq.nsmallest(limit, files)
 
