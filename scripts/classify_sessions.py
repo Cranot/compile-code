@@ -360,20 +360,21 @@ def _default_scan_dirs() -> list[Path]:
     return dirs
 
 
+def _expand_jsonl_source(path: Path) -> list[Path]:
+    """Return the .jsonl file(s) represented by a single source path."""
+    if path.is_dir():
+        return list(path.rglob("*.jsonl"))
+    if path.suffix == ".jsonl":
+        return [path]
+    return []
+
+
 def _gather(paths: list[Path]) -> list[Path]:
     """Resolve CLI paths to .jsonl files, or fall back to default scan dirs."""
-    if paths:
-        files: list[Path] = []
-        for p in paths:
-            if p.is_dir():
-                files.extend(p.rglob("*.jsonl"))
-            elif p.suffix == ".jsonl":
-                files.append(p)
-        return files
-    files = []
-    for d in _default_scan_dirs():
-        if d.is_dir():
-            files.extend(d.rglob("*.jsonl"))
+    sources = paths if paths else _default_scan_dirs()
+    files: list[Path] = []
+    for p in sources:
+        files.extend(_expand_jsonl_source(p))
     return files
 
 
