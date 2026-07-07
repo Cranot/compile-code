@@ -376,6 +376,11 @@ def _gather(paths: list[Path]) -> Iterable[Path]:
         yield from _expand_jsonl_source(p)
 
 
+def _scan_path_key_preserves_display_order(path: Path) -> str:
+    """Return the path ordering key users see in reports."""
+    return str(path)
+
+
 def _order_all_scan_paths_for_stable_uncapped_reports(files: Iterable[Path]) -> list[Path]:
     """Return every scan path in stable report order when no cap is applied.
 
@@ -383,7 +388,7 @@ def _order_all_scan_paths_for_stable_uncapped_reports(files: Iterable[Path]) -> 
     startup work. Uncapped scans consume every path, so sorting preserves stable
     complete reports.
     """
-    return sorted(files)
+    return sorted(files, key=_scan_path_key_preserves_display_order)
 
 
 def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
@@ -393,7 +398,7 @@ def _direct_select_capped_scan_paths_to_keep_startup_bounded(files: Iterable[Pat
     startup work. Capped scans need the smallest displayed paths, not a full
     sorted list.
     """
-    return nsmallest(limit, files, key=str)
+    return nsmallest(limit, files, key=_scan_path_key_preserves_display_order)
 
 
 def _select_scan_paths_to_keep_capped_startup_bounded(files: Iterable[Path], limit: int) -> list[Path]:
