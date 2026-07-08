@@ -385,12 +385,7 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], lim
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
-    """Resolve CLI paths to .jsonl files, capped by ``limit`` (0 = uncapped).
-
-    Conservation law: deterministic global ordering trades off against bounded
-    discovery work. Capped scans use direct selection so ``--limit`` preserves
-    sorted path semantics without fully ordering the whole ledger tree first.
-    """
+    """Resolve CLI paths to .jsonl files, capped by ``limit`` (0 = uncapped)."""
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
     return _select_ledgers_without_spending_global_sort_work(files, limit)
