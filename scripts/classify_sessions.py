@@ -376,11 +376,6 @@ def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
     return os.fspath(path)
 
 
-def _ledger_limit_preserves_uncapped_scan(limit: int) -> int | None:
-    """Return a positive selection cap, or None when the CLI asked for all ledgers."""
-    return limit if limit > 0 else None
-
-
 def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
     """Return ledger paths without a full global sort.
 
@@ -389,10 +384,9 @@ def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: in
     direct selection (``nsmallest``); uncapped scans accept the natural
     expansion order so we do not sort the whole ledger tree just to iterate it.
     """
-    selection_limit = _ledger_limit_preserves_uncapped_scan(limit)
-    if selection_limit is None:
+    if limit <= 0:
         return list(files)
-    return nsmallest(selection_limit, files, key=_ledger_path_key_preserves_cli_determinism)
+    return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
