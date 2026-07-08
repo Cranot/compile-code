@@ -343,9 +343,7 @@ def _classify_verify_failure(output: str, rc: int) -> str:
     """
     lines = output.splitlines()
     section_at: dict[int, str] = {
-        i: match.group(1).strip()
-        for i, line in enumerate(lines)
-        if (match := _VERIFY_SECTION.match(line))
+        i: match.group(1).strip() for i, line in enumerate(lines) if (match := _VERIFY_SECTION.match(line))
     }
     failing: list[str] = []
     current: str | None = None
