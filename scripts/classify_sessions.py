@@ -461,6 +461,8 @@ def _direct_select_top_rows_to_keep_report_work_bounded(
     report work. Top-N direct selection keeps ``--top`` proportional to the rows
     shown instead of sorting all candidates before slicing.
     """
+    if top <= 0:
+        return []
     return nlargest(top, items, key=key)
 
 
@@ -472,11 +474,6 @@ def _session_retry_signal_count(session: dict[str, object]) -> int:
 def _repeat_count(item: tuple[str, int]) -> int:
     """Return the ranking signal for repeated command/read rows."""
     return item[1]
-
-
-def _report_bound_preserves_direct_selection(top: int) -> int:
-    """Return a nonnegative report cap so top-N selection stays bounded."""
-    return max(0, top)
 
 
 def _print_prose_report(
@@ -491,24 +488,23 @@ def _print_prose_report(
     print("[classify] bucket hits:")
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
-    visible_top = _report_bound_preserves_direct_selection(top)
     if retry_clusters:
         ranked = _direct_select_top_rows_to_keep_report_work_bounded(
-            retry_clusters.items(), visible_top, _retry_cluster_size
+            retry_clusters.items(), top, _retry_cluster_size
         )
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
-    print(f"[classify] top {min(visible_top, len(flagged))} retry-like session(s):")
-    for s in _direct_select_top_rows_to_keep_report_work_bounded(flagged, visible_top, _session_retry_signal_count):
+    print(f"[classify] top {min(max(0, top), len(flagged))} retry-like session(s):")
+    for s in _direct_select_top_rows_to_keep_report_work_bounded(flagged, top, _session_retry_signal_count):
         tags = ",".join(b for b in BUCKETS if s["buckets"][b]) or "-"
         print(f"  [{tags}] {Path(s['path']).name}")
         for cmd, n in _direct_select_top_rows_to_keep_report_work_bounded(
-            s["counts"]["bash_repeats"].items(), min(2, visible_top), _repeat_count
+            s["counts"]["bash_repeats"].items(), min(2, top), _repeat_count
         ):
             print(f"        bash x{n}: {cmd[:70]}")
         for fp, n in _direct_select_top_rows_to_keep_report_work_bounded(
-            s["counts"]["read_repeats"].items(), min(2, visible_top), _repeat_count
+            s["counts"]["read_repeats"].items(), min(2, top), _repeat_count
         ):
             print(f"        read x{n}: {fp}")
         if s["counts"]["verify_fails"]:
