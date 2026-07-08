@@ -387,7 +387,7 @@ def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
     if limit <= 0:
-        return list(files)
+        return sorted(files)
     return _select_capped_ledgers_without_spending_global_sort_work(files, limit)
 
 
