@@ -376,25 +376,32 @@ def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
     return os.fspath(path)
 
 
+def _ledger_limit_preserves_uncapped_scan(limit: int) -> int | None:
+    """Return a positive selection cap, or None when the CLI asked for all ledgers."""
+    return limit if limit > 0 else None
+
+
 def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
     """Return ledger paths without a full global sort.
 
-    Conservation law: deterministic global ordering trades off against bounded
-    discovery work. Capped scans preserve sorted-path semantics via direct
-    selection (``nsmallest``); uncapped scans accept the natural expansion
-    order so we do not sort the whole ledger tree just to iterate it.
+    Conservation law: deterministic sorted-path semantics trade off against
+    bounded ordering work. Positive caps preserve sorted-path semantics via
+    direct selection (``nsmallest``); uncapped scans accept the natural
+    expansion order so we do not sort the whole ledger tree just to iterate it.
     """
-    if limit <= 0:
+    selection_limit = _ledger_limit_preserves_uncapped_scan(limit)
+    if selection_limit is None:
         return list(files)
-    return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
+    return nsmallest(selection_limit, files, key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     """Resolve CLI paths to .jsonl files, capped by ``limit`` (0 = uncapped).
 
-    Conservation law: deterministic global ordering trades off against bounded
-    discovery work. Capped scans use direct selection so ``--limit`` preserves
-    sorted path semantics without fully ordering the whole ledger tree first.
+    Conservation law: deterministic sorted-path semantics trade off against
+    bounded ordering work. Capped scans use direct selection so ``--limit``
+    preserves sorted path semantics without fully ordering the whole ledger tree
+    first.
     """
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
