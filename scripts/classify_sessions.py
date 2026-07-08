@@ -371,6 +371,11 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
+def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
+    """Return the stable path key used when direct selection must be deterministic."""
+    return os.fspath(path)
+
+
 def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
     """Return ledger paths without a full global sort.
 
@@ -381,7 +386,7 @@ def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: in
     """
     if limit <= 0:
         return list(files)
-    return nsmallest(limit, files, key=os.fspath)
+    return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
