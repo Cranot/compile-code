@@ -371,7 +371,7 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _select_capped_ledgers_without_spending_global_sort_work(files: Iterable[Path], limit: int) -> list[Path]:
+def _direct_select_capped_ledgers_to_keep_discovery_bounded(files: Iterable[Path], limit: int) -> list[Path]:
     """Return the lowest ``limit`` ledger paths without globally sorting them.
 
     Conservation law: deterministic global ordering trades off against bounded
@@ -379,6 +379,8 @@ def _select_capped_ledgers_without_spending_global_sort_work(files: Iterable[Pat
     selection (``nsmallest`` over ``Path`` ordering) instead of sorting every
     discovered ledger before slicing.
     """
+    if limit <= 0:
+        return []
     return nsmallest(limit, files)
 
 
@@ -388,7 +390,7 @@ def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     files = (f for p in sources for f in _expand_jsonl_source(p))
     if limit <= 0:
         return sorted(files)
-    return _select_capped_ledgers_without_spending_global_sort_work(files, limit)
+    return _direct_select_capped_ledgers_to_keep_discovery_bounded(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
