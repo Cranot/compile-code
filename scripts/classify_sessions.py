@@ -495,9 +495,7 @@ def _print_prose_report(
     for b in BUCKETS:
         print(f"  {b:22s} {bucket_totals[b]}")
     if retry_clusters:
-        ranked = _direct_select_top_rows_to_keep_report_work_bounded(
-            retry_clusters.items(), top, _retry_cluster_size
-        )
+        ranked = _direct_select_top_rows_to_keep_report_work_bounded(retry_clusters.items(), top, _retry_cluster_size)
         print(f"[classify] cross-session retry clusters ({len(retry_clusters)} prompt(s), top {len(ranked)}):")
         for prompt, paths in ranked:
             print(f"  [{len(paths)}x] {prompt[:90]}")
