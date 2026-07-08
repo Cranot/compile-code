@@ -371,11 +371,6 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
-    """Return the stable path key used when direct selection must be deterministic."""
-    return os.fspath(path)
-
-
 def _requested_limit_preserves_bounded_discovery(limit: int) -> int | None:
     """Return a direct-selection cap only when ``--limit`` bounds discovery."""
     return limit if limit > 0 else None
@@ -386,12 +381,12 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], cap
 
     Conservation law: deterministic global ordering trades off against bounded
     discovery work. Capped scans preserve sorted-path semantics via direct
-    selection (``nsmallest``); uncapped scans keep natural discovery order
-    because every discovered ledger is returned.
+    selection (``nsmallest`` over ``os.fspath`` keys); uncapped scans keep
+    natural discovery order because every discovered ledger is returned.
     """
     if cap is None:
         return list(files)
-    return nsmallest(cap, files, key=_ledger_path_key_preserves_cli_determinism)
+    return nsmallest(cap, files, key=os.fspath)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
