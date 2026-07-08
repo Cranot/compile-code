@@ -376,17 +376,18 @@ def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
     return os.fspath(path)
 
 
-def _select_limited_ledgers_without_global_sort(files: Iterable[Path], limit: int) -> list[Path]:
-    """Return ledger paths without a full global sort.
+def _select_ledgers_preserving_order_without_capped_full_sort(files: Iterable[Path], limit: int) -> list[Path]:
+    """Return ledger paths using the cheapest ordering that preserves CLI semantics.
 
     Conservation law: deterministic sorted-path semantics trade off against
-    bounded ordering work. Positive caps preserve sorted-path semantics via
-    direct selection (``nsmallest``); uncapped scans accept the natural
-    expansion order so we do not sort the whole ledger tree just to iterate it.
+    bounded ordering work. Positive caps only expose the first N sorted paths,
+    so direct selection preserves visible semantics without fully ordering every
+    candidate; uncapped scans have no selection boundary, so they keep the
+    deterministic full ordering.
     """
-    if limit <= 0:
-        return list(files)
-    return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
+    if limit > 0:
+        return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
+    return sorted(files, key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
@@ -399,7 +400,7 @@ def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     """
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
-    return _select_limited_ledgers_without_global_sort(files, limit)
+    return _select_ledgers_preserving_order_without_capped_full_sort(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
