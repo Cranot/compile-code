@@ -386,7 +386,7 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], lim
     """
     if limit <= 0:
         return list(files)
-    return nsmallest(limit, files, key=_ledger_path_key_preserves_cli_determinism)
+    return nsmallest(limit, iter(files), key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
