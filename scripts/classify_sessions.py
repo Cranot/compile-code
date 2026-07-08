@@ -386,12 +386,12 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], lim
 
     Conservation law: deterministic global ordering trades off against bounded
     discovery work. Capped scans preserve sorted-path semantics via direct
-    selection (``nsmallest``); uncapped scans accept the natural expansion
-    order so we do not sort the whole ledger tree just to iterate it.
+    selection (``nsmallest``); uncapped scans can spend the full sort because
+    every discovered ledger is returned.
     """
     cap = _requested_limit_preserves_bounded_discovery(limit)
     if cap is None:
-        return list(files)
+        return sorted(files, key=_ledger_path_key_preserves_cli_determinism)
     return nsmallest(cap, iter(files), key=_ledger_path_key_preserves_cli_determinism)
 
 
