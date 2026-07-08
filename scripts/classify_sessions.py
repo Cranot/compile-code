@@ -371,12 +371,7 @@ def _expand_jsonl_source(path: Path) -> Iterable[Path]:
         yield path
 
 
-def _requested_limit_preserves_bounded_discovery(limit: int) -> int | None:
-    """Return a direct-selection cap only when ``--limit`` bounds discovery."""
-    return limit if limit > 0 else None
-
-
-def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], cap: int | None) -> list[Path]:
+def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], limit: int) -> list[Path]:
     """Return ledger paths while keeping capped discovery work bounded.
 
     Conservation law: deterministic global ordering trades off against bounded
@@ -384,9 +379,9 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], cap
     selection (``nsmallest`` over ``os.fspath`` keys); uncapped scans keep
     natural discovery order because every discovered ledger is returned.
     """
-    if cap is None:
+    if limit <= 0:
         return list(files)
-    return nsmallest(cap, files, key=os.fspath)
+    return nsmallest(limit, files, key=os.fspath)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
@@ -398,8 +393,7 @@ def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
     """
     sources = paths if paths else _default_scan_dirs()
     files = (f for p in sources for f in _expand_jsonl_source(p))
-    cap = _requested_limit_preserves_bounded_discovery(limit)
-    return _select_ledgers_without_spending_global_sort_work(files, cap)
+    return _select_ledgers_without_spending_global_sort_work(files, limit)
 
 
 def main(argv: list[str] | None = None) -> int:
