@@ -376,11 +376,6 @@ def _ledger_path_key_preserves_cli_determinism(path: Path) -> str:
     return os.fspath(path)
 
 
-def _positive_limit_allows_bounded_selection(limit: int) -> int | None:
-    """Return a direct-selection cap only when the caller requested bounded work."""
-    return limit if limit > 0 else None
-
-
 def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], limit: int) -> list[Path]:
     """Return ledger paths while keeping selection work bounded.
 
@@ -389,10 +384,9 @@ def _select_ledgers_without_spending_global_sort_work(files: Iterable[Path], lim
     via direct selection; uncapped scans accept natural expansion order instead
     of globally sorting every ledger just to scan them all.
     """
-    cap = _positive_limit_allows_bounded_selection(limit)
-    if cap is None:
+    if limit <= 0:
         return list(files)
-    return nsmallest(cap, iter(files), key=_ledger_path_key_preserves_cli_determinism)
+    return nsmallest(limit, iter(files), key=_ledger_path_key_preserves_cli_determinism)
 
 
 def _discover_session_ledgers(paths: list[Path], limit: int) -> list[Path]:
