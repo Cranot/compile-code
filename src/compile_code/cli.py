@@ -39,6 +39,7 @@ EXIT_VERIFY_GATE = 5
 # named constant so the delegated hook-detection contract is explicit and
 # updates in lockstep if roam-code renames the hook.
 HOOK_MARKER = "roam-compile-ups.py"
+LAUNCH_INDEX_HEAD_FILE = os.path.join(".roam", ".compile-code-launch-head")
 
 
 def _on_path(name: str) -> bool:
@@ -128,11 +129,21 @@ def _ensure_indexed_for_launch() -> int:
     click context.
     """
     if _require_index():
+        if not _launch_index_needs_refresh():
+            return 0
+        click.echo("compile: indexing repo (HEAD drift)...")
+        rc = _delegate("index")
+        if rc != 0:
+            click.echo("VERDICT: indexing failed — rerun `compile claude` after fixing the index")
+            return rc
+        _mark_launch_indexed()
         return 0
     click.echo("compile: indexing repo (first run)...")
     rc = _delegate("init")
     if rc != 0:
-        click.echo("VERDICT: indexing failed — run `compile init` for details")
+        click.echo("VERDICT: indexing failed — rerun `compile claude` after fixing the index")
+        return rc
+    _mark_launch_indexed()
     return rc
 
 
@@ -173,6 +184,66 @@ def _wired_in(settings_path: str) -> bool:
             return HOOK_MARKER in fh.read()
     except OSError:
         return False
+
+
+def _project_wired() -> bool:
+    """True when either project-local Claude settings file contains the hook."""
+    return _wired_in(os.path.join(".claude", "settings.local.json")) or _wired_in(
+        os.path.join(".claude", "settings.json")
+    )
+
+
+def _user_wired() -> bool:
+    """True when either user-global Claude settings file contains the hook."""
+    user_claude = os.path.join(os.path.expanduser("~"), ".claude")
+    return _wired_in(os.path.join(user_claude, "settings.local.json")) or _wired_in(
+        os.path.join(user_claude, "settings.json")
+    )
+
+
+def _launch_head() -> str | None:
+    """Short git HEAD for the current repo, or ``None`` if it cannot be read."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], check=False, capture_output=True, text=True, timeout=10
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    head = proc.stdout.strip()
+    if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]+", head):
+        return None
+    return head
+
+
+def _launch_index_head() -> str | None:
+    """Persisted HEAD from the last successful launch-time index."""
+    try:
+        with open(LAUNCH_INDEX_HEAD_FILE, encoding="utf-8") as fh:
+            head = fh.read().strip()
+    except OSError:
+        return None
+    return head if re.fullmatch(r"[0-9a-f]+", head) else None
+
+
+def _mark_launch_indexed(head: str | None = None) -> None:
+    """Remember the HEAD that the launch-time index was built against."""
+    head = head or _launch_head()
+    if not head:
+        return
+    try:
+        os.makedirs(os.path.dirname(LAUNCH_INDEX_HEAD_FILE), exist_ok=True)
+        with open(LAUNCH_INDEX_HEAD_FILE, "w", encoding="utf-8") as fh:
+            fh.write(f"{head}\n")
+    except OSError:
+        pass
+
+
+def _launch_index_needs_refresh() -> bool:
+    """Fail open: any uncertain HEAD comparison refreshes the index."""
+    current = _launch_head()
+    if not current:
+        return True
+    return _launch_index_head() != current
 
 
 # Commands are dispatched by string name through this group (via the
@@ -257,7 +328,7 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...]) -> None:
         ctx.exit(rc)
     # Idempotent wiring. Fail-open by contract: a wiring failure must not
     # block the agent launch — but say so instead of swallowing it.
-    if _delegate("hooks", "claude", "--write") != 0:
+    if not (_project_wired() or _user_wired()) and _delegate("hooks", "claude", "--write") != 0:
         click.echo("compile: wiring failed (continuing without hooks — run `compile doctor`)")
     if os.name == "nt":  # pragma: no cover - windows-only branch
         # exec* on Windows spawns-and-detaches instead of replacing the
@@ -424,16 +495,17 @@ def _verify(files: tuple[str, ...], threshold: int) -> None:
 def _doctor() -> None:
     """Check the install: toolchain present, index state, wiring state.
 
-    Wiring is checked at both levels — project (.claude/settings.json)
-    and user-global (~/.claude/settings.json); either counts as wired.
+    Wiring is checked at both levels — project (.claude/settings.local.json
+    / settings.json) and user-global (~/.claude/settings.local.json /
+    settings.json); either counts as wired.
     """
     toolchain_ok = _on_path("roam")
     indexed = _require_index()
-    project_wired = _wired_in(os.path.join(".claude", "settings.json"))
+    project_wired = _project_wired()
     # Only read the user-global settings when the project isn't already wired —
     # the label below reports "wired (project)" regardless, so this IO is
     # redundant when project_wired is true.
-    user_wired = project_wired or _wired_in(os.path.join(os.path.expanduser("~"), ".claude", "settings.json"))
+    user_wired = project_wired or _user_wired()
     wired = project_wired or user_wired
     wired_label = (
         "wired (project)"

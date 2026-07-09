@@ -116,7 +116,7 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code pins `roam-code >= 13.5` and picks up every kernel release —
+compile-code pins `roam-code >= 13.7.0` and picks up every kernel release —
 so the published losses above are not static marketing: each one was
 attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped

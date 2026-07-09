@@ -8,6 +8,8 @@ subprocess work, so they run anywhere.
 
 from __future__ import annotations
 
+from importlib.metadata import version
+
 import pytest
 from click.testing import CliRunner
 
@@ -33,6 +35,23 @@ def roam_calls(monkeypatch):
 
     monkeypatch.setattr(mod, "_roam", fake)
     return calls
+
+
+def _version_tuple(raw: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for chunk in raw.split("."):
+        digits = []
+        for char in chunk:
+            if char.isdigit():
+                digits.append(char)
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int("".join(digits)))
+        if len(parts) == 3:
+            break
+    return tuple(parts)
 
 
 class TestSurface:
@@ -98,6 +117,38 @@ class TestSurface:
         self._delegates(runner, roam_calls, ["stats"], ["compile-stats"])
 
 
+class TestDependencyFloor:
+    def test_installed_roam_code_satisfies_launch_floor(self):
+        assert _version_tuple(version("roam-code")) >= (13, 7, 0)
+
+
+class TestWiringSmoke:
+    def test_wire_round_trip_marks_repo_and_doctor_sees_it(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / "index.db").write_text("")
+        (tmp_path / ".claude").mkdir()
+        calls = []
+
+        class _P:
+            returncode = 0
+
+        def fake(*args, timeout=600):
+            calls.append(list(args))
+            if list(args) == ["hooks", "claude", "--write"]:
+                (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["wire", "claude"])
+        assert res.exit_code == 0
+        assert calls == [["hooks", "claude", "--write"]]
+        doctor = runner.invoke(mod.cli, ["doctor"])
+        assert "wired (project)" in doctor.output
+        assert "VERDICT: ready" in doctor.output
+
+
 class TestClaudeLaunch:
     def test_missing_claude_binary_exits_1(self, runner, roam_calls, monkeypatch):
         monkeypatch.setattr(mod, "_on_path", lambda name: False)
@@ -113,6 +164,36 @@ class TestClaudeLaunch:
         res = runner.invoke(mod.cli, ["claude", "--", "-p", "hello"])
         assert res.exit_code == 0
         assert ["init"] in roam_calls
+        assert ["hooks", "claude", "--write"] in roam_calls
+        assert execs and execs[0][0] == "claude"
+
+    def test_skips_wiring_when_repo_is_already_wired(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        execs = []
+        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        res = runner.invoke(mod.cli, ["claude"])
+        assert res.exit_code == 0
+        assert roam_calls == []
+        assert execs and execs[0][0] == "claude"
+
+    def test_wires_when_repo_is_indexed_but_unwired(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        execs = []
+        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        res = runner.invoke(mod.cli, ["claude"])
+        assert res.exit_code == 0
         assert ["hooks", "claude", "--write"] in roam_calls
         assert execs and execs[0][0] == "claude"
 
@@ -195,9 +276,13 @@ class TestFailurePaths:
 class TestEnsureIndexedForLaunch:
     """The index-delegation contract, tested directly — no click context."""
 
-    def test_returns_0_when_already_indexed(self, monkeypatch, capsys):
+    def test_returns_0_when_already_indexed_and_head_is_unchanged(self, monkeypatch, capsys, tmp_path):
+        monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
         monkeypatch.setattr(mod, "_delegate", lambda *a: pytest.fail("must not index"))
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
         assert mod._ensure_indexed_for_launch() == 0
         assert capsys.readouterr().out == ""
 
@@ -205,8 +290,16 @@ class TestEnsureIndexedForLaunch:
         monkeypatch.setattr(mod, "_require_index", lambda: False)
         calls = []
         monkeypatch.setattr(mod, "_delegate", lambda *a: calls.append(a) or 0)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        wrote = {}
+
+        def mark(head=None):
+            wrote["head"] = head
+
+        monkeypatch.setattr(mod, "_mark_launch_indexed", mark)
         assert mod._ensure_indexed_for_launch() == 0
         assert calls == [("init",)]
+        assert wrote == {"head": None}
         assert "indexing repo (first run)" in capsys.readouterr().out
 
     def test_indexing_failure_yields_verdict_and_code(self, monkeypatch, capsys):
@@ -215,13 +308,43 @@ class TestEnsureIndexedForLaunch:
         assert mod._ensure_indexed_for_launch() == 2
         assert "VERDICT: indexing failed" in capsys.readouterr().out
 
+    def test_reindexes_when_head_marker_is_missing(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        monkeypatch.setattr(mod, "_launch_index_head", lambda: None)
+        calls = []
+        monkeypatch.setattr(mod, "_delegate", lambda *a: calls.append(a) or 0)
+        wrote = {}
+        monkeypatch.setattr(mod, "_mark_launch_indexed", lambda head=None: wrote.setdefault("head", head))
+        assert mod._ensure_indexed_for_launch() == 0
+        assert calls == [("index",)]
+        assert wrote == {"head": None}
+        assert "HEAD drift" in capsys.readouterr().out
+
+    def test_reindexes_when_head_marker_changed(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        monkeypatch.setattr(mod, "_launch_index_head", lambda: "fff999")
+        calls = []
+        monkeypatch.setattr(mod, "_delegate", lambda *a: calls.append(a) or 0)
+        wrote = {}
+        monkeypatch.setattr(mod, "_mark_launch_indexed", lambda head=None: wrote.setdefault("head", head))
+        assert mod._ensure_indexed_for_launch() == 0
+        assert calls == [("index",)]
+        assert wrote == {"head": None}
+        assert "HEAD drift" in capsys.readouterr().out
+
 
 class TestFailurePathsLaunch:
     def test_claude_launch_warns_on_wire_failure_but_continues(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / "index.db").write_text("")
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        (tmp_path / ".claude").mkdir()
         monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
 
         class _Fail:
             returncode = 1
