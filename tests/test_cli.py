@@ -64,7 +64,7 @@ class TestSurface:
 
     def test_help_lists_all_verbs(self, runner):
         res = runner.invoke(mod.cli, ["--help"])
-        for verb in ("init", "wire", "unwire", "claude", "run", "stats", "doctor"):
+        for verb in ("init", "wire", "unwire", "baseline", "claude", "run", "stats", "doctor"):
             assert verb in res.output
 
     def test_init_delegates(self, runner, roam_calls):
@@ -115,6 +115,15 @@ class TestSurface:
 
     def test_stats_delegates(self, runner, roam_calls):
         self._delegates(runner, roam_calls, ["stats"], ["compile-stats"])
+
+    def test_baseline_help_lists_the_new_verb(self, runner):
+        res = runner.invoke(mod.cli, ["baseline", "--help"])
+        assert "Snapshot accepted debt" in res.output
+
+    def test_verify_help_includes_new_only_and_diff_only(self, runner):
+        res = runner.invoke(mod.cli, ["verify", "--help"])
+        assert "--new-only" in res.output
+        assert "--diff-only" in res.output
 
 
 class TestDependencyFloor:
@@ -450,6 +459,15 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == ["verify", "--threshold", "90", "src/bad.py"]
         assert "command : compile verify --threshold 90 src/bad.py" in res.output
 
+    def test_verify_new_only_and_diff_only_pass_through(self, runner, monkeypatch):
+        fake, captured = self._capture(self.FAIL_OUTPUT, 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        res = runner.invoke(mod.cli, ["verify", "--new-only", "--diff-only", "src/bad.py"])
+        assert res.exit_code == 5
+        assert captured["args"] == ["verify", "--new-only", "--diff-only", "--threshold", "70", "src/bad.py"]
+        assert "command : compile verify --new-only --diff-only src/bad.py" in res.output
+        assert "next    : compile verify --new-only --diff-only src/bad.py" in res.output
+
     def test_verify_no_changed_files_delegates_changed_flag(self, runner, monkeypatch):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -457,3 +475,49 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 0
         assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
+
+
+class TestBaselineVerb:
+    def test_baseline_refuses_dirty_tree(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_git_status_porcelain", lambda timeout=10: (0, " M src/cli.py\n"))
+        monkeypatch.setattr(mod, "_roam", lambda *a, timeout=600: pytest.fail("must not baseline dirty trees"))
+        res = runner.invoke(mod.cli, ["baseline"])
+        assert res.exit_code == 1
+        assert "dirty tree" in res.output
+
+    def test_baseline_uses_report_baseline_write_with_raised_timeout(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_git_status_porcelain", lambda timeout=10: (0, ""))
+        calls = []
+
+        class _P:
+            returncode = 0
+
+        def fake(*args, timeout=600):
+            calls.append((list(args), timeout))
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["baseline"])
+        assert res.exit_code == 0
+        assert calls == [(["verify", "--report", "--baseline-write"], mod.BASELINE_TIMEOUT)]
+
+    def test_baseline_can_target_source_dirs(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "tests").mkdir()
+        monkeypatch.setattr(mod, "_git_status_porcelain", lambda timeout=10: (0, ""))
+        calls = []
+
+        class _P:
+            returncode = 0
+
+        def fake(*args, timeout=600):
+            calls.append((list(args), timeout))
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["baseline", "src", "tests"])
+        assert res.exit_code == 0
+        assert calls == [(["verify", "--report", "--baseline-write", "src", "tests"], mod.BASELINE_TIMEOUT)]

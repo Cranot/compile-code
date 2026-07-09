@@ -33,6 +33,7 @@ EXIT_TIMEOUT = 124
 # roam verify quality-gate failure (see `roam exit-codes`); the one verify exit
 # code the product surface acts on — checks ran and the score fell below threshold.
 EXIT_VERIFY_GATE = 5
+BASELINE_TIMEOUT = 1200
 
 # The hook script the roam-code dependency installs into a Claude settings
 # file; its presence is how we detect that compile is wired in. Kept as a
@@ -117,6 +118,33 @@ def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str]:
     except KeyboardInterrupt:
         click.echo("VERDICT: interrupted")
         return 130, ""
+
+
+def _git_status_porcelain(timeout: int = 10) -> tuple[int, str]:
+    """Return ``git status --porcelain`` output, or a clean verdict + code.
+
+    `compile baseline` refuses dirty trees before it snapshots accepted debt.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"], timeout=timeout, check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        click.echo("VERDICT: toolchain missing — `git` is not on PATH. Fix: install git and rerun `compile baseline`.")
+        return EXIT_TOOLCHAIN, ""
+    except subprocess.TimeoutExpired:
+        click.echo(
+            f"VERDICT: baseline refused — `git status` timed out after {timeout}s. "
+            "Fix: rerun on a smaller checkout or file an issue."
+        )
+        return EXIT_TIMEOUT, ""
+    except KeyboardInterrupt:
+        click.echo("VERDICT: interrupted")
+        return 130, ""
+    if proc.returncode != 0:
+        click.echo("VERDICT: baseline refused — unable to inspect the git tree. Fix: rerun from a git checkout.")
+        return 1, ""
+    return 0, proc.stdout or ""
 
 
 def _ensure_indexed_for_launch() -> int:
@@ -309,6 +337,28 @@ def _unwire(agent: str, user_level: bool) -> None:
 cli.add_command(_unwire)
 
 
+@cli.command("baseline")
+@click.argument(
+    "paths",
+    nargs=-1,
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=str),
+)
+def _baseline(paths: tuple[str, ...]) -> None:
+    """Snapshot accepted debt for a clean whole-repo tree.
+
+    Uses roam's report mode so the baseline is explicitly whole-repo and
+    avoids the silent no-op shapes that the natural verify invocations hit.
+    Optional directory targets let callers spell the whole repo explicitly.
+    """
+    rc, status = _git_status_porcelain()
+    if rc != 0:
+        raise SystemExit(rc)
+    if status.strip():
+        click.echo("VERDICT: baseline refused — dirty tree. Fix: commit, stash, or rerun on a clean checkout.")
+        raise SystemExit(1)
+    raise SystemExit(_delegate("verify", "--report", "--baseline-write", *paths, timeout=BASELINE_TIMEOUT))
+
+
 @cli.command("claude", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("agent_args", nargs=-1, type=click.UNPROCESSED)
 @click.pass_context
@@ -455,37 +505,64 @@ def _format_verify_failure(**failure: object) -> str:
 @cli.command("verify")
 @click.argument("files", nargs=-1)
 @click.option(
+    "--new-only",
+    is_flag=True,
+    help="Ignore findings already present in .roam/verify-baseline.json (absent baseline behaves like today).",
+)
+@click.option(
+    "--diff-only",
+    is_flag=True,
+    help="Report only violations on edited lines (noise cut; still fails on new violations).",
+)
+@click.option(
     "--threshold",
     type=int,
     default=70,
     show_default=True,
-    help="Fail below this score (default 70, or .roam/verify.yaml).",
+    help="Fail below this score (default 70, or .roam/verify.yaml; diff-only keeps its own score scale).",
 )
-def _verify(files: tuple[str, ...], threshold: int) -> None:
+def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: int) -> None:
     """Run scoped verify on changed files; on failure, explain the next local action.
 
     Delegates to `roam verify` (naming, imports, error handling, duplicates,
-    syntax on the changed set). On a failure the raw check output is kept and
-    followed by a block naming the failing command, the changed files, a
-    likely cause category, and the single local rerun to run next.
+    syntax on the changed set). `--new-only` passes through to roam's accepted-
+    debt baseline; `--diff-only` keeps the output scoped to changed lines.
+    On a failure the raw check output is kept and followed by a block naming
+    the failing command, the changed files, a likely cause category, and the
+    single local rerun to run next.
     """
     targets = list(files) or _changed_files()
-    argv = ["verify", "--threshold", str(threshold), *(targets if targets else ["--changed"])]
+    argv = ["verify"]
+    command = ["compile", "verify"]
+    if new_only:
+        argv.append("--new-only")
+        command.append("--new-only")
+    if diff_only:
+        argv.append("--diff-only")
+        command.append("--diff-only")
+    argv.extend(["--threshold", str(threshold)])
+    if threshold != 70:
+        command.extend(["--threshold", str(threshold)])
+    argv.extend(targets if targets else ["--changed"])
+    command.extend(targets if targets else ["--changed"])
     rc, output = _delegate_capturing(*argv)
     if output:
         click.echo(output.rstrip())
     if rc not in (0, EXIT_TOOLCHAIN, EXIT_TIMEOUT, 130):
         failing = _failing_files(output)
         scoped = failing or targets
-        files_suffix = " ".join(targets) if targets else "--changed"
-        next_suffix = " ".join(scoped) if scoped else "--changed"
-        threshold_suffix = f" --threshold {threshold}" if threshold != 70 else ""
+        next_tokens = ["compile", "verify"]
+        if new_only:
+            next_tokens.append("--new-only")
+        if diff_only:
+            next_tokens.append("--diff-only")
+        next_tokens.extend(scoped if scoped else ["--changed"])
         click.echo(
             _format_verify_failure(
-                command=f"compile verify{threshold_suffix} {files_suffix}",
+                command=" ".join(command),
                 files=targets,
                 cause=_classify_verify_failure(output, rc),
-                next_action=f"compile verify {next_suffix}",
+                next_action=" ".join(next_tokens),
             )
         )
     raise SystemExit(rc)
