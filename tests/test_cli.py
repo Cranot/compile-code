@@ -64,7 +64,7 @@ class TestSurface:
 
     def test_help_lists_all_verbs(self, runner):
         res = runner.invoke(mod.cli, ["--help"])
-        for verb in ("init", "wire", "unwire", "baseline", "claude", "run", "stats", "doctor"):
+        for verb in ("init", "wire", "unwire", "baseline", "report", "claude", "run", "stats", "doctor"):
             assert verb in res.output
 
     def test_init_delegates(self, runner, roam_calls):
@@ -115,6 +115,10 @@ class TestSurface:
 
     def test_stats_delegates(self, runner, roam_calls):
         self._delegates(runner, roam_calls, ["stats"], ["compile-stats"])
+
+    def test_report_delegates_to_persisted_verify_report(self, runner, roam_calls):
+        res = self._delegates(runner, roam_calls, ["report"], ["verify", "--report", "--persist"])
+        assert res.exit_code == 0
 
     def test_baseline_help_lists_the_new_verb(self, runner):
         res = runner.invoke(mod.cli, ["baseline", "--help"])
@@ -208,6 +212,25 @@ class TestClaudeLaunch:
 
 
 class TestDoctor:
+    def test_doctor_reports_present_verify_report_age(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
+        monkeypatch.setattr(mod.time, "time", lambda: 10_000.0)
+        (tmp_path / ".roam").mkdir()
+        report = tmp_path / ".roam" / "verify-report.json"
+        report.write_text("{}")
+        mod.os.utime(report, (9_880, 9_880))
+        res = runner.invoke(mod.cli, ["doctor"])
+        assert "verify report: present (2m old)" in res.output
+
+    def test_doctor_reports_absent_verify_report(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
+        res = runner.invoke(mod.cli, ["doctor"])
+        assert "verify report: none — run `compile report`" in res.output
+
     def test_doctor_reports_unwired_state(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mod, "_on_path", lambda name: True)

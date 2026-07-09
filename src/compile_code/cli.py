@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 
 import click
 
@@ -41,6 +42,7 @@ BASELINE_TIMEOUT = 1200
 # updates in lockstep if roam-code renames the hook.
 HOOK_MARKER = "roam-compile-ups.py"
 LAUNCH_INDEX_HEAD_FILE = os.path.join(".roam", ".compile-code-launch-head")
+VERIFY_REPORT_FILE = os.path.join(".roam", "verify-report.json")
 
 
 def _on_path(name: str) -> bool:
@@ -274,6 +276,23 @@ def _launch_index_needs_refresh() -> bool:
     return _launch_index_head() != current
 
 
+def _verify_report_status() -> str:
+    """Presence and age of roam's persisted verify report, failing open."""
+    try:
+        age_seconds = max(0, int(time.time() - os.path.getmtime(VERIFY_REPORT_FILE)))
+    except (OSError, OverflowError, ValueError):
+        return "none — run `compile report`"
+    if age_seconds < 60:
+        age = f"{age_seconds}s"
+    elif age_seconds < 3600:
+        age = f"{age_seconds // 60}m"
+    elif age_seconds < 86400:
+        age = f"{age_seconds // 3600}h"
+    else:
+        age = f"{age_seconds // 86400}d"
+    return f"present ({age} old)"
+
+
 # Commands are dispatched by string name through this group (via the
 # console-script entry points in pyproject.toml). Keep callback functions
 # private and set the public Click command names explicitly.
@@ -357,6 +376,13 @@ def _baseline(paths: tuple[str, ...]) -> None:
         click.echo("VERDICT: baseline refused — dirty tree. Fix: commit, stash, or rerun on a clean checkout.")
         raise SystemExit(1)
     raise SystemExit(_delegate("verify", "--report", "--baseline-write", *paths, timeout=BASELINE_TIMEOUT))
+
+
+@cli.command("report")
+def _report() -> None:
+    """Persist a whole-repo verify report without gating."""
+    # Report mode composes with accepted-debt --new-only; it does not add a second gate.
+    raise SystemExit(_delegate("verify", "--report", "--persist"))
 
 
 @cli.command("claude", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -594,6 +620,7 @@ def _doctor() -> None:
     click.echo(f"toolchain : {'ok' if toolchain_ok else 'MISSING'}")
     click.echo(f"index     : {'ok' if indexed else 'absent (run `compile init`)'}")
     click.echo(f"claude    : {wired_label}")
+    click.echo(f"verify report: {_verify_report_status()}")
     if not toolchain_ok:
         click.echo("VERDICT: toolchain missing — `roam` not on PATH (pip install --force-reinstall compile-code)")
         raise SystemExit(EXIT_TOOLCHAIN)
