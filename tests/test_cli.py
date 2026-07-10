@@ -8,6 +8,7 @@ subprocess work, so they run anywhere.
 
 from __future__ import annotations
 
+import json
 from importlib.metadata import version
 
 import pytest
@@ -34,6 +35,9 @@ def roam_calls(monkeypatch):
         return _P()
 
     monkeypatch.setattr(mod, "_roam", fake)
+    # Delegation-only tests run from the checkout, whose real Claude settings
+    # must not be mutated by the successful stub.
+    monkeypatch.setattr(mod, "_wire_roam_midtask_access", lambda **kwargs: None)
     return calls
 
 
@@ -160,6 +164,64 @@ class TestWiringSmoke:
         doctor = runner.invoke(mod.cli, ["doctor"])
         assert "wired (project)" in doctor.output
         assert "VERDICT: ready" in doctor.output
+
+
+class TestRoamMidtaskWiring:
+    def _stub_successful_hook_write(self, monkeypatch, tmp_path):
+        class _P:
+            returncode = 0
+
+        def fake(*args, timeout=600):
+            assert list(args) == ["hooks", "claude", "--write"]
+            settings = tmp_path / ".claude" / "settings.json"
+            settings.parent.mkdir(exist_ok=True)
+            settings.write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+
+    def test_wire_adds_curated_permissions_and_guidance_once(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._stub_successful_hook_write(monkeypatch, tmp_path)
+        local_settings = tmp_path / ".claude" / "settings.local.json"
+        local_settings.parent.mkdir()
+        local_settings.write_text('{"permissions": {"allow": ["Bash(pytest:*)"]}, "theme": "dark"}')
+        (tmp_path / "CLAUDE.md").write_text("# Existing instructions\n\nKeep this text.\n")
+
+        first = runner.invoke(mod.cli, ["wire", "claude"])
+        second = runner.invoke(mod.cli, ["wire", "claude"])
+
+        assert first.exit_code == second.exit_code == 0
+        settings = json.loads(local_settings.read_text())
+        allow = settings["permissions"]["allow"]
+        assert settings["theme"] == "dark"
+        assert "Bash(pytest:*)" in allow
+        for entry in mod.ROAM_MIDTASK_ALLOW:
+            assert allow.count(entry) == 1
+        guidance = (tmp_path / "CLAUDE.md").read_text()
+        assert guidance.startswith("# Existing instructions\n\nKeep this text.\n")
+        assert guidance.count(mod.ROAM_GUIDANCE_BEGIN) == 1
+        assert guidance.count(mod.ROAM_GUIDANCE_END) == 1
+        for command in mod.ROAM_MIDTASK_COMMANDS:
+            assert guidance.count(f"`roam {command} --json`") == 1
+        assert "roam ask --json" not in guidance
+        assert "launch-time graph" in guidance
+        assert "edits are invisible until the Stop hook" in guidance
+
+    def test_wire_leaves_malformed_local_settings_and_guidance_untouched(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._stub_successful_hook_write(monkeypatch, tmp_path)
+        local_settings = tmp_path / ".claude" / "settings.local.json"
+        local_settings.parent.mkdir()
+        local_settings.write_text("{not-json\n")
+        claude_md = tmp_path / "CLAUDE.md"
+        claude_md.write_text("# Existing instructions\n")
+
+        result = runner.invoke(mod.cli, ["wire", "claude"])
+
+        assert result.exit_code == 0
+        assert local_settings.read_text() == "{not-json\n"
+        assert claude_md.read_text() == "# Existing instructions\n"
 
 
 class TestClaudeLaunch:

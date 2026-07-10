@@ -18,6 +18,7 @@ Hardening contract: every toolchain failure surfaces as a one-line
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -43,6 +44,19 @@ BASELINE_TIMEOUT = 1200
 HOOK_MARKER = "roam-compile-ups.py"
 LAUNCH_INDEX_HEAD_FILE = os.path.join(".roam", ".compile-code-launch-head")
 VERIFY_REPORT_FILE = os.path.join(".roam", "verify-report.json")
+ROAM_MIDTASK_COMMANDS = (
+    "impact",
+    "critique",
+    "uses",
+    "context",
+    "preflight",
+    "understand",
+    "at",
+    "retrieve",
+)
+ROAM_MIDTASK_ALLOW = tuple(f"Bash(roam {command}:*)" for command in ROAM_MIDTASK_COMMANDS)
+ROAM_GUIDANCE_BEGIN = "<!-- BEGIN compile-code roam graph access -->"
+ROAM_GUIDANCE_END = "<!-- END compile-code roam graph access -->"
 
 
 def _on_path(name: str) -> bool:
@@ -196,13 +210,12 @@ def _exit_after_canonical_claude_hook_update(
     *, uninstall: bool = False, no_verify: bool = False, user_level: bool = False
 ) -> None:
     """Exit through one Claude hook mutation path so wire/unwire cannot drift."""
-    raise SystemExit(
-        _delegate(
-            *_claude_hook_args_for_canonical_write_order(
-                uninstall=uninstall, no_verify=no_verify, user_level=user_level
-            )
-        )
+    rc = _delegate(
+        *_claude_hook_args_for_canonical_write_order(uninstall=uninstall, no_verify=no_verify, user_level=user_level)
     )
+    if rc == 0 and not uninstall:
+        _wire_roam_midtask_access(user_level=user_level)
+    raise SystemExit(rc)
 
 
 def _wired_in(settings_path: str) -> bool:
@@ -214,6 +227,90 @@ def _wired_in(settings_path: str) -> bool:
             return HOOK_MARKER in fh.read()
     except OSError:
         return False
+
+
+def _merge_roam_permissions(settings_path: str) -> bool:
+    """Best-effort merge of curated roam commands into Claude's Bash allow-list."""
+    try:
+        if os.path.exists(settings_path):
+            with open(settings_path, encoding="utf-8") as fh:
+                settings = json.load(fh)
+        else:
+            settings = {}
+        if not isinstance(settings, dict):
+            return False
+        permissions = settings.setdefault("permissions", {})
+        if not isinstance(permissions, dict):
+            return False
+        allow = permissions.setdefault("allow", [])
+        if not isinstance(allow, list):
+            return False
+        changed = False
+        for entry in ROAM_MIDTASK_ALLOW:
+            if entry not in allow:
+                allow.append(entry)
+                changed = True
+        if changed:
+            os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+            with open(settings_path, "w", encoding="utf-8") as fh:
+                json.dump(settings, fh, indent=2)
+                fh.write("\n")
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _roam_guidance_section() -> str:
+    commands = "\n".join(f"- `roam {command} --json`" for command in ROAM_MIDTASK_COMMANDS)
+    return (
+        f"{ROAM_GUIDANCE_BEGIN}\n"
+        "## Roam graph access\n\n"
+        "Use these deterministic graph queries during a task:\n\n"
+        f"{commands}\n\n"
+        "Mid-turn answers come from the launch-time graph; agent edits are invisible until the Stop hook.\n"
+        f"{ROAM_GUIDANCE_END}"
+    )
+
+
+def _merge_roam_guidance(claude_path: str) -> None:
+    """Best-effort, idempotent merge of the curated command advertisement."""
+    try:
+        if os.path.exists(claude_path):
+            with open(claude_path, encoding="utf-8") as fh:
+                content = fh.read()
+        else:
+            content = ""
+        begin = content.find(ROAM_GUIDANCE_BEGIN)
+        end = content.find(ROAM_GUIDANCE_END)
+        if (begin < 0) != (end < 0) or (begin >= 0 and end < begin):
+            return
+        section = _roam_guidance_section()
+        if begin >= 0:
+            end += len(ROAM_GUIDANCE_END)
+            updated = content[:begin] + section + content[end:]
+        else:
+            prefix = content.rstrip()
+            updated = f"{prefix}\n\n{section}\n" if prefix else f"{section}\n"
+        if updated == content:
+            return
+        parent = os.path.dirname(claude_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(claude_path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+    except OSError:
+        return
+
+
+def _wire_roam_midtask_access(*, user_level: bool) -> None:
+    """Expose curated launch-graph queries after the delegated hook write."""
+    claude_dir = os.path.join(os.path.expanduser("~"), ".claude") if user_level else ".claude"
+    if not any(_wired_in(os.path.join(claude_dir, name)) for name in ("settings.local.json", "settings.json")):
+        return
+    if not _merge_roam_permissions(os.path.join(claude_dir, "settings.local.json")):
+        return
+    claude_path = os.path.join(claude_dir, "CLAUDE.md") if user_level else "CLAUDE.md"
+    _merge_roam_guidance(claude_path)
 
 
 def _project_wired() -> bool:
