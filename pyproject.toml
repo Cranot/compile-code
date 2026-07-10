@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     # >=13.7.0: the launch/verify wire contract is pinned at this floor.
-    "roam-code>=13.7.0",
+    "roam-code>=13.8.0",
     "click>=8.0",
 ]
 
