@@ -71,6 +71,12 @@ class TestSurface:
         for verb in ("init", "wire", "unwire", "baseline", "report", "claude", "run", "stats", "doctor"):
             assert verb in res.output
 
+    def test_help_lists_every_registered_command(self, runner):
+        # Self-updating: any @cli.command(...) added in future must surface in --help.
+        output = runner.invoke(mod.cli, ["--help"]).output
+        for name in mod.cli.commands.keys():
+            assert name in output, f"registered command {name!r} missing from --help"
+
     def test_init_delegates(self, runner, roam_calls):
         res = self._delegates(runner, roam_calls, ["init"], ["init"])
         assert res.exit_code == 0
@@ -672,3 +678,24 @@ class TestBaselineVerb:
         res = runner.invoke(mod.cli, ["baseline", "src", "tests"])
         assert res.exit_code == 0
         assert calls == [(["verify", "--report", "--baseline-write", "src", "tests"], mod.BASELINE_TIMEOUT)]
+
+
+class TestCommandInventory:
+    def test_inventory_is_deterministic_and_complete(self):
+        from compile_code.cli import _format_command_inventory
+
+        commands = mod.cli.commands
+        out1 = _format_command_inventory(commands)
+        out2 = _format_command_inventory(commands)
+        assert out1 == out2
+        lines = out1.splitlines()
+        names = [ln.split(" ", 1)[0] for ln in lines]
+        assert names == sorted(mod.cli.commands.keys())
+        assert set(names) == set(mod.cli.commands.keys())
+
+    def test_commands_verb_prints_inventory(self, runner):
+        res = runner.invoke(mod.cli, ["commands"])
+        assert res.exit_code == 0
+        from compile_code.cli import _format_command_inventory
+
+        assert res.output.strip() == _format_command_inventory(mod.cli.commands).strip()

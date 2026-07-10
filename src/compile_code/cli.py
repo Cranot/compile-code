@@ -661,6 +661,22 @@ def _classify_verify_failure(output: str, rc: int) -> str:
     return _EXIT_CAUSE.get(rc, "verify failure")
 
 
+def _format_command_inventory(commands: dict) -> str:
+    """Render a deterministic, greppable dispatch inventory: one 'name — short_help' line per verb."""
+    lines = []
+    for name in sorted(commands):
+        cmd = commands[name]
+        help_text = (cmd.get_short_help_str() or "").strip()
+        lines.append(f"{name} — {help_text}" if help_text else name)
+    return "\n".join(lines)
+
+
+@cli.command("commands")
+def _commands() -> None:
+    """Print a deterministic inventory of all CLI verbs (for scripts / CI)."""
+    click.echo(_format_command_inventory(cli.commands))
+
+
 def _format_verify_failure(**failure: object) -> str:
     """Render the verify-failure block from the context needed to act locally."""
     command = failure.get("command")
