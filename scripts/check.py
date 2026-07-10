@@ -25,6 +25,12 @@ LEAK_PATTERNS = [
     (r"/root/(apps|services|repos)/", "VPS-local path"),
     (r"\binternal/planning/[A-Z]", "private memo reference"),
 ]
+ARTIFACT_SEGMENTS = (".venv", "node_modules", "dist", "build", "__pycache__")
+
+
+def _path_is_committed_artifact(rel: str) -> bool:
+    """Return whether a tracked relative path belongs to a build artifact."""
+    return any(segment in ARTIFACT_SEGMENTS or segment.endswith(".egg-info") for segment in rel.split("/"))
 
 
 def run(title: str, cmd: list[str]) -> bool:
@@ -62,6 +68,15 @@ def leak_scan() -> bool:
     return not hits
 
 
+def artifact_scan() -> bool:
+    tracked = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True).stdout.splitlines()
+    hits = [rel for rel in tracked if _path_is_committed_artifact(rel)]
+    print(f"[check] artifact scan: {'PASS' if not hits else 'FAIL'}")
+    for rel in hits[:10]:
+        print(f"  {rel}  [committed artifact]")
+    return not hits
+
+
 def readme_sanity() -> bool:
     """The promises a reader acts on first must stay true."""
     text = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -82,6 +97,7 @@ def main() -> int:
         run("ruff format --check", [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"]),
         run("pytest", [sys.executable, "-m", "pytest", "tests/", "-q"]),
         leak_scan(),
+        artifact_scan(),
         readme_sanity(),
     ]
     if all(results):
