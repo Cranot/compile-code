@@ -264,6 +264,24 @@ planted hallucinations caught in both languages.
 `compile-code` and `cmpl` are aliases for `compile` if another tool owns
 that name on your system.
 
+## Beyond Claude Code — Codex, MCP, and CI
+
+One-command wiring (`compile wire claude`) targets Claude Code's hook system
+today. The compiler itself is **agent-agnostic** — the compiled envelope is
+just text, so any agent can consume it right now:
+
+- **Any agent, headless.** `compile run "who calls handleSave?"` prints the
+  envelope to stdout. Pipe it into Codex, paste it into a chat, or feed it to
+  a CI step — no Claude required. `--json` gives a machine-readable envelope.
+- **Codex and other MCP clients.** The kernel ships an MCP server (`roam mcp`,
+  from the roam-code dependency). Point Codex — or any MCP-capable client — at
+  it and the same graph facts (callers, blast radius, history) are exposed as
+  live tools.
+- **Roadmap.** A one-command `compile wire codex` (MCP-first) is planned, so
+  Codex gets the same before-the-first-token injection Claude has today.
+
+Every mode is 100% local — no API keys, nothing leaves your machine.
+
 ## Troubleshooting
 
 `compile doctor` diagnoses the three states that matter: toolchain on PATH,
