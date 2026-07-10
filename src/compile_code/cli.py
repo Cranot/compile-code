@@ -42,6 +42,7 @@ BASELINE_TIMEOUT = 1200
 # named constant so the delegated hook-detection contract is explicit and
 # updates in lockstep if roam-code renames the hook.
 HOOK_MARKER = "roam-compile-ups.py"
+HOOK_FILENAMES = (HOOK_MARKER, "roam-verify-stop.py")
 LAUNCH_INDEX_HEAD_FILE = os.path.join(".roam", ".compile-code-launch-head")
 VERIFY_REPORT_FILE = os.path.join(".roam", "verify-report.json")
 ROAM_MIDTASK_COMMANDS = (
@@ -206,6 +207,42 @@ def _claude_hook_args_for_canonical_write_order(
     return args
 
 
+def _override_hook_maintenance_commands(script: str) -> str:
+    """Put roam's group-level mode override before hook maintenance commands.
+
+    roam-code owns the generated hook bodies, so compile-code normalizes the
+    small command-construction seam after installation without copying those
+    bodies into this package. The dynamic form is used by the current Stop
+    hook; the direct form keeps this compatible with simpler hook versions.
+    """
+    dynamic_command = '["roam", "--json", *args]'
+    overridden_dynamic_command = (
+        '["roam", *(["--override-mode"] if args and args[0] in {"verify", "index"} else []), "--json", *args]'
+    )
+    script = script.replace(dynamic_command, overridden_dynamic_command)
+    return re.sub(
+        r'(["\']roam["\']\s*,\s*)(["\'])(verify|index)\2',
+        r'\1"--override-mode", \2\3\2',
+        script,
+    )
+
+
+def _ensure_hook_mode_overrides(*, user_level: bool) -> None:
+    """Best-effort upgrade of roam-managed Claude hook command ordering."""
+    claude_dir = os.path.join(os.path.expanduser("~"), ".claude") if user_level else ".claude"
+    for filename in HOOK_FILENAMES:
+        hook_path = os.path.join(claude_dir, "hooks", filename)
+        try:
+            with open(hook_path, encoding="utf-8") as fh:
+                script = fh.read()
+            updated = _override_hook_maintenance_commands(script)
+            if updated != script:
+                with open(hook_path, "w", encoding="utf-8") as fh:
+                    fh.write(updated)
+        except OSError:
+            continue
+
+
 def _exit_after_canonical_claude_hook_update(
     *, uninstall: bool = False, no_verify: bool = False, user_level: bool = False
 ) -> None:
@@ -214,6 +251,7 @@ def _exit_after_canonical_claude_hook_update(
         *_claude_hook_args_for_canonical_write_order(uninstall=uninstall, no_verify=no_verify, user_level=user_level)
     )
     if rc == 0 and not uninstall:
+        _ensure_hook_mode_overrides(user_level=user_level)
         _wire_roam_midtask_access(user_level=user_level)
     raise SystemExit(rc)
 
@@ -484,8 +522,9 @@ def _report() -> None:
 
 @cli.command("claude", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("agent_args", nargs=-1, type=click.UNPROCESSED)
+@click.option("--read-only", is_flag=True, default=False, help="Enforce read-only mode for the launched agent.")
 @click.pass_context
-def _claude(ctx: click.Context, agent_args: tuple[str, ...]) -> None:
+def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool) -> None:
     """Launch Claude Code with the compile/verify loop active (all-in-one).
 
     Ensures the repo is indexed, wires the hooks if absent, then execs
@@ -503,10 +542,18 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...]) -> None:
     # block the agent launch — but say so instead of swallowing it.
     if not (_project_wired() or _user_wired()) and _delegate("hooks", "claude", "--write") != 0:
         click.echo("compile: wiring failed (continuing without hooks — run `compile doctor`)")
+    # Keep both project-local and user-global managed hooks compatible with
+    # read-only enforcement, including hooks installed before this release.
+    _ensure_hook_mode_overrides(user_level=False)
+    _ensure_hook_mode_overrides(user_level=True)
+    child_env = os.environ.copy()
+    if read_only:
+        child_env.update(ROAM_AGENT_MODE="read_only", ROAM_MODE_ENFORCEMENT="1")
     if os.name == "nt":  # pragma: no cover - windows-only branch
         # exec* on Windows spawns-and-detaches instead of replacing the
         # process (console handling breaks). Run as a child instead.
-        raise SystemExit(subprocess.run(["claude", *agent_args], check=False).returncode)
+        raise SystemExit(subprocess.run(["claude", *agent_args], check=False, env=child_env).returncode)
+    os.environ.update(child_env)
     os.execvp("claude", ["claude", *agent_args])
 
 

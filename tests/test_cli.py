@@ -272,6 +272,48 @@ class TestClaudeLaunch:
         assert ["hooks", "claude", "--write"] in roam_calls
         assert execs and execs[0][0] == "claude"
 
+    def test_read_only_sets_child_mode_enforcement(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        monkeypatch.delenv("ROAM_AGENT_MODE", raising=False)
+        monkeypatch.delenv("ROAM_MODE_ENFORCEMENT", raising=False)
+        # Isolate os.environ: _claude does os.environ.update() before execvp
+        # (mocked here), which would otherwise permanently leak ROAM_* into the
+        # test process and flake sibling tests under the pre-push gate.
+        monkeypatch.setattr(mod.os, "environ", dict(mod.os.environ))
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        child_env = {}
+        monkeypatch.setattr(mod.os, "execvp", lambda _f, _argv: child_env.update(mod.os.environ))
+
+        res = runner.invoke(mod.cli, ["claude", "--read-only"])
+
+        assert res.exit_code == 0
+        assert child_env["ROAM_AGENT_MODE"] == "read_only"
+        assert child_env["ROAM_MODE_ENFORCEMENT"] == "1"
+
+    def test_hook_commands_put_override_before_maintenance_subcommands(self):
+        source = """
+def command(args):
+    return ["roam", "--json", *args]
+
+direct_verify = ["roam", "verify", "--auto"]
+direct_index = ["roam", "index", "--quiet"]
+"""
+        namespace = {}
+
+        exec(mod._override_hook_maintenance_commands(source), namespace)
+
+        assert namespace["command"](["verify", "--auto"]) == ["roam", "--override-mode", "--json", "verify", "--auto"]
+        assert namespace["command"](["index", "--quiet"]) == ["roam", "--override-mode", "--json", "index", "--quiet"]
+        assert namespace["command"](["critique"]) == ["roam", "--json", "critique"]
+        assert namespace["direct_verify"] == ["roam", "--override-mode", "verify", "--auto"]
+        assert namespace["direct_index"] == ["roam", "--override-mode", "index", "--quiet"]
+
 
 class TestDoctor:
     def test_doctor_reports_present_verify_report_age(self, runner, monkeypatch, tmp_path):
