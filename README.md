@@ -56,7 +56,7 @@ and without the compiled envelope — on a 300+ KLOC production Python
 codebase, June 2026. Medians over repeated runs; negative cells published
 alongside the wins.
 
-### Headline (Claude, 41-cell A/B)
+### Headline (Claude, 41-cell A/B — controlled benchmark, June 2026)
 
 | Metric | vanilla | compiled | delta |
 |---|---|---|---|
@@ -113,6 +113,10 @@ Replayed against **723 real prompts** captured from live agent sessions
   that get a skeleton-plus-search envelope instead.
 - Compile latency: **p50 0.45 s** cold on the replay harness, **p50 92 ms**
   in live sessions (warm cache). Zero model calls, fully local.
+- **Continuously re-checked (latest 2026-07-11, roam 13.7.1):** a daily dogfood
+  harness re-measures the envelope on the live codebases — most recent rolling
+  cold-compile p50 = **410 ms**, consistent with the 0.45 s above. The headline
+  A/B table is the June-2026 controlled benchmark.
 
 ### The numbers move with the kernel
 
