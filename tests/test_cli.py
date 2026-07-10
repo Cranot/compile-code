@@ -526,6 +526,15 @@ class TestVerifyFailureFormatting:
     def test_failing_files_dedupes_in_order(self):
         assert mod._failing_files(self.FAIL_OUTPUT) == ["src/bad.py"]
 
+    def test_oversized_helper_returns_advisory_above_cap(self):
+        advisory = mod._oversized_target_set([f"f{i}.py" for i in range(26)], cap=25)
+        assert isinstance(advisory, str) and advisory
+        assert "scope down" in advisory
+
+    def test_oversized_helper_silent_at_or_below_cap(self):
+        assert mod._oversized_target_set(["a.py", "b.py"], cap=25) is None
+        assert mod._oversized_target_set([f"f{i}.py" for i in range(25)], cap=25) is None
+
     def test_classify_maps_failing_sections_to_causes(self):
         assert mod._classify_verify_failure(self.FAIL_OUTPUT, 5) == "naming violation + syntax error"
 
@@ -602,6 +611,21 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 0
         assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
+
+    def test_oversized_advisory_does_not_change_delegation(self, runner, monkeypatch):
+        fake, captured = self._capture(self.FAIL_OUTPUT, 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        files = [f"f{i}.py" for i in range(30)]
+        res = runner.invoke(mod.cli, ["verify", *files])
+        assert res.exit_code == 5
+        assert "scope down" in res.output
+        assert captured["args"] == ["verify", "--threshold", "70", *files]
+
+    def test_no_advisory_for_small_explicit_list(self, runner, monkeypatch):
+        fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        res = runner.invoke(mod.cli, ["verify", "a.py", "b.py"])
+        assert "scope down" not in res.output
 
 
 class TestBaselineVerb:

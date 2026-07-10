@@ -612,6 +612,16 @@ def _changed_files() -> list[str]:
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
+def _oversized_target_set(targets: list[str], cap: int = 25) -> str | None:
+    """Return an advisory for an explicitly oversized target set."""
+    if len(targets) <= cap:
+        return None
+    return (
+        f"note: verifying {len(targets)} files at once (> {cap}); scope down with an explicit smaller file list "
+        "for a faster, sharper check."
+    )
+
+
 def _failing_files(output: str) -> list[str]:
     """Files named on ``FAIL: file:line`` lines, de-duplicated, order-preserving."""
     failing: list[str] = []
@@ -702,6 +712,9 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     single local rerun to run next.
     """
     targets = list(files) or _changed_files()
+    advisory = _oversized_target_set(list(files), cap=25)
+    if advisory:
+        click.echo(advisory)
     argv = ["verify"]
     command = ["compile", "verify"]
     if new_only:
