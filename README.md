@@ -1,13 +1,42 @@
+<div align="center">
+
 # compile-code
 
-**A compiler for AI coding tasks.** It pre-resolves the mechanical work —
-who calls this, what changed recently, what breaks if I touch it, where the
-bug-site code is — *before* your coding agent's first model token, and
-verifies the change after it edits. Your agent spends its turns thinking,
-not grepping.
+**A compiler for AI coding tasks.**
 
-Works with Claude Code today. One command, zero configuration, 100% local —
-nothing leaves your machine, no API keys.
+Pre-resolves the mechanical work — who calls this, what changed recently, what breaks if I touch it, where the bug-site code is — *before* your coding agent's first model token, then verifies the change after it edits. Your agent spends its turns thinking, not grepping.
+
+[![CI](https://github.com/Cranot/compile-code/actions/workflows/ci.yml/badge.svg)](https://github.com/Cranot/compile-code/actions/workflows/ci.yml)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub stars](https://img.shields.io/github/stars/Cranot/compile-code?style=flat-square)](https://github.com/Cranot/compile-code/stargazers)
+
+<sub>Works with Claude Code · one command · zero config · 100% local — no API keys, nothing leaves your machine</sub>
+
+<sub>A thin CLI over the [roam-code](https://github.com/Cranot/roam-code) engine (installed automatically) · 23 intent procedures · 28 languages · zero model calls</sub>
+
+</div>
+
+---
+
+```text
+          your prompt
+               │
+               ▼
+   ┌───────────────────────┐   deterministic · <0.5 s · zero model calls
+   │       COMPILE         │   callers · git log · blast radius · bug-site source
+   └───────────────────────┘
+               │   facts injected before the agent's first token
+               ▼
+   ┌───────────────────────┐
+   │      YOUR AGENT       │   edits with the facts already in context
+   └───────────────────────┘
+               │   after it edits
+               ▼
+   ┌───────────────────────┐   scoped review over exactly the changed lines
+   │        VERIFY         │   returns a fix-or-suppress list before it stops
+   └───────────────────────┘
+```
 
 ## Install and use in 60 seconds
 
@@ -17,7 +46,7 @@ cd your-repo
 compile claude          # index + wire + launch Claude Code, all-in-one
 ```
 
-(`pip install compile-code` once the PyPI release lands.)
+That one line installs the `compile` CLI and its roam-code engine. (A shorter `pip install compile-code` lands with the first PyPI release.)
 
 That's it. From then on, every prompt you type gets compiled facts injected
 before the model sees it, and every edit gets a scoped verification after.
@@ -56,7 +85,7 @@ and without the compiled envelope — on a 300+ KLOC production Python
 codebase, June 2026. Medians over repeated runs; negative cells published
 alongside the wins.
 
-### Headline (Claude, 41-cell A/B — controlled benchmark, June 2026)
+**Headline (Claude, 41-cell A/B — controlled benchmark, June 2026):**
 
 | Metric | vanilla | compiled | delta |
 |---|---|---|---|
@@ -66,7 +95,13 @@ alongside the wins.
 | Wall time | — | — | **−50%** |
 | Compile overhead per prompt | — | p50 92 ms | — |
 
-The same shape reproduces on Opus (−86% turns on navigation tasks).
+The same shape reproduces on Opus (−86% turns on navigation tasks). Quality
+holds: on a ground-truth bug bench (a failing test must transition to
+passing — not LLM-judged), the compiled arm fixed **10/10, same as vanilla,
+at −13% cost**.
+
+<details>
+<summary><strong>Full benchmark breakdown</strong> — per-task gallery (incl. the published losses), the bug bench, and routing stats</summary>
 
 ### Per-task gallery (same bench, median per cell)
 
@@ -129,6 +164,8 @@ The full version-keyed eval history, with raw cells and methodology, lives
 in the [roam-code README](https://github.com/Cranot/roam-code#the-compiler--your-agents-first-token-already-knows-the-answer)
 and its benchmarks directory — this page keeps only the current,
 reproducible numbers.
+
+</details>
 
 ## See one
 
@@ -209,8 +246,8 @@ agent runs as if compile-code were not installed. `--no-verify` skips it.
 These checks are themselves eval-gated: a planted-issues corpus proves
 every category catches its canonical positives, and false-positive locks
 are dogfooded across three real repos (a Python package, a production
-Vue 3 app, a Node/TS server) — zero false positives, planted
-hallucinations caught in both languages.
+Vue 3 app, a Node/TS server) — no false positives across that corpus,
+planted hallucinations caught in both languages.
 
 ## Commands
 
@@ -249,4 +286,4 @@ toolchain libraries. 100% local, no API keys, nothing leaves your machine.
 
 ## License
 
-Apache-2.0
+Apache-2.0 — see [LICENSE](LICENSE). The kernel ([roam-code](https://github.com/Cranot/roam-code)) is Apache-2.0 too.
