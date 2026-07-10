@@ -41,5 +41,5 @@ what.
 ## Releases
 
 GitHub is the source of truth. PyPI publish is owner-gated (no token on the
-dev box). The roam-code dependency floor (`>=13.5`) only moves when the CLI
+dev box). The roam-code dependency floor (`>=13.7.0`) only moves when the CLI
 actually requires a newer kernel feature.
