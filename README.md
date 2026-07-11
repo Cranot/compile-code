@@ -150,8 +150,9 @@ Replayed against **723 real prompts** captured from live agent sessions
   in live sessions (warm cache). Zero model calls, fully local.
 - **Continuously re-checked (latest 2026-07-11, roam 13.7.1):** a daily dogfood
   harness re-measures the envelope on the live codebases — most recent rolling
-  cold-compile p50 = **410 ms**, consistent with the 0.45 s above. The headline
-  A/B table is the June-2026 controlled benchmark.
+  cold-compile median = **410 ms** (a separate live-traffic population, not
+  the 0.45 s replay-harness figure above). The headline A/B table is the
+  June-2026 controlled benchmark.
 
 ### The numbers move with the kernel
 
