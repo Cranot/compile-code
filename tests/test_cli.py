@@ -123,8 +123,63 @@ class TestSurface:
             ["--json", "compile", "task", "--artifact", "auto"],
         )
 
+    def test_run_stamps_compile_agent_mode(self, runner, monkeypatch):
+        seen = []
+
+        def fake(*args, timeout=600):
+            seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
+
+            class _P:
+                returncode = 0
+
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["run", "task"])
+
+        assert res.exit_code == 0
+        assert seen == ["compile"]
+        assert "ROAM_AGENT_MODE" not in mod.os.environ
+
+    def test_run_preserves_codex_agent_mode(self, runner, monkeypatch):
+        seen = []
+
+        def fake(*args, timeout=600):
+            seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
+
+            class _P:
+                returncode = 0
+
+            return _P()
+
+        monkeypatch.setenv("ROAM_AGENT_MODE", "compile_codex")
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["run", "task"])
+
+        assert res.exit_code == 0
+        assert seen == ["compile_codex"]
+
     def test_stats_delegates(self, runner, roam_calls):
         self._delegates(runner, roam_calls, ["stats"], ["compile-stats"])
+
+    def test_stats_does_not_stamp_compile_agent_mode(self, runner, monkeypatch):
+        seen = []
+
+        def fake(*args, timeout=600):
+            seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
+
+            class _P:
+                returncode = 0
+
+            return _P()
+
+        monkeypatch.delenv("ROAM_AGENT_MODE", raising=False)
+        monkeypatch.setattr(mod, "_roam", fake)
+        res = runner.invoke(mod.cli, ["stats"])
+
+        assert res.exit_code == 0
+        assert seen == [None]
+        assert "ROAM_AGENT_MODE" not in mod.os.environ
 
     def test_report_delegates_to_persisted_verify_report(self, runner, roam_calls):
         res = self._delegates(runner, roam_calls, ["report"], ["verify", "--report", "--persist"])
@@ -301,6 +356,23 @@ class TestClaudeLaunch:
         assert res.exit_code == 0
         assert child_env["ROAM_AGENT_MODE"] == "read_only"
         assert child_env["ROAM_MODE_ENFORCEMENT"] == "1"
+
+    def test_claude_stamps_compile_claude_agent_mode(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        child_env = {}
+        monkeypatch.setattr(mod.os, "execvp", lambda _f, _argv: child_env.update(mod.os.environ))
+
+        res = runner.invoke(mod.cli, ["claude"])
+
+        assert res.exit_code == 0
+        assert child_env["ROAM_AGENT_MODE"] == "compile_claude"
 
     def test_hook_commands_put_override_before_maintenance_subcommands(self):
         source = """

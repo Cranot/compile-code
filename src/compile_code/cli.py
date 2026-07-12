@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
 
 import click
 
@@ -80,6 +81,19 @@ def _require_index(path: str = ".") -> bool:
 def _roam(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
     """Run the roam toolchain CLI (provided by the roam-code dependency)."""
     return subprocess.run(["roam", *args], timeout=timeout, check=False)
+
+
+@contextmanager
+def _default_agent_mode(mode: str):
+    """Set the telemetry mode for a product path without clobbering callers."""
+    previous = os.environ.get("ROAM_AGENT_MODE")
+    if previous is None:
+        os.environ["ROAM_AGENT_MODE"] = mode
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("ROAM_AGENT_MODE", None)
 
 
 def _delegate(*args: str, timeout: int = 600) -> int:
@@ -547,6 +561,7 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool) ->
     _ensure_hook_mode_overrides(user_level=False)
     _ensure_hook_mode_overrides(user_level=True)
     child_env = os.environ.copy()
+    child_env.setdefault("ROAM_AGENT_MODE", "compile_claude")
     if read_only:
         child_env.update(ROAM_AGENT_MODE="read_only", ROAM_MODE_ENFORCEMENT="1")
     if os.name == "nt":  # pragma: no cover - windows-only branch
@@ -568,7 +583,8 @@ def _run(task: str, json_out: bool) -> None:
     contract — paste-ready as an agent prompt prefix.
     """
     args = (["--json"] if json_out else []) + ["compile", task, "--artifact", "auto"]
-    raise SystemExit(_delegate(*args))
+    with _default_agent_mode("compile"):
+        raise SystemExit(_delegate(*args))
 
 
 @cli.command("stats")
