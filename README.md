@@ -85,7 +85,7 @@ and without the compiled envelope — on a 300+ KLOC production Python
 codebase, June 2026. Medians over repeated runs; negative cells published
 alongside the wins.
 
-**Headline (Claude, 41-cell A/B — controlled benchmark, June 2026):**
+**Headline (Claude Fable 5, 41-cell A/B, n=2/cell — controlled benchmark, June 2026, roam v13.4):**
 
 | Metric | vanilla | compiled | delta |
 |---|---|---|---|
@@ -95,10 +95,12 @@ alongside the wins.
 | Wall time | — | — | **−50%** |
 | Compile overhead per prompt | — | p50 92 ms | — |
 
-The same shape reproduces on Opus (−86% turns on navigation tasks). Quality
-holds: on a ground-truth bug bench (a failing test must transition to
-passing — not LLM-judged), the compiled arm fixed **10/10, same as vanilla,
-at −13% cost**.
+A second run on Claude Opus showed the same shape (−86% turns on navigation
+tasks). Other model tiers (Sonnet, Haiku, non-Claude agents) have not been
+measured on this A/B — the deltas above are measured on the frontier tier and
+should not be assumed to transfer. Quality holds: on a ground-truth bug bench
+(a failing test must transition to passing — not LLM-judged), the compiled
+arm fixed **10/10, same as vanilla, at −13% cost**.
 
 <details>
 <summary><strong>Full benchmark breakdown</strong> — per-task gallery (incl. the published losses), the bug bench, and routing stats</summary>
