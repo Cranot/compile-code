@@ -95,8 +95,10 @@ alongside the wins.
 | Wall time | — | — | **−50%** |
 | Compile overhead per prompt | — | p50 92 ms | — |
 
-A second run on Claude Opus showed the same shape (−86% turns on navigation
-tasks). Other model tiers (Sonnet, Haiku, non-Claude agents) have not been
+A second run on Claude Opus showed the same direction at smaller magnitude
+(−33% turns overall on that run; the best single cell reached −88%, but no
+aggregate supports more than −33%). Other model tiers (Sonnet, Haiku,
+non-Claude agents) have not been
 measured on this A/B — the deltas above are measured on the frontier tier and
 should not be assumed to transfer. On a ground-truth bug bench (a failing test
 must transition to passing — not LLM-judged), the compiled arm fixed **10/10,
@@ -155,10 +157,15 @@ failing-test-transitions-to-passing oracle — not LLM-judged.
 Replayed against **723 real prompts** captured from live agent sessions
 (re-measured on the June 11 2026 kernel):
 
-- **91% of envelopes ship pre-executed answers** (L1 probes) — the caller
+- **57% of envelopes ship pre-executed answers** (L1 probes) — the caller
   list, the git history, the env-var location, the blast radius — so the
-  agent's first token can be the answer. The other 9% are freeform tasks
-  that get a skeleton-plus-search envelope instead.
+  agent's first token can be the answer. A further ~33% ship structured
+  facts (relevant context, not the literal answer), and the rest are
+  freeform tasks that get a skeleton-plus-search envelope instead. (The
+  57% figure is pinned by a shipped floor test in the engine repo —
+  [`tests/test_l1_rate_floor.py`](https://github.com/Cranot/roam-code/blob/main/tests/test_l1_rate_floor.py);
+  an earlier "91%" wording here counted the facts envelopes as answers,
+  which they are not.)
 - Compile latency: **p50 0.45 s** cold on the replay harness, **p50 92 ms**
   in live sessions (warm cache). Zero model calls, fully local.
 - **Continuously re-checked (latest 2026-07-11, roam 13.7.1):** a daily dogfood
