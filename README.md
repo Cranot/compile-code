@@ -98,9 +98,13 @@ alongside the wins.
 A second run on Claude Opus showed the same shape (−86% turns on navigation
 tasks). Other model tiers (Sonnet, Haiku, non-Claude agents) have not been
 measured on this A/B — the deltas above are measured on the frontier tier and
-should not be assumed to transfer. Quality holds: on a ground-truth bug bench
-(a failing test must transition to passing — not LLM-judged), the compiled
-arm fixed **10/10, same as vanilla, at −13% cost**.
+should not be assumed to transfer. On a ground-truth bug bench (a failing test
+must transition to passing — not LLM-judged), the compiled arm fixed **10/10,
+as did vanilla, at −13% cost**. Read that honestly: **10/10 vs 10/10 does not
+establish quality parity** — at n=10 the 95% interval on the true resolve rate
+runs [72%, 100%], and a compiled arm that had genuinely dropped to 90% would
+still have shown 10/10 about a third of the time. It means **no quality
+difference was detected at a sample size with little power to detect one.**
 
 <details>
 <summary><strong>Full benchmark breakdown</strong> — per-task gallery (incl. the published losses), the bug bench, and routing stats</summary>
@@ -134,7 +138,14 @@ navigation, debugging, and review-shaped work.
 20-cell bench: planted bugs with real tracebacks, graded by a
 failing-test-transitions-to-passing oracle — not LLM-judged.
 
-- **Quality parity: 10/10 fixed in both arms.**
+- **10/10 fixed in both arms — but this is NOT a parity result.** n=10 gives a 95%
+  interval of [72%, 100%] on the true resolve rate; a real drop to 90% would still
+  show 10/10 roughly a third of the time. Pooling all three graded bug benches we
+  have run (28 instances): compiled **23/28 (82%, CI [64%, 92%])** vs vanilla
+  **22/28 (79%, CI [61%, 90%])** — the intervals overlap almost entirely.
+  **No quality difference has been detected; the data cannot rule out a meaningful
+  difference in either direction.** If quality parity matters to your decision, say
+  so and we will run a bench large enough to actually test it.
 - Compiled arm cost **$5.55 vs $6.41** total (−13%) — the envelope ships the
   bug-site source slice (±12 lines around the cited `path:line`), so the
   typical fix landed within 2 turns instead of a grep-and-read walk.
