@@ -18,7 +18,6 @@ Hardening contract: every toolchain failure surfaces as a one-line
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import subprocess
@@ -26,8 +25,6 @@ import time
 from contextlib import contextmanager
 
 import click
-
-from compile_code import __version__
 
 __all__ = ["cli"]
 
@@ -108,6 +105,14 @@ def _delegate(*args: str, timeout: int = 600) -> int:
             "(installs the roam-code dependency)"
         )
         return EXIT_TOOLCHAIN
+    except OSError as exc:
+        # Present on PATH but not launchable: broken shim, wrong-arch binary,
+        # permission denied. Same contract slot as missing: exit 2, no traceback.
+        click.echo(
+            f"VERDICT: toolchain broken — `roam` failed to launch ({exc}). "
+            "Fix: pip install --force-reinstall compile-code"
+        )
+        return EXIT_TOOLCHAIN
     except subprocess.TimeoutExpired:
         click.echo(f"VERDICT: toolchain call timed out after {timeout}s — rerun with a smaller scope or file an issue")
         return EXIT_TIMEOUT
@@ -123,18 +128,40 @@ def _roam_capture(*args: str, timeout: int = 600) -> subprocess.CompletedProcess
     ``_roam``. Only ``verify`` needs the captured output — to classify the
     failure and explain the next local action — so the other commands keep
     streaming via ``_delegate``.
+
+    Decoding is pinned to UTF-8 with replacement so undecodable toolchain
+    bytes can never raise mid-capture (Windows would otherwise decode roam's
+    UTF-8 output as the legacy code page — or crash on it).
     """
-    return subprocess.run(["roam", *args], timeout=timeout, check=False, capture_output=True, text=True)
+    return subprocess.run(
+        ["roam", *args],
+        timeout=timeout,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
-def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str]:
+def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str | None]:
     """Run the toolchain and translate failure modes like ``_delegate``.
 
     Returns ``(rc, stdout)`` instead of streaming, so the caller can classify
     a verify failure from roam's check output before composing the verdict.
+    ``stdout`` is ``None`` when the toolchain never produced a result (missing,
+    broken, timed out, interrupted) — the verdict was already emitted here, so
+    callers must not layer their own failure analysis on top. That sentinel is
+    what disambiguates our ``EXIT_TOOLCHAIN`` (2) from roam's own exit 2
+    ("bad arguments"). Captured stderr is surfaced on failure so a toolchain
+    crash keeps its diagnostic instead of collapsing to a bare exit code.
     """
     try:
         proc = _roam_capture(*args, timeout=timeout)
+        if proc.returncode != 0:
+            stderr = getattr(proc, "stderr", "") or ""
+            if stderr.strip():
+                click.echo(stderr.rstrip(), err=True)
         return proc.returncode, proc.stdout or ""
     except FileNotFoundError:
         click.echo(
@@ -142,13 +169,19 @@ def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str]:
             "Fix: pip install --force-reinstall compile-code  "
             "(installs the roam-code dependency)"
         )
-        return EXIT_TOOLCHAIN, ""
+        return EXIT_TOOLCHAIN, None
+    except OSError as exc:
+        click.echo(
+            f"VERDICT: toolchain broken — `roam` failed to launch ({exc}). "
+            "Fix: pip install --force-reinstall compile-code"
+        )
+        return EXIT_TOOLCHAIN, None
     except subprocess.TimeoutExpired:
         click.echo(f"VERDICT: toolchain call timed out after {timeout}s — rerun with a smaller scope or file an issue")
-        return EXIT_TIMEOUT, ""
+        return EXIT_TIMEOUT, None
     except KeyboardInterrupt:
         click.echo("VERDICT: interrupted")
-        return 130, ""
+        return 130, None
 
 
 def _git_status_porcelain(timeout: int = 10) -> tuple[int, str]:
@@ -158,10 +191,19 @@ def _git_status_porcelain(timeout: int = 10) -> tuple[int, str]:
     """
     try:
         proc = subprocess.run(
-            ["git", "status", "--porcelain"], timeout=timeout, check=False, capture_output=True, text=True
+            ["git", "status", "--porcelain"],
+            timeout=timeout,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         click.echo("VERDICT: toolchain missing — `git` is not on PATH. Fix: install git and rerun `compile baseline`.")
+        return EXIT_TOOLCHAIN, ""
+    except OSError as exc:
+        click.echo(f"VERDICT: baseline refused — `git` failed to launch ({exc}). Fix: reinstall git and rerun.")
         return EXIT_TOOLCHAIN, ""
     except subprocess.TimeoutExpired:
         click.echo(
@@ -253,7 +295,7 @@ def _ensure_hook_mode_overrides(*, user_level: bool) -> None:
             if updated != script:
                 with open(hook_path, "w", encoding="utf-8") as fh:
                     fh.write(updated)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             continue
 
 
@@ -271,18 +313,29 @@ def _exit_after_canonical_claude_hook_update(
 
 
 def _wired_in(settings_path: str) -> bool:
-    """True when the compile hook is present in a Claude settings file."""
+    """True when the compile hook is present in a Claude settings file.
+
+    ``UnicodeDecodeError`` counts as "not wired": a settings file saved in a
+    non-UTF-8 encoding (PowerShell defaults to UTF-16 with a BOM) must degrade
+    to re-wiring, never crash `doctor` / `wire` / `claude`.
+    """
     if not os.path.exists(settings_path):
         return False
     try:
         with open(settings_path, encoding="utf-8") as fh:
             return HOOK_MARKER in fh.read()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
 
 
 def _merge_roam_permissions(settings_path: str) -> bool:
-    """Best-effort merge of curated roam commands into Claude's Bash allow-list."""
+    """Best-effort merge of curated roam commands into Claude's Bash allow-list.
+
+    ``json`` is imported lazily (same contract as ``_on_path``'s shutil): only
+    the wire path parses settings files, so the common commands skip the cost.
+    """
+    import json
+
     try:
         if os.path.exists(settings_path):
             with open(settings_path, encoding="utf-8") as fh:
@@ -350,7 +403,7 @@ def _merge_roam_guidance(claude_path: str) -> None:
             os.makedirs(parent, exist_ok=True)
         with open(claude_path, "w", encoding="utf-8") as fh:
             fh.write(updated)
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return
 
 
@@ -384,9 +437,15 @@ def _launch_head() -> str | None:
     """Short git HEAD for the current repo, or ``None`` if it cannot be read."""
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], check=False, capture_output=True, text=True, timeout=10
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired):
         return None
     head = proc.stdout.strip()
     if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]+", head):
@@ -399,7 +458,8 @@ def _launch_index_head() -> str | None:
     try:
         with open(LAUNCH_INDEX_HEAD_FILE, encoding="utf-8") as fh:
             head = fh.read().strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A corrupted marker means "unknown HEAD" — fail open into a re-index.
         return None
     return head if re.fullmatch(r"[0-9a-f]+", head) else None
 
@@ -442,11 +502,34 @@ def _verify_report_status() -> str:
     return f"present ({age} old)"
 
 
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """Resolve and print the package version only when ``--version`` is passed.
+
+    A plain ``click.version_option(version=__version__)`` forces the
+    ``importlib.metadata`` lookup at import time on every invocation; this
+    callback defers it to the one command that needs it. Output format matches
+    click's default version message.
+    """
+    if not value or ctx.resilient_parsing:
+        return
+    from compile_code import __version__
+
+    click.echo(f"{ctx.find_root().info_name}, version {__version__}")
+    ctx.exit()
+
+
 # Commands are dispatched by string name through this group (via the
 # console-script entry points in pyproject.toml). Keep callback functions
 # private and set the public Click command names explicitly.
 @click.group()
-@click.version_option(version=__version__, package_name="compile-code")
+@click.option(
+    "--version",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_print_version,
+    help="Show the version and exit.",
+)
 def cli() -> None:
     """compile-code — pre-resolve repo facts before your AI agent's first token.
 
@@ -534,6 +617,35 @@ def _report() -> None:
     raise SystemExit(_delegate("verify", "--report", "--persist"))
 
 
+def _launch_agent(argv: list[str], env: dict[str, str], *, use_exec: bool | None = None) -> int:
+    """Hand the console to the agent binary, mapping launch failures to the contract.
+
+    POSIX replaces this process via exec, so a return only happens on failure;
+    Windows runs the agent as a child because exec* there spawns-and-detaches
+    (console handling breaks). ``use_exec`` lets tests pin either branch
+    regardless of the platform they run on. The PATH check at command start is
+    advisory only — the binary can vanish or be unlaunchable by the time we
+    get here, and that race must end in a verdict, not a traceback.
+    """
+    if use_exec is None:
+        use_exec = os.name != "nt"
+    try:
+        if use_exec:
+            os.environ.update(env)
+            os.execvp(argv[0], argv)
+            return 0  # only reachable when tests stub execvp; exec does not return
+        return subprocess.run(argv, check=False, env=env).returncode
+    except FileNotFoundError:
+        click.echo(f"VERDICT: `{argv[0]}` vanished from PATH mid-launch — reinstall it and rerun")
+        return 1
+    except OSError as exc:
+        click.echo(f"VERDICT: could not launch `{argv[0]}` ({exc}) — reinstall it and rerun")
+        return 1
+    except KeyboardInterrupt:
+        click.echo("VERDICT: interrupted")
+        return 130
+
+
 @cli.command("claude", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("agent_args", nargs=-1, type=click.UNPROCESSED)
 @click.option("--read-only", is_flag=True, default=False, help="Enforce read-only mode for the launched agent.")
@@ -564,12 +676,7 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool) ->
     child_env.setdefault("ROAM_AGENT_MODE", "compile_claude")
     if read_only:
         child_env.update(ROAM_AGENT_MODE="read_only", ROAM_MODE_ENFORCEMENT="1")
-    if os.name == "nt":  # pragma: no cover - windows-only branch
-        # exec* on Windows spawns-and-detaches instead of replacing the
-        # process (console handling breaks). Run as a child instead.
-        raise SystemExit(subprocess.run(["claude", *agent_args], check=False, env=child_env).returncode)
-    os.environ.update(child_env)
-    os.execvp("claude", ["claude", *agent_args])
+    raise SystemExit(_launch_agent(["claude", *agent_args], child_env))
 
 
 @cli.command("run")
@@ -582,6 +689,9 @@ def _run(task: str, json_out: bool) -> None:
     (callers, history, blast radius, bug-site source, ...) and an answer
     contract — paste-ready as an agent prompt prefix.
     """
+    if not task.strip():
+        click.echo('VERDICT: empty task — pass a navigation prompt, e.g. compile run "who calls handleSave?"')
+        raise SystemExit(1)
     args = (["--json"] if json_out else []) + ["compile", task, "--artifact", "auto"]
     with _default_agent_mode("compile"):
         raise SystemExit(_delegate(*args))
@@ -621,9 +731,17 @@ def _changed_files() -> list[str]:
     """Tracked files that differ from HEAD (staged + unstaged). Empty outside git."""
     try:
         out = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"], check=False, capture_output=True, text=True, timeout=10
+            ["git", "diff", "--name-only", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
         ).stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired):
+        # OSError covers missing AND unlaunchable git; scoping falls back to
+        # roam's own --changed detection rather than crashing `compile verify`.
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
 
@@ -763,7 +881,12 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     rc, output = _delegate_capturing(*argv)
     if output:
         click.echo(output.rstrip())
-    if rc not in (0, EXIT_TOOLCHAIN, EXIT_TIMEOUT, 130):
+    # output is None => the toolchain never ran to completion (missing, broken,
+    # timed out, interrupted) and its verdict is already on screen. Every
+    # completed nonzero run gets the failure block — including roam's own
+    # exit 2 ("bad arguments"), which only the sentinel can distinguish from
+    # this CLI's EXIT_TOOLCHAIN (also 2).
+    if rc != 0 and output is not None:
         failing = _failing_files(output)
         scoped = failing or targets
         next_tokens = ["compile", "verify"]

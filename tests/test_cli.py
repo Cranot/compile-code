@@ -292,16 +292,26 @@ class TestClaudeLaunch:
         assert res.exit_code == 1
         assert "not found on PATH" in res.output
 
+    def _stub_launch(self, monkeypatch, rc=0):
+        """Stub the launch seam; record (argv, env) per call."""
+        launches = []
+
+        def fake(argv, env, *, use_exec=None):
+            launches.append((list(argv), dict(env)))
+            return rc
+
+        monkeypatch.setattr(mod, "_launch_agent", fake)
+        return launches
+
     def test_indexes_wires_then_execs(self, runner, roam_calls, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)  # no index here
         monkeypatch.setattr(mod, "_on_path", lambda name: True)
-        execs = []
-        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        launches = self._stub_launch(monkeypatch)
         res = runner.invoke(mod.cli, ["claude", "--", "-p", "hello"])
         assert res.exit_code == 0
         assert ["init"] in roam_calls
         assert ["hooks", "claude", "--write"] in roam_calls
-        assert execs and execs[0][0] == "claude"
+        assert launches and launches[0][0][0] == "claude"
 
     def test_skips_wiring_when_repo_is_already_wired(self, runner, roam_calls, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -312,12 +322,11 @@ class TestClaudeLaunch:
         (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
-        execs = []
-        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        launches = self._stub_launch(monkeypatch)
         res = runner.invoke(mod.cli, ["claude"])
         assert res.exit_code == 0
         assert roam_calls == []
-        assert execs and execs[0][0] == "claude"
+        assert launches and launches[0][0][0] == "claude"
 
     def test_wires_when_repo_is_indexed_but_unwired(self, runner, roam_calls, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -326,12 +335,24 @@ class TestClaudeLaunch:
         monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
-        execs = []
-        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        launches = self._stub_launch(monkeypatch)
         res = runner.invoke(mod.cli, ["claude"])
         assert res.exit_code == 0
         assert ["hooks", "claude", "--write"] in roam_calls
-        assert execs and execs[0][0] == "claude"
+        assert launches and launches[0][0][0] == "claude"
+
+    def test_launch_exit_code_propagates(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        self._stub_launch(monkeypatch, rc=7)
+        res = runner.invoke(mod.cli, ["claude"])
+        assert res.exit_code == 7
 
     def test_read_only_sets_child_mode_enforcement(self, runner, roam_calls, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -340,20 +361,16 @@ class TestClaudeLaunch:
         monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
         monkeypatch.delenv("ROAM_AGENT_MODE", raising=False)
         monkeypatch.delenv("ROAM_MODE_ENFORCEMENT", raising=False)
-        # Isolate os.environ: _claude does os.environ.update() before execvp
-        # (mocked here), which would otherwise permanently leak ROAM_* into the
-        # test process and flake sibling tests under the pre-push gate.
-        monkeypatch.setattr(mod.os, "environ", dict(mod.os.environ))
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
-        child_env = {}
-        monkeypatch.setattr(mod.os, "execvp", lambda _f, _argv: child_env.update(mod.os.environ))
+        launches = self._stub_launch(monkeypatch)
 
         res = runner.invoke(mod.cli, ["claude", "--read-only"])
 
         assert res.exit_code == 0
+        child_env = launches[0][1]
         assert child_env["ROAM_AGENT_MODE"] == "read_only"
         assert child_env["ROAM_MODE_ENFORCEMENT"] == "1"
 
@@ -362,17 +379,17 @@ class TestClaudeLaunch:
         monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod, "_require_index", lambda: True)
         monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        monkeypatch.delenv("ROAM_AGENT_MODE", raising=False)
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.local.json").write_text(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
-        child_env = {}
-        monkeypatch.setattr(mod.os, "execvp", lambda _f, _argv: child_env.update(mod.os.environ))
+        launches = self._stub_launch(monkeypatch)
 
         res = runner.invoke(mod.cli, ["claude"])
 
         assert res.exit_code == 0
-        assert child_env["ROAM_AGENT_MODE"] == "compile_claude"
+        assert launches[0][1]["ROAM_AGENT_MODE"] == "compile_claude"
 
     def test_hook_commands_put_override_before_maintenance_subcommands(self):
         source = """
@@ -486,6 +503,174 @@ class TestFailurePaths:
         assert res.exit_code == 124
         assert "timed out" in res.output
 
+    def _raise_broken(self, *args, timeout=600):
+        raise PermissionError(13, "Access is denied", "roam")
+
+    @pytest.mark.parametrize("argv", [["init"], ["run", "task"], ["stats"]])
+    def test_broken_toolchain_is_a_verdict_not_a_traceback(self, runner, monkeypatch, argv):
+        # On PATH but unlaunchable (broken shim, wrong arch, permissions):
+        # the docstring contract says exit 2 "toolchain missing/broken".
+        monkeypatch.setattr(mod, "_roam", self._raise_broken)
+        res = runner.invoke(mod.cli, argv)
+        assert res.exit_code == 2
+        assert "VERDICT: toolchain broken" in res.output
+        assert "Traceback" not in res.output
+
+    def test_run_refuses_empty_task_without_touching_the_toolchain(self, runner, monkeypatch):
+        monkeypatch.setattr(mod, "_roam", lambda *a, timeout=600: pytest.fail("must not call the toolchain"))
+        res = runner.invoke(mod.cli, ["run", "   "])
+        assert res.exit_code == 1
+        assert "VERDICT: empty task" in res.output
+
+
+class TestVerifyToolchainFailureIsNotAVerifyFailure:
+    """`compile verify` must not stack its failure block on a toolchain that
+    never ran — and must not confuse roam's exit 2 (bad arguments) with the
+    CLI's own EXIT_TOOLCHAIN (also 2)."""
+
+    def test_missing_toolchain_skips_the_failure_block(self, runner, monkeypatch):
+        def raise_missing(*args, timeout=600):
+            raise FileNotFoundError("roam")
+
+        monkeypatch.setattr(mod, "_roam_capture", raise_missing)
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+        assert res.exit_code == 2
+        assert "VERDICT: toolchain missing" in res.output
+        assert "verify failed" not in res.output
+
+    def test_broken_toolchain_skips_the_failure_block(self, runner, monkeypatch):
+        def raise_broken(*args, timeout=600):
+            raise PermissionError(13, "Access is denied", "roam")
+
+        monkeypatch.setattr(mod, "_roam_capture", raise_broken)
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+        assert res.exit_code == 2
+        assert "VERDICT: toolchain broken" in res.output
+        assert "verify failed" not in res.output
+
+    def test_timeout_skips_the_failure_block(self, runner, monkeypatch):
+        def raise_timeout(*args, timeout=600):
+            raise mod.subprocess.TimeoutExpired(cmd=["roam"], timeout=timeout)
+
+        monkeypatch.setattr(mod, "_roam_capture", raise_timeout)
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+        assert res.exit_code == 124
+        assert "timed out" in res.output
+        assert "verify failed" not in res.output
+
+    def test_roam_exit_2_bad_arguments_gets_the_failure_block(self, runner, monkeypatch):
+        # roam ran and exited 2 on its own: that is a completed verify run,
+        # so the explained block must appear with the exit-code cause.
+        class _P:
+            returncode = 2
+            stdout = "error: unknown flag --bogus\n"
+
+        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600: _P())
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+        assert res.exit_code == 2
+        assert "VERDICT: verify failed." in res.output
+        assert "cause   : bad arguments" in res.output
+
+    def test_toolchain_stderr_is_surfaced_on_failure(self, runner, monkeypatch):
+        # A roam crash (rc=1, diagnostics only on stderr) must keep its
+        # diagnostic instead of collapsing to a bare "verify failure".
+        class _P:
+            returncode = 1
+            stdout = ""
+            stderr = "RuntimeError: kernel exploded\n"
+
+        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600: _P())
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+        assert res.exit_code == 1
+        assert "kernel exploded" in res.stderr
+        assert "VERDICT: verify failed." in res.output
+
+
+class TestLaunchAgentFailurePaths:
+    """The agent launch seam maps every launch failure to a verdict + code —
+    the PATH check at command start is advisory, so the race where the binary
+    vanishes or cannot start must not traceback."""
+
+    def test_exec_branch_hands_env_and_argv_to_execvp(self, monkeypatch):
+        monkeypatch.setattr(mod.os, "environ", dict(mod.os.environ))
+        recorded = {}
+        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: recorded.update(file=f, argv=argv))
+        rc = mod._launch_agent(["claude", "-p", "hi"], {"ROAM_AGENT_MODE": "compile_claude"}, use_exec=True)
+        assert rc == 0
+        assert recorded["file"] == "claude"
+        assert recorded["argv"] == ["claude", "-p", "hi"]
+        assert mod.os.environ["ROAM_AGENT_MODE"] == "compile_claude"
+
+    def test_child_branch_propagates_exit_code(self, monkeypatch):
+        class _P:
+            returncode = 7
+
+        monkeypatch.setattr(mod.subprocess, "run", lambda argv, check, env: _P())
+        assert mod._launch_agent(["claude"], {}, use_exec=False) == 7
+
+    def test_vanished_binary_is_a_verdict_exit_1(self, monkeypatch, capsys):
+        def raise_missing(argv, check, env):
+            raise FileNotFoundError("claude")
+
+        monkeypatch.setattr(mod.subprocess, "run", raise_missing)
+        assert mod._launch_agent(["claude"], {}, use_exec=False) == 1
+        assert "vanished from PATH" in capsys.readouterr().out
+
+    def test_unlaunchable_binary_is_a_verdict_exit_1(self, monkeypatch, capsys):
+        monkeypatch.setattr(mod.os, "environ", dict(mod.os.environ))
+
+        def raise_broken(f, argv):
+            raise OSError(8, "Exec format error")
+
+        monkeypatch.setattr(mod.os, "execvp", raise_broken)
+        assert mod._launch_agent(["claude"], {}, use_exec=True) == 1
+        assert "could not launch" in capsys.readouterr().out
+
+    def test_interrupt_maps_to_130(self, monkeypatch, capsys):
+        def raise_interrupt(argv, check, env):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(mod.subprocess, "run", raise_interrupt)
+        assert mod._launch_agent(["claude"], {}, use_exec=False) == 130
+        assert "interrupted" in capsys.readouterr().out
+
+
+class TestEncodingRobustness:
+    """Settings and marker files written in non-UTF-8 encodings (PowerShell
+    defaults to UTF-16 with a BOM) must degrade gracefully, never traceback."""
+
+    def test_wired_in_treats_utf16_settings_as_unwired(self, tmp_path):
+        settings = tmp_path / "settings.local.json"
+        with open(settings, "w", encoding="utf-16") as fh:
+            fh.write(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        assert mod._wired_in(str(settings)) is False
+
+    def test_doctor_survives_utf16_settings_file(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
+        (tmp_path / ".claude").mkdir()
+        with open(tmp_path / ".claude" / "settings.local.json", "w", encoding="utf-16") as fh:
+            fh.write(f'{{"hooks": "{mod.HOOK_MARKER}"}}')
+        res = runner.invoke(mod.cli, ["doctor"])
+        assert res.exit_code == 0
+        assert "not wired" in res.output
+        assert "Traceback" not in res.output
+
+    def test_merge_roam_guidance_leaves_utf16_claude_md_untouched(self, tmp_path):
+        claude_md = tmp_path / "CLAUDE.md"
+        with open(claude_md, "w", encoding="utf-16") as fh:
+            fh.write("# Existing instructions\n")
+        before = claude_md.read_bytes()
+        mod._merge_roam_guidance(str(claude_md))  # must not raise
+        assert claude_md.read_bytes() == before
+
+    def test_corrupt_launch_head_marker_reads_as_unknown(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_bytes(b"\xff\xfe\x00garbage")
+        assert mod._launch_index_head() is None
+
 
 class TestEnsureIndexedForLaunch:
     """The index-delegation contract, tested directly — no click context."""
@@ -564,11 +749,11 @@ class TestFailurePathsLaunch:
             returncode = 1
 
         monkeypatch.setattr(mod, "_roam", lambda *a, timeout=600: _Fail())
-        execs = []
-        monkeypatch.setattr(mod.os, "execvp", lambda f, argv: execs.append((f, argv)))
+        launches = []
+        monkeypatch.setattr(mod, "_launch_agent", lambda argv, env, **kw: launches.append(list(argv)) or 0)
         res = runner.invoke(mod.cli, ["claude"])
         assert "wiring failed (continuing without hooks" in res.output
-        assert execs and execs[0][0] == "claude"
+        assert launches and launches[0][0] == "claude"
         assert res.exit_code == 0
 
 
