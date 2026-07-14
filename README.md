@@ -162,10 +162,13 @@ Replayed against **723 real prompts** captured from live agent sessions
   agent's first token can be the answer. A further ~33% ship structured
   facts (relevant context, not the literal answer), and the rest are
   freeform tasks that get a skeleton-plus-search envelope instead. (The
-  57% figure is pinned by a shipped floor test in the engine repo —
-  [`tests/test_l1_rate_floor.py`](https://github.com/Cranot/roam-code/blob/main/tests/test_l1_rate_floor.py);
-  an earlier "91%" wording here counted the facts envelopes as answers,
-  which they are not.)
+  engine repo ships a regression guard for this rate —
+  [`tests/test_l1_rate_floor.py`](https://github.com/Cranot/roam-code/blob/main/tests/test_l1_rate_floor.py)
+  replays a deterministic 60-prompt subsample of the corpus and fails
+  below a 45% L1 floor; it recorded 56.7% at introduction and skips on
+  public CI, where the private corpus and index are absent. An earlier
+  "91%" wording here counted the facts envelopes as answers, which they
+  are not.)
 - Compile latency: **p50 0.45 s** cold on the replay harness, **p50 92 ms**
   in live sessions (warm cache). Zero model calls, fully local.
 - **Continuously re-checked (latest 2026-07-11, roam 13.7.1):** a daily dogfood
@@ -176,7 +179,7 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code pins `roam-code >= 13.7.0` and picks up every kernel release —
+compile-code pins `roam-code >= 13.8.0` and picks up every kernel release —
 so the published losses above are not static marketing: each one was
 attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped
@@ -279,7 +282,11 @@ planted hallucinations caught in both languages.
 | `compile wire claude` | Persistent wiring; `--user` for all repos, `--no-verify` to skip the post-edit check |
 | `compile unwire claude` | Remove the hooks (`--user` for the user-global install) |
 | `compile run "task"` | Headless: print the compiled envelope (`--json` for scripts/CI) |
+| `compile verify [files...]` | Scoped review of the changed files (`--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
+| `compile baseline [dirs...]` | Snapshot accepted debt for a clean whole-repo tree (refuses a dirty tree) |
+| `compile report` | Persist a whole-repo verify report without gating |
 | `compile stats` | Routing/latency/cache telemetry for this repo |
+| `compile commands` | Print a deterministic inventory of all CLI verbs (for scripts/CI) |
 | `compile doctor` | Check toolchain, index, and wiring (project + user-global) |
 
 `compile-code` and `cmpl` are aliases for `compile` if another tool owns

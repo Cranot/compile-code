@@ -27,6 +27,16 @@ LEAK_PATTERNS = [
 ]
 ARTIFACT_SEGMENTS = (".venv", "node_modules", "dist", "build", "__pycache__")
 
+# Claims retired by the 2026-07-14 public-claims audit. A match fails unless
+# an allow-marker shares its line(s) — i.e. the claim is quoted as corrected
+# history ("an earlier ... wording", a parity caveat), not asserted as truth.
+RETIRED_CLAIMS = [
+    (r"91%\s+of\s+envelopes", "retired 91% pre-executed claim (corrected: 57% L1 + ~33% facts)", ()),
+    (r"10/10[\s\S]{0,40}?both\s+arms", "10/10 both-arms phrasing without the parity caveat", ("parity", "n=10")),
+    (r"[−-]86%\s+turns", "retired -86% Opus turns claim (corrected: -33% overall)", ("corrected",)),
+    (r"pip\s+install\s+compile-code(?![\w-])", "bare pip install compile-code (not on PyPI)", ("pypi", "uninstall")),
+]
+
 
 def _path_is_committed_artifact(rel: str) -> bool:
     """Return whether a tracked relative path belongs to a build artifact."""
@@ -77,14 +87,54 @@ def artifact_scan() -> bool:
     return not hits
 
 
+def _floor_drift(pyproject: str, docs: dict[str, str]) -> list[str]:
+    """Every roam-code floor quoted in the docs must match the pyproject pin."""
+    pin = re.search(r'"roam-code>=([\d.]+)"', pyproject)
+    if not pin:
+        return ["roam-code pin missing from pyproject.toml"]
+    floor = pin.group(1)
+    problems = []
+    # The comment above the pin quotes the floor too — keep it honest.
+    for quoted in re.findall(r"#\s*>=([\d.]+):", pyproject):
+        if quoted != floor:
+            problems.append(f"pyproject.toml comment says >={quoted} but the pin is >={floor}")
+    for name, doc in docs.items():
+        quotes = re.findall(r"roam-code[^\n]{0,60}?>=\s*([\d.]+)", doc)
+        if not quotes:
+            problems.append(f"{name}: no roam-code floor mention found to verify against the pin")
+        problems += [f"{name} quotes roam-code >={q} but the pin is >={floor}" for q in quotes if q != floor]
+    return problems
+
+
+def _retired_claim_hits(name: str, doc: str) -> list[str]:
+    """Unannotated reappearances of retired public claims in one doc."""
+    hits = []
+    for pattern, label, allow in RETIRED_CLAIMS:
+        for m in re.finditer(pattern, doc, re.IGNORECASE):
+            line_start = doc.rfind("\n", 0, m.start()) + 1
+            line_end = doc.find("\n", m.end())
+            segment = doc[line_start : line_end if line_end != -1 else len(doc)].lower()
+            if any(marker in segment for marker in allow):
+                continue
+            problems_line = doc.count("\n", 0, m.start()) + 1
+            hits.append(f"{name}:{problems_line}: {label}")
+    return hits
+
+
 def readme_sanity() -> bool:
     """The promises a reader acts on first must stay true."""
     text = (ROOT / "README.md").read_text(encoding="utf-8")
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     problems = []
     if "pip install git+https://github.com/Cranot/compile-code" not in text:
         problems.append("install command missing")
     if text.count("# compile-code") < 1:
         problems.append("title missing")
+    docs = {"README.md": text, "AGENTS.md": agents}
+    problems += _floor_drift(pyproject, docs)
+    for name, doc in docs.items():
+        problems += _retired_claim_hits(name, doc)
     print(f"[check] README sanity: {'PASS' if not problems else 'FAIL'}")
     for p in problems:
         print("  -", p)
