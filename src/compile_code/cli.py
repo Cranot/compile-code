@@ -34,6 +34,14 @@ EXIT_TIMEOUT = 124
 # code the product surface acts on — checks ran and the score fell below threshold.
 EXIT_VERIFY_GATE = 5
 BASELINE_TIMEOUT = 1200
+MIN_ROAM_VERSION = "13.10.0"
+
+_ROAM_VERSION_LINE = re.compile(r"^roam(?:\.exe)?,\s+version\s+(\S+)\s*$", re.IGNORECASE)
+_VERSION_VALUE = re.compile(
+    r"^(\d+)\.(\d+)\.(\d+)"
+    r"(?P<suffix>(?:(?:a|b|rc)\d+|\.?dev\d+|\.post\d+)?(?:\+[A-Za-z0-9.-]+)?)$",
+    re.IGNORECASE,
+)
 
 # The hook script the roam-code dependency installs into a Claude settings
 # file; its presence is how we detect that compile is wired in. Kept as a
@@ -63,11 +71,153 @@ def _on_path(name: str) -> bool:
 
     ``shutil`` is imported lazily here so the common commands
     (``run``, ``stats``, ``init``, ``--help``) never pay its import cost —
-    only ``claude`` and ``doctor`` do a PATH lookup.
+    only ``claude`` does this boolean PATH lookup. Doctor and Verify use the
+    stronger version-aware resolver below.
     """
     import shutil
 
     return shutil.which(name) is not None
+
+
+def _resolve_roam_executable() -> str | None:
+    """Return the exact ``roam`` executable selected by PATH."""
+    import shutil
+
+    return shutil.which("roam")
+
+
+def _python_roam_metadata_version() -> str | None:
+    """Installed Python distribution version, diagnostic only.
+
+    Console-script shims can outlive or differ from Python metadata, so this
+    value never authorizes Verify. It is reported separately to make that
+    mismatch visible without adding a version-parsing dependency.
+    """
+    from importlib import metadata
+
+    try:
+        return metadata.version("roam-code")
+    except Exception:
+        return None
+
+
+def _parse_version_value(raw: str) -> tuple[tuple[int, int, int], bool] | None:
+    """Parse the roam release and whether it is a pre-release."""
+    match = _VERSION_VALUE.fullmatch(raw.strip())
+    if not match:
+        return None
+    release = tuple(int(match.group(index)) for index in range(1, 4))
+    suffix = match.group("suffix").lower()
+    prerelease = bool(re.match(r"^(?:a|b|rc|\.?dev)", suffix))
+    return release, prerelease
+
+
+def _version_meets_minimum(raw: str, minimum: str = MIN_ROAM_VERSION) -> bool:
+    """Compare roam versions without requiring ``packaging`` at runtime."""
+    parsed = _parse_version_value(raw)
+    floor = _parse_version_value(minimum)
+    if parsed is None or floor is None:
+        return False
+    release, prerelease = parsed
+    floor_release, floor_prerelease = floor
+    if release != floor_release:
+        return release > floor_release
+    if prerelease != floor_prerelease:
+        return floor_prerelease
+    return True
+
+
+def _extract_roam_version(output: str) -> str | None:
+    """Extract a valid version from Click's canonical ``roam --version`` line."""
+    for line in output.splitlines():
+        match = _ROAM_VERSION_LINE.fullmatch(line.strip())
+        if match and _parse_version_value(match.group(1)) is not None:
+            return match.group(1)
+    return None
+
+
+def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
+    """Inspect the exact PATH executable and Python metadata independently."""
+    metadata_version = _python_roam_metadata_version()
+    executable = _resolve_roam_executable()
+    info = {
+        "path": executable,
+        "version": None,
+        "metadata_version": metadata_version,
+        "state": "missing" if executable is None else "unknown",
+        "detail": None,
+    }
+    if executable is None:
+        return info
+    try:
+        proc = subprocess.run(
+            [executable, "--version"],
+            timeout=timeout,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError:
+        info.update(state="vanished", detail="the resolved executable vanished before launch")
+        return info
+    except OSError as exc:
+        info.update(state="unlaunchable", detail=str(exc))
+        return info
+    except subprocess.TimeoutExpired:
+        info.update(state="timeout", detail=f"version check timed out after {timeout}s")
+        return info
+    except KeyboardInterrupt:
+        info.update(state="interrupted", detail="version check interrupted")
+        return info
+    if proc.returncode != 0:
+        diagnostic = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[0][:200]
+        detail = f"version check exited {proc.returncode}"
+        if diagnostic:
+            detail += f": {diagnostic}"
+        info.update(state="version_failed", detail=detail)
+        return info
+    version = _extract_roam_version("\n".join((proc.stdout or "", proc.stderr or "")))
+    if version is None:
+        info.update(state="malformed_version", detail="`roam --version` returned no parseable version")
+        return info
+    info.update(state="ok", version=version)
+    return info
+
+
+def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
+    """Return the product exit code and verdict for an unusable roam install."""
+    state = info.get("state")
+    executable = info.get("path")
+    version = info.get("version")
+    metadata_version = info.get("metadata_version")
+    fix = f'python -m pip install --upgrade "roam-code>={MIN_ROAM_VERSION}"'
+    if state == "missing":
+        return EXIT_TOOLCHAIN, f"VERDICT: toolchain missing — `roam` is not on PATH. Fix: {fix}"
+    if state == "timeout":
+        return EXIT_TIMEOUT, f"VERDICT: toolchain version check timed out — rerun, then fix with: {fix}"
+    if state == "interrupted":
+        return 130, "VERDICT: interrupted"
+    if state != "ok" or not executable or not version:
+        detail = info.get("detail") or "version inspection failed"
+        return (
+            EXIT_TOOLCHAIN,
+            f"VERDICT: toolchain broken — PATH roam at `{executable or 'unknown'}` could not be verified "
+            f"({detail}). Fix: {fix}",
+        )
+    if not _version_meets_minimum(version):
+        metadata_note = (
+            f" Python metadata reports roam-code {metadata_version}; PATH still selects the executable above."
+            if metadata_version
+            else ""
+        )
+        return (
+            EXIT_TOOLCHAIN,
+            f"VERDICT: toolchain version mismatch — PATH roam at `{executable}` reports {version}; "
+            f"compile-code requires >={MIN_ROAM_VERSION}.{metadata_note} Fix: {fix}",
+        )
+    return None
 
 
 def _require_index(path: str = ".") -> bool:
@@ -121,7 +271,7 @@ def _delegate(*args: str, timeout: int = 600) -> int:
         return 130
 
 
-def _roam_capture(*args: str, timeout: int = 600) -> subprocess.CompletedProcess:
+def _roam_capture(*args: str, timeout: int = 600, executable: str = "roam") -> subprocess.CompletedProcess:
     """Run the roam toolchain CLI capturing stdout (``_roam`` streams it).
 
     Kept as a separate indirection so tests stub it the way they stub
@@ -134,7 +284,7 @@ def _roam_capture(*args: str, timeout: int = 600) -> subprocess.CompletedProcess
     UTF-8 output as the legacy code page — or crash on it).
     """
     return subprocess.run(
-        ["roam", *args],
+        [executable, *args],
         timeout=timeout,
         check=False,
         capture_output=True,
@@ -144,7 +294,7 @@ def _roam_capture(*args: str, timeout: int = 600) -> subprocess.CompletedProcess
     )
 
 
-def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str | None]:
+def _delegate_capturing(*args: str, timeout: int = 600, executable: str = "roam") -> tuple[int, str | None]:
     """Run the toolchain and translate failure modes like ``_delegate``.
 
     Returns ``(rc, stdout)`` instead of streaming, so the caller can classify
@@ -157,7 +307,7 @@ def _delegate_capturing(*args: str, timeout: int = 600) -> tuple[int, str | None
     crash keeps its diagnostic instead of collapsing to a bare exit code.
     """
     try:
-        proc = _roam_capture(*args, timeout=timeout)
+        proc = _roam_capture(*args, timeout=timeout, executable=executable)
         if proc.returncode != 0:
             stderr = getattr(proc, "stderr", "") or ""
             if stderr.strip():
@@ -649,8 +799,14 @@ def _launch_agent(argv: list[str], env: dict[str, str], *, use_exec: bool | None
 @cli.command("claude", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("agent_args", nargs=-1, type=click.UNPROCESSED)
 @click.option("--read-only", is_flag=True, default=False, help="Enforce read-only mode for the launched agent.")
+@click.option(
+    "--allow-unwired",
+    is_flag=True,
+    default=False,
+    help="Launch even if compile/Verify hooks cannot be proven active (explicit degraded mode).",
+)
 @click.pass_context
-def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool) -> None:
+def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, allow_unwired: bool) -> None:
     """Launch Claude Code with the compile/verify loop active (all-in-one).
 
     Ensures the repo is indexed, wires the hooks if absent, then execs
@@ -664,10 +820,20 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool) ->
     rc = _ensure_indexed_for_launch()
     if rc != 0:
         ctx.exit(rc)
-    # Idempotent wiring. Fail-open by contract: a wiring failure must not
-    # block the agent launch — but say so instead of swallowing it.
-    if not (_project_wired() or _user_wired()) and _delegate("hooks", "claude", "--write") != 0:
-        click.echo("compile: wiring failed (continuing without hooks — run `compile doctor`)")
+    # Idempotent wiring is part of this launcher's safety contract: claiming
+    # the compile/Verify loop is active while launching without hooks is a
+    # false success. Degraded launch remains available only by explicit opt-in.
+    if not (_project_wired() or _user_wired()):
+        wire_rc = _delegate("hooks", "claude", "--write")
+        wired = wire_rc == 0 and (_project_wired() or _user_wired())
+        if not wired:
+            click.echo(
+                "VERDICT: wiring failed — compile/Verify hooks are not proven active; agent not launched. "
+                "Run `compile doctor`, or pass `--allow-unwired` to acknowledge degraded mode."
+            )
+            if not allow_unwired:
+                ctx.exit(wire_rc or 1)
+            click.echo("compile: explicit degraded launch accepted (--allow-unwired)")
     # Keep both project-local and user-global managed hooks compatible with
     # read-only enforcement, including hooks installed before this release.
     _ensure_hook_mode_overrides(user_level=False)
@@ -722,28 +888,55 @@ _VERIFY_CAUSE_LABELS = {
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
 # A failing check line, e.g. ``  FAIL: src/cli.py:5 -- <message>``.
-_VERIFY_FAIL_LINE = re.compile(r"^\s*FAIL:\s*(\S+?):\d+\b")
+_VERIFY_FAIL_LINE = re.compile(r"^\s*FAIL:\s*(.+?):\d+\b")
+_VERIFY_COMPLETION_LINE = re.compile(r"^VERDICT:\s+(?:PASS|WARN)\b")
 # Cause when no FAIL line was parseable — fall back to the roam exit code.
 _EXIT_CAUSE = {2: "bad arguments", 3: "index missing", 4: "index stale", EXIT_VERIFY_GATE: "quality gate"}
 
 
+def _parse_changed_status_paths(raw: str) -> list[str]:
+    """Parse NUL-delimited porcelain status for best-effort failure context.
+
+    Rename records contain the destination followed by the source; include
+    both. Copy records consume their source without claiming it changed.
+    """
+    records = raw.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4:
+            continue
+        status = record[:2]
+        path = record[3:].replace("\\", "/")
+        if path:
+            paths.append(path)
+        if "R" in status or "C" in status:
+            source = records[index].replace("\\", "/") if index < len(records) else ""
+            index += 1
+            if "R" in status and source:
+                paths.append(source)
+    return list(dict.fromkeys(paths))
+
+
 def _changed_files() -> list[str]:
-    """Tracked files that differ from HEAD (staged + unstaged). Empty outside git."""
+    """Best-effort status-aware paths for the human failure block only."""
     try:
-        out = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+        proc = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=10,
-        ).stdout
+        )
     except (OSError, subprocess.TimeoutExpired):
-        # OSError covers missing AND unlaunchable git; scoping falls back to
-        # roam's own --changed detection rather than crashing `compile verify`.
         return []
-    return [line.strip() for line in out.splitlines() if line.strip()]
+    if proc.returncode != 0:
+        return []
+    return _parse_changed_status_paths(proc.stdout or "")
 
 
 def _oversized_target_set(targets: list[str], cap: int = 25) -> str | None:
@@ -763,10 +956,16 @@ def _failing_files(output: str) -> list[str]:
         match = _VERIFY_FAIL_LINE.match(line)
         if not match:
             continue
-        failed_file = match.group(1)
+        failed_file = match.group(1).strip()
         if failed_file not in failing:
             failing.append(failed_file)
     return failing
+
+
+def _valid_verify_completion(output: str) -> bool:
+    """A zero exit is valid only with an explicit non-failing verdict."""
+    first_line = next((line.strip() for line in output.splitlines() if line.strip()), "")
+    return bool(_VERIFY_COMPLETION_LINE.match(first_line))
 
 
 def _classify_verify_failure(output: str, rc: int) -> str:
@@ -861,7 +1060,19 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     the failing command, the changed files, a likely cause category, and the
     single local rerun to run next.
     """
-    targets = list(files) or _changed_files()
+    roam_info = _inspect_roam()
+    roam_problem = _roam_problem(roam_info)
+    if roam_problem is not None:
+        exit_code, verdict = roam_problem
+        click.echo(verdict)
+        raise SystemExit(exit_code)
+    executable = roam_info.get("path")
+    if not executable:  # Defensive: _roam_problem() rejects this state.
+        click.echo("VERDICT: toolchain missing — `roam` is not on PATH")
+        raise SystemExit(EXIT_TOOLCHAIN)
+
+    targets = list(files)
+    scope_args = targets or ["--changed"]
     advisory = _oversized_target_set(list(files), cap=25)
     if advisory:
         click.echo(advisory)
@@ -876,11 +1087,17 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     argv.extend(["--threshold", str(threshold)])
     if threshold != 70:
         command.extend(["--threshold", str(threshold)])
-    argv.extend(targets if targets else ["--changed"])
-    command.extend(targets if targets else ["--changed"])
-    rc, output = _delegate_capturing(*argv)
+    argv.extend(scope_args)
+    command.extend(scope_args)
+    rc, output = _delegate_capturing(*argv, executable=executable)
     if output:
         click.echo(output.rstrip())
+    if rc == 0 and (output is None or not _valid_verify_completion(output)):
+        click.echo(
+            f"VERDICT: verifier protocol failure — `{executable}` exited 0 without a parseable PASS/WARN "
+            f'verdict. Fix: python -m pip install --upgrade "roam-code>={MIN_ROAM_VERSION}"'
+        )
+        raise SystemExit(EXIT_TOOLCHAIN)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
     # completed nonzero run gets the failure block — including roam's own
@@ -888,17 +1105,18 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     # this CLI's EXIT_TOOLCHAIN (also 2).
     if rc != 0 and output is not None:
         failing = _failing_files(output)
-        scoped = failing or targets
+        status_paths = _changed_files() if not failing and not targets else []
+        scoped = failing or targets or status_paths
         next_tokens = ["compile", "verify"]
         if new_only:
             next_tokens.append("--new-only")
         if diff_only:
             next_tokens.append("--diff-only")
-        next_tokens.extend(scoped if scoped else ["--changed"])
+        next_tokens.extend(failing or targets or ["--changed"])
         click.echo(
             _format_verify_failure(
                 command=" ".join(command),
-                files=targets,
+                files=scoped,
                 cause=_classify_verify_failure(output, rc),
                 next_action=" ".join(next_tokens),
             )
@@ -914,7 +1132,9 @@ def _doctor() -> None:
     / settings.json) and user-global (~/.claude/settings.local.json /
     settings.json); either counts as wired.
     """
-    toolchain_ok = _on_path("roam")
+    roam_info = _inspect_roam()
+    roam_problem = _roam_problem(roam_info)
+    toolchain_ok = roam_problem is None
     indexed = _require_index()
     project_wired = _project_wired()
     # Only read the user-global settings when the project isn't already wired —
@@ -929,13 +1149,19 @@ def _doctor() -> None:
         if user_wired
         else "not wired (run `compile wire claude`)"
     )
-    click.echo(f"toolchain : {'ok' if toolchain_ok else 'MISSING'}")
+    state = roam_info.get("state")
+    toolchain_label = "ok" if toolchain_ok else "MISSING" if state == "missing" else "INCOMPATIBLE"
+    click.echo(f"toolchain : {toolchain_label}")
+    click.echo(f"roam path : {roam_info.get('path') or 'not found'}")
+    click.echo(f"roam version: {roam_info.get('version') or 'unknown'} (required >={MIN_ROAM_VERSION})")
+    click.echo(f"python metadata: roam-code {roam_info.get('metadata_version') or 'not installed'}")
     click.echo(f"index     : {'ok' if indexed else 'absent (run `compile init`)'}")
     click.echo(f"claude    : {wired_label}")
     click.echo(f"verify report: {_verify_report_status()}")
-    if not toolchain_ok:
-        click.echo("VERDICT: toolchain missing — `roam` not on PATH (pip install --force-reinstall compile-code)")
-        raise SystemExit(EXIT_TOOLCHAIN)
+    if roam_problem is not None:
+        exit_code, verdict = roam_problem
+        click.echo(verdict)
+        raise SystemExit(exit_code)
     click.echo("VERDICT: ready" if indexed and wired else "VERDICT: install ok — finish setup above")
 
 

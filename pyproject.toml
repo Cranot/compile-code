@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compile-code"
-version = "0.1.0"
+version = "0.2.0"
 description = "A compiler for AI coding tasks: pre-resolves repo facts before your agent's first token. Fewer turns, fewer tokens, same answers."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,8 +25,8 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
-    # >=13.8.0: the launch/verify wire contract is pinned at this floor.
-    "roam-code>=13.8.0",
+    # >=13.10.0: complete-evidence Verify + default-on mode enforcement contract.
+    "roam-code>=13.10.0",
     "click>=8.0",
 ]
 

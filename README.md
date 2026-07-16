@@ -179,7 +179,7 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code pins `roam-code >= 13.8.0` and picks up every kernel release —
+compile-code pins `roam-code >= 13.10.0` and picks up every kernel release —
 so the published losses above are not static marketing: each one was
 attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped
@@ -264,8 +264,10 @@ What it catches, in practice:
   with a concrete fix sketch
 
 Suppressions are keyed to the symbol, not the line, so they survive
-refactors. The whole loop is fail-open: if anything in it breaks, your
-agent runs as if compile-code were not installed. `--no-verify` skips it.
+refactors. Prompt optimization remains fail-open, but the launcher refuses to
+claim the compile/Verify loop is active unless its hooks are proven wired.
+`compile claude --allow-unwired` is the explicit degraded-mode escape hatch;
+`compile wire claude --no-verify` is the deliberate persistent opt-out.
 
 These checks are themselves eval-gated: a planted-issues corpus proves
 every category catches its canonical positives, and false-positive locks
@@ -277,7 +279,7 @@ planted hallucinations caught in both languages.
 
 | Command | What it does |
 |---|---|
-| `compile claude [...]` | Index + wire + launch Claude Code (args pass through) |
+| `compile claude [...]` | Index + prove wiring + launch Claude Code (args pass through; `--allow-unwired` explicitly accepts degraded mode) |
 | `compile init` | Index the repo (incremental afterwards; `--force` rebuilds) |
 | `compile wire claude` | Persistent wiring; `--user` for all repos, `--no-verify` to skip the post-edit check |
 | `compile unwire claude` | Remove the hooks (`--user` for the user-global install) |
@@ -291,6 +293,10 @@ planted hallucinations caught in both languages.
 
 `compile-code` and `cmpl` are aliases for `compile` if another tool owns
 that name on your system.
+
+With no explicit files, `compile verify` delegates the complete worktree scope
+to `roam verify --changed`, including staged, unstaged, untracked, renamed, and
+deleted paths.
 
 ## Beyond Claude Code — Codex, MCP, and CI
 
@@ -317,8 +323,14 @@ index present, hooks wired (at either level). Every failure surfaces as a
 one-line `VERDICT:` with the fix — never a traceback. Exit codes: `0` ok,
 `1` user-fixable state, `2` toolchain missing, `124` timeout.
 
-The hooks are fail-open end to end: if the compiler or verifier ever
-breaks, your agent runs exactly as if compile-code weren't installed.
+Doctor resolves the exact `roam` executable selected by PATH and requires
+`roam-code >= 13.10.0`. It reports that executable's path and version separately
+from Python package metadata, because a stale console-script shim can disagree
+with the installed distribution.
+
+Prompt compilation remains fail-open so an unavailable optimizer never blocks
+work. Post-edit verification is fail-closed for edited turns: malformed,
+incomplete, or unavailable verifier evidence cannot be reported as a pass.
 Uninstall completely with `compile unwire claude && pip uninstall
 compile-code roam-code`.
 

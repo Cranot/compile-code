@@ -4,6 +4,10 @@ compile-code is the product CLI over the roam-code compile/verify kernel
 (`compile claude` = index + wire + launch). Small by design: the kernel
 lives in the `roam-code` dependency; this repo owns the product surface.
 
+The all-in-one launcher is fail-closed on hook wiring. It may continue without
+the compile/Verify loop only when the caller explicitly passes
+`--allow-unwired`; tests must keep this degraded path visible and deliberate.
+
 ## The pipeline — every commit ships polished
 
 `python3 scripts/check.py` is the gate: ruff check, ruff format --check,
@@ -41,5 +45,6 @@ what.
 ## Releases
 
 GitHub is the source of truth. PyPI publish is owner-gated (no token on the
-dev box). The roam-code dependency floor (`>=13.8.0`) only moves when the CLI
-actually requires a newer kernel feature.
+dev box). The roam-code dependency floor (`>=13.10.0`) is shared with
+`MIN_ROAM_VERSION` in `src/compile_code/cli.py`; Verify requires this release
+for canonical `--changed` discovery and the hardened verifier protocol.

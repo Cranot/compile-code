@@ -9,12 +9,16 @@ subprocess work, so they run anywhere.
 from __future__ import annotations
 
 import json
-from importlib.metadata import version
+import re
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 import compile_code.cli as mod
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
@@ -26,36 +30,49 @@ def runner():
 def roam_calls(monkeypatch):
     """Stub the toolchain; record argv per call."""
     calls = []
+    wiring = {"active": False}
+    original_project_wired = mod._project_wired
 
     class _P:
         returncode = 0
 
     def fake(*args, timeout=600):
         calls.append(list(args))
+        if list(args) == ["hooks", "claude", "--write"]:
+            wiring["active"] = True
         return _P()
 
     monkeypatch.setattr(mod, "_roam", fake)
     # Delegation-only tests run from the checkout, whose real Claude settings
     # must not be mutated by the successful stub.
     monkeypatch.setattr(mod, "_wire_roam_midtask_access", lambda **kwargs: None)
+    monkeypatch.setattr(mod, "_project_wired", lambda: wiring["active"] or original_project_wired())
     return calls
 
 
-def _version_tuple(raw: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for chunk in raw.split("."):
-        digits = []
-        for char in chunk:
-            if char.isdigit():
-                digits.append(char)
-            else:
-                break
-        if not digits:
-            break
-        parts.append(int("".join(digits)))
-        if len(parts) == 3:
-            break
-    return tuple(parts)
+def _roam_info(
+    *,
+    path: str | None = "/opt/roam/bin/roam",
+    executable_version: str | None = mod.MIN_ROAM_VERSION,
+    metadata_version: str | None = mod.MIN_ROAM_VERSION,
+    state: str = "ok",
+    detail: str | None = None,
+) -> dict[str, str | None]:
+    return {
+        "path": path,
+        "version": executable_version,
+        "metadata_version": metadata_version,
+        "state": state,
+        "detail": detail,
+    }
+
+
+@pytest.fixture
+def compatible_roam(monkeypatch):
+    """Keep CLI tests independent of whichever roam shim the host PATH selects."""
+    info = _roam_info()
+    monkeypatch.setattr(mod, "_inspect_roam", lambda timeout=10: dict(info))
+    return info
 
 
 class TestSurface:
@@ -196,14 +213,96 @@ class TestSurface:
 
 
 class TestDependencyFloor:
-    def test_installed_roam_code_satisfies_launch_floor(self):
-        assert _version_tuple(version("roam-code")) >= (13, 7, 0)
+    def test_runtime_metadata_and_docs_share_the_13_9_floor(self):
+        assert mod.MIN_ROAM_VERSION == "13.10.0"
+        floor = mod.MIN_ROAM_VERSION
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        assert f'"roam-code>={floor}"' in pyproject
+        for name in ("README.md", "AGENTS.md"):
+            contents = (ROOT / name).read_text(encoding="utf-8")
+            assert re.search(rf"roam-code[^\n]{{0,80}}>=\s*{re.escape(floor)}", contents)
 
 
+class TestRoamVersionEnforcement:
+    @pytest.mark.parametrize(
+        ("raw", "compatible"),
+        [
+            ("13.9.99", False),
+            ("13.10.0rc1", False),
+            ("13.10.0", True),
+            ("13.10.0.post1", True),
+            ("13.10.0dev1", False),
+            ("not-a-version", False),
+        ],
+    )
+    def test_minimum_comparison(self, raw, compatible):
+        assert mod._version_meets_minimum(raw) is compatible
+
+    def test_inspection_runs_the_exact_path_and_keeps_metadata_separate(self, monkeypatch):
+        chosen = r"C:\Tools\roam.exe"
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = "roam.EXE, version 13.10.2\n"
+            stderr = ""
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return _P()
+
+        monkeypatch.setattr(mod, "_resolve_roam_executable", lambda: chosen)
+        monkeypatch.setattr(mod, "_python_roam_metadata_version", lambda: "99.0.0")
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+        info = mod._inspect_roam()
+
+        assert captured["argv"] == [chosen, "--version"]
+        assert info["path"] == chosen
+        assert info["version"] == "13.10.2"
+        assert info["metadata_version"] == "99.0.0"
+
+    def test_verify_blocks_old_path_executable_even_with_newer_metadata(self, runner, monkeypatch):
+        path = r"C:\old-bin\roam.exe"
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(path=path, executable_version="13.9.9", metadata_version="13.10.4"),
+        )
+        monkeypatch.setattr(mod, "_roam_capture", lambda *a, **kw: pytest.fail("Verify must not run"))
+
+        res = runner.invoke(mod.cli, ["verify"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "toolchain version mismatch" in res.output
+        assert path in res.output
+        assert "reports 13.9.9" in res.output
+        assert "Python metadata reports roam-code 13.10.4" in res.output
+
+    def test_doctor_reports_path_version_and_metadata_separately(self, runner, monkeypatch, tmp_path):
+        path = r"C:\old-bin\roam.exe"
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod.os.path, "expanduser", lambda value: str(tmp_path / "home"))
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(path=path, executable_version="13.9.9", metadata_version="13.10.4"),
+        )
+
+        res = runner.invoke(mod.cli, ["doctor"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "toolchain : INCOMPATIBLE" in res.output
+        assert f"roam path : {path}" in res.output
+        assert "roam version: 13.9.9 (required >=13.10.0)" in res.output
+        assert "python metadata: roam-code 13.10.4" in res.output
+
+
+@pytest.mark.usefixtures("compatible_roam")
 class TestWiringSmoke:
     def test_wire_round_trip_marks_repo_and_doctor_sees_it(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / "index.db").write_text("")
         (tmp_path / ".claude").mkdir()
@@ -410,10 +509,10 @@ direct_index = ["roam", "index", "--quiet"]
         assert namespace["direct_index"] == ["roam", "--override-mode", "index", "--quiet"]
 
 
+@pytest.mark.usefixtures("compatible_roam")
 class TestDoctor:
     def test_doctor_reports_present_verify_report_age(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         monkeypatch.setattr(mod.time, "time", lambda: 10_000.0)
         (tmp_path / ".roam").mkdir()
@@ -425,14 +524,12 @@ class TestDoctor:
 
     def test_doctor_reports_absent_verify_report(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         res = runner.invoke(mod.cli, ["doctor"])
         assert "verify report: none — run `compile report`" in res.output
 
     def test_doctor_reports_unwired_state(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         res = runner.invoke(mod.cli, ["doctor"])
         assert "absent" in res.output and "not wired" in res.output
@@ -440,7 +537,13 @@ class TestDoctor:
 
     def test_doctor_fails_without_toolchain(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: False)
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(
+                path=None, executable_version=None, metadata_version="13.10.0", state="missing"
+            ),
+        )
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         res = runner.invoke(mod.cli, ["doctor"])
         assert res.exit_code == 2
@@ -448,7 +551,6 @@ class TestDoctor:
 
     def test_doctor_sees_project_wiring(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         (tmp_path / ".claude").mkdir()
         (tmp_path / ".claude" / "settings.json").write_text('{"hooks": "roam-compile-ups.py"}')
@@ -461,7 +563,6 @@ class TestDoctor:
 
     def test_doctor_sees_user_global_wiring(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         home = tmp_path / "home"
         (home / ".claude").mkdir(parents=True)
         (home / ".claude" / "settings.json").write_text('{"hooks": "roam-compile-ups.py"}')
@@ -523,13 +624,14 @@ class TestFailurePaths:
         assert "VERDICT: empty task" in res.output
 
 
+@pytest.mark.usefixtures("compatible_roam")
 class TestVerifyToolchainFailureIsNotAVerifyFailure:
     """`compile verify` must not stack its failure block on a toolchain that
     never ran — and must not confuse roam's exit 2 (bad arguments) with the
     CLI's own EXIT_TOOLCHAIN (also 2)."""
 
     def test_missing_toolchain_skips_the_failure_block(self, runner, monkeypatch):
-        def raise_missing(*args, timeout=600):
+        def raise_missing(*args, timeout=600, executable="roam"):
             raise FileNotFoundError("roam")
 
         monkeypatch.setattr(mod, "_roam_capture", raise_missing)
@@ -539,7 +641,7 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
         assert "verify failed" not in res.output
 
     def test_broken_toolchain_skips_the_failure_block(self, runner, monkeypatch):
-        def raise_broken(*args, timeout=600):
+        def raise_broken(*args, timeout=600, executable="roam"):
             raise PermissionError(13, "Access is denied", "roam")
 
         monkeypatch.setattr(mod, "_roam_capture", raise_broken)
@@ -549,7 +651,7 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
         assert "verify failed" not in res.output
 
     def test_timeout_skips_the_failure_block(self, runner, monkeypatch):
-        def raise_timeout(*args, timeout=600):
+        def raise_timeout(*args, timeout=600, executable="roam"):
             raise mod.subprocess.TimeoutExpired(cmd=["roam"], timeout=timeout)
 
         monkeypatch.setattr(mod, "_roam_capture", raise_timeout)
@@ -565,7 +667,7 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
             returncode = 2
             stdout = "error: unknown flag --bogus\n"
 
-        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600: _P())
+        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600, executable="roam": _P())
         res = runner.invoke(mod.cli, ["verify", "x.py"])
         assert res.exit_code == 2
         assert "VERDICT: verify failed." in res.output
@@ -579,7 +681,7 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
             stdout = ""
             stderr = "RuntimeError: kernel exploded\n"
 
-        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600: _P())
+        monkeypatch.setattr(mod, "_roam_capture", lambda *a, timeout=600, executable="roam": _P())
         res = runner.invoke(mod.cli, ["verify", "x.py"])
         assert res.exit_code == 1
         assert "kernel exploded" in res.stderr
@@ -635,6 +737,7 @@ class TestLaunchAgentFailurePaths:
         assert "interrupted" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("compatible_roam")
 class TestEncodingRobustness:
     """Settings and marker files written in non-UTF-8 encodings (PowerShell
     defaults to UTF-16 with a BOM) must degrade gracefully, never traceback."""
@@ -647,7 +750,6 @@ class TestEncodingRobustness:
 
     def test_doctor_survives_utf16_settings_file(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(mod, "_on_path", lambda name: True)
         monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(tmp_path / "home"))
         (tmp_path / ".claude").mkdir()
         with open(tmp_path / ".claude" / "settings.local.json", "w", encoding="utf-16") as fh:
@@ -735,7 +837,7 @@ class TestEnsureIndexedForLaunch:
 
 
 class TestFailurePathsLaunch:
-    def test_claude_launch_warns_on_wire_failure_but_continues(self, runner, monkeypatch, tmp_path):
+    def test_claude_launch_blocks_on_wire_failure_by_default(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / "index.db").write_text("")
@@ -752,11 +854,34 @@ class TestFailurePathsLaunch:
         launches = []
         monkeypatch.setattr(mod, "_launch_agent", lambda argv, env, **kw: launches.append(list(argv)) or 0)
         res = runner.invoke(mod.cli, ["claude"])
-        assert "wiring failed (continuing without hooks" in res.output
+        assert "VERDICT: wiring failed" in res.output
+        assert launches == []
+        assert res.exit_code == 1
+
+    def test_claude_launch_requires_explicit_opt_in_to_continue_unwired(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / "index.db").write_text("")
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        monkeypatch.setattr(mod, "_on_path", lambda name: True)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+
+        class _Fail:
+            returncode = 1
+
+        monkeypatch.setattr(mod, "_roam", lambda *a, timeout=600: _Fail())
+        launches = []
+        monkeypatch.setattr(mod, "_launch_agent", lambda argv, env, **kw: launches.append(list(argv)) or 0)
+
+        res = runner.invoke(mod.cli, ["claude", "--allow-unwired"])
+
+        assert "explicit degraded launch accepted" in res.output
         assert launches and launches[0][0] == "claude"
         assert res.exit_code == 0
 
 
+@pytest.mark.usefixtures("compatible_roam")
 class TestVerifyFailureFormatting:
     """`compile verify` must turn a roam verify failure into a block that names
     the failing command, the changed files, a likely cause, and one local rerun."""
@@ -781,13 +906,25 @@ class TestVerifyFailureFormatting:
             returncode = rc
             stdout = output
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, executable="roam"):
+            captured["executable"] = executable
             return _P(args)
 
         return fake, captured
 
     def test_failing_files_dedupes_in_order(self):
         assert mod._failing_files(self.FAIL_OUTPUT) == ["src/bad.py"]
+
+    def test_status_parser_covers_staged_unstaged_untracked_rename_and_deletion(self):
+        raw = "M  staged.py\0 M unstaged.py\0?? untracked.py\0R  renamed.py\0old.py\0D  deleted.py\0"
+        assert mod._parse_changed_status_paths(raw) == [
+            "staged.py",
+            "unstaged.py",
+            "untracked.py",
+            "renamed.py",
+            "old.py",
+            "deleted.py",
+        ]
 
     def test_oversized_helper_returns_advisory_above_cap(self):
         advisory = mod._oversized_target_set([f"f{i}.py" for i in range(26)], cap=25)
@@ -825,22 +962,23 @@ class TestVerifyFailureFormatting:
         )
         assert "files   : (no changed files)" in block
 
-    def test_verify_failure_emits_block_and_exit_5(self, runner, monkeypatch):
+    def test_verify_failure_emits_block_and_exit_5(self, runner, monkeypatch, compatible_roam):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
-        monkeypatch.setattr(mod, "_changed_files", lambda: ["src/bad.py"])
+        monkeypatch.setattr(mod, "_changed_files", lambda: pytest.fail("parsed failures need no local discovery"))
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 5
         # roam's raw output is preserved...
         assert "FAIL: src/bad.py:12" in res.output
         # ...and the explained block carries all four components.
         assert "VERDICT: verify failed." in res.output
-        assert "command : compile verify src/bad.py" in res.output
+        assert "command : compile verify --changed" in res.output
         assert "files   : src/bad.py" in res.output
         assert "cause   : naming violation + syntax error" in res.output
         assert "next    : compile verify src/bad.py" in res.output
-        # delegated to roam verify with the resolved files + default threshold.
-        assert captured["args"] == ["verify", "--threshold", "70", "src/bad.py"]
+        # No-argument correctness belongs to roam's canonical discovery.
+        assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
+        assert captured["executable"] == compatible_roam["path"]
 
     def test_verify_pass_streams_roam_output_without_block(self, runner, monkeypatch):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
@@ -849,6 +987,50 @@ class TestVerifyFailureFormatting:
         assert res.exit_code == 0
         assert "VERDICT: PASS" in res.output
         assert "verify failed" not in res.output
+
+    @pytest.mark.parametrize("output", ["", "checks completed without a verdict\n"], ids=["empty", "malformed"])
+    def test_zero_exit_requires_parseable_success_verdict(self, output, runner, monkeypatch):
+        fake, _ = self._capture(output, 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "VERDICT: verifier protocol failure" in res.output
+        assert "verify failed" not in res.output
+
+    def test_zero_exit_accepts_an_explicit_warn_verdict(self, runner, monkeypatch):
+        fake, _ = self._capture("VERDICT: WARN (score 75/100) -- review findings\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert res.exit_code == 0
+        assert "VERDICT: WARN" in res.output
+        assert "verifier protocol failure" not in res.output
+
+    def test_zero_exit_rejects_a_skipped_verifier(self, runner, monkeypatch):
+        fake, _ = self._capture(
+            "VERDICT: SKIPPED -- verify disabled in .roam/verify.yaml\n",
+            0,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "VERDICT: verifier protocol failure" in res.output
+
+    def test_completed_nonzero_output_and_exit_code_are_preserved(self, runner, monkeypatch):
+        fake, _ = self._capture("kernel diagnostic from completed run\n", 17)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert res.exit_code == 17
+        assert "kernel diagnostic from completed run" in res.output
+        assert "VERDICT: verify failed." in res.output
+        assert "verifier protocol failure" not in res.output
 
     def test_verify_threshold_passes_through_and_shows_in_command(self, runner, monkeypatch):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -867,13 +1049,38 @@ class TestVerifyFailureFormatting:
         assert "command : compile verify --new-only --diff-only src/bad.py" in res.output
         assert "next    : compile verify --new-only --diff-only src/bad.py" in res.output
 
-    def test_verify_no_changed_files_delegates_changed_flag(self, runner, monkeypatch):
+    def test_verify_no_argument_delegates_changed_without_local_discovery(self, runner, monkeypatch):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
-        monkeypatch.setattr(mod, "_changed_files", lambda: [])
+        monkeypatch.setattr(mod, "_changed_files", lambda: pytest.fail("success must not depend on local discovery"))
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 0
         assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
+
+    def test_no_argument_failure_uses_status_only_for_human_context(self, runner, monkeypatch):
+        fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        status_paths = ["staged.py", "unstaged.py", "untracked.py", "renamed.py", "old.py", "deleted.py"]
+        monkeypatch.setattr(mod, "_changed_files", lambda: status_paths)
+
+        res = runner.invoke(mod.cli, ["verify"])
+
+        assert res.exit_code == 5
+        assert captured["args"] == ["verify", "--threshold", "70", "--changed"]
+        assert f"files   : {', '.join(status_paths)}" in res.output
+        assert "next    : compile verify --changed" in res.output
+
+    def test_failure_block_reports_parsed_failing_scope_not_all_targets(self, runner, monkeypatch):
+        fake, captured = self._capture(self.FAIL_OUTPUT, 5)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/good.py", "src/bad.py"])
+
+        assert res.exit_code == 5
+        assert captured["args"] == ["verify", "--threshold", "70", "src/good.py", "src/bad.py"]
+        assert "command : compile verify src/good.py src/bad.py" in res.output
+        assert "files   : src/bad.py" in res.output
+        assert "next    : compile verify src/bad.py" in res.output
 
     def test_oversized_advisory_does_not_change_delegation(self, runner, monkeypatch):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
