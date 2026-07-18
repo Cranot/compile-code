@@ -40,13 +40,21 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 
 ## Install and use in 60 seconds
 
+Release `0.2.0` is deliberately dependency-gated. Install it only after
+`roam-code 13.10.0` is available on PyPI; the installer resolves that real
+dependency and fails instead of silently substituting an older kernel.
+
 ```bash
-pip install git+https://github.com/Cranot/compile-code
+python -m pip install "compile-code==0.2.0"                    # owner-gated PyPI release
+# or, after the same tag is published:
+python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.0"
 cd your-repo
 compile claude          # index + wire + launch Claude Code, all-in-one
 ```
 
-That one line installs the `compile` CLI and its roam-code engine. (A shorter `pip install compile-code` lands with the first PyPI release.)
+The install resolves the `compile` CLI and its roam-code engine together. The
+version pin makes the command auditable and prevents a future release from
+changing an existing environment unexpectedly.
 
 That's it. From then on, every prompt you type gets compiled facts injected
 before the model sees it, and every edit gets a scoped verification after.
@@ -333,6 +341,45 @@ work. Post-edit verification is fail-closed for edited turns: malformed,
 incomplete, or unavailable verifier evidence cannot be reported as a pass.
 Uninstall completely with `compile unwire claude && pip uninstall
 compile-code roam-code`.
+
+## Release integrity
+
+Releases originate only from an annotated `vX.Y.Z` tag whose target is the
+checked-out source SHA and whose version equals `pyproject.toml`. The GitHub
+workflow has read-only build permissions, uses full commit pins for every
+action, installs a hash-locked toolchain (including `pip`), builds wheel and
+sdist twice from `git archive`, normalizes both under
+`SOURCE_DATE_EPOCH`, and requires byte-for-byte equality. The release bundle
+contains SHA-256 and SHA-512 hashes, matching SRI values, a closed manifest,
+and a deterministic CycloneDX SBOM. GitHub provenance and PyPI PEP 740
+attestations bind the published files to the tag workflow.
+
+Before PEP 517 runs, the builder rejects legacy `setup.py`, `setup.cfg`, and
+`MANIFEST.in` inputs, validates a closed static `pyproject.toml`, removes the
+source tree from the tool launch path, and uses a scrubbed networkless build
+environment. Transport verification uses bounded, no-follow, single-link
+reads; wheel and sdist must have canonical bytes and identical package and
+Apache-2.0 license and core-metadata payloads.
+
+Publishing is tokenless and isolated from the builder. OIDC is confined to the
+GitHub provenance job and the `publish` job. Before tagging, maintainers must
+create the `pypi` GitHub Environment, add the owner as its required reviewer,
+and configure the matching PyPI Trusted Publisher; the workflow targets that
+environment but cannot create or prove those external protection settings.
+Both the original tag actor and any rerun actor must be the repository owner.
+The publish job downloads an immutable artifact ID and runs pinned
+download/publish actions; it checks out no source and contains no
+repository-controlled shell steps.
+Before and after publication, unprivileged gates rebind the downloaded
+manifest to the current annotated tag and source SHA, then require exact PyPI
+bytes. A rerun is therefore a no-op only for a byte-identical release;
+same-version differences fail closed.
+
+Maintainer sequence: publish `roam-code>=13.10.0`, run
+`python scripts/check.py`, verify the protected `pypi` environment and Trusted
+Publisher, create the annotated version tag, push that tag, and approve the
+environment deployment. Do not create the tag while the dependency-resolving
+wheel and sdist smokes are blocked.
 
 ## How it relates to roam-code
 

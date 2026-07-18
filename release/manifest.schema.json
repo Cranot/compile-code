@@ -1,0 +1,190 @@
+{
+  "$id": "https://github.com/Cranot/compile-code/releases/schema/manifest-v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "role": {
+                  "const": "sbom"
+                }
+              },
+              "required": [
+                "role"
+              ]
+            },
+            "then": {
+              "properties": {
+                "size": {
+                  "maximum": 8388608
+                }
+              }
+            }
+          }
+        ],
+        "properties": {
+          "filename": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]+$",
+            "type": "string"
+          },
+          "hashes": {
+            "additionalProperties": false,
+            "properties": {
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "sha512": {
+                "pattern": "^[0-9a-f]{128}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sha256",
+              "sha512"
+            ],
+            "type": "object"
+          },
+          "media_type": {
+            "enum": [
+              "application/gzip",
+              "application/vnd.cyclonedx+json",
+              "application/zip"
+            ]
+          },
+          "role": {
+            "enum": [
+              "sbom",
+              "sdist",
+              "wheel"
+            ]
+          },
+          "size": {
+            "maximum": 134217728,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "sri": {
+            "additionalProperties": false,
+            "properties": {
+              "sha256": {
+                "pattern": "^sha256-[A-Za-z0-9+/]{43}=$",
+                "type": "string"
+              },
+              "sha512": {
+                "pattern": "^sha512-[A-Za-z0-9+/]{86}==$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sha256",
+              "sha512"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "filename",
+          "hashes",
+          "media_type",
+          "role",
+          "size",
+          "sri"
+        ],
+        "type": "object"
+      },
+      "maxItems": 3,
+      "minItems": 3,
+      "prefixItems": [
+        {
+          "properties": {
+            "role": {
+              "const": "wheel"
+            }
+          },
+          "required": [
+            "role"
+          ]
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "sdist"
+            }
+          },
+          "required": [
+            "role"
+          ]
+        },
+        {
+          "properties": {
+            "role": {
+              "const": "sbom"
+            }
+          },
+          "required": [
+            "role"
+          ]
+        }
+      ],
+      "type": "array",
+      "uniqueItems": true
+    },
+    "project": {
+      "const": "compile-code"
+    },
+    "schema": {
+      "const": "https://github.com/Cranot/compile-code/releases/schema/manifest-v1"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "const": "https://github.com/Cranot/compile-code"
+        },
+        "sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "source_date_epoch": {
+          "maximum": 4102444799,
+          "minimum": 315532800,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "repository",
+        "sha",
+        "source_date_epoch"
+      ],
+      "type": "object"
+    },
+    "tag": {
+      "pattern": "^v(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "version": {
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "files",
+    "project",
+    "schema",
+    "schema_version",
+    "source",
+    "tag",
+    "version"
+  ],
+  "title": "compile-code release artifact manifest v1",
+  "type": "object"
+}

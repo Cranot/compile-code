@@ -48,3 +48,7 @@ GitHub is the source of truth. PyPI publish is owner-gated (no token on the
 dev box). The roam-code dependency floor (`>=13.10.0`) is shared with
 `MIN_ROAM_VERSION` in `src/compile_code/cli.py`; Verify requires this release
 for canonical `--changed` discovery and the hardened verifier protocol.
+Before creating a release tag, verify that the repository's `pypi` GitHub
+Environment exists with the owner as required reviewer and that PyPI has the
+matching Trusted Publisher; the workflow references but cannot provision
+those external controls.

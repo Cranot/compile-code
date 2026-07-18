@@ -15,18 +15,46 @@ concurrency:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Python ${{ matrix.python-version }} quality gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10.20"
+          - "3.11.15"
+          - "3.12.13"
+          - "3.13.14"
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Check out the reviewed source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          python-version: "3.12"
+          persist-credentials: false
 
-      - name: Install package
-        run: pip install -e ".[dev]"
+      - name: Set up exact Python and pip
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          pip-version: "26.1.2"
 
-      - name: Run checks
+      - name: Install hash-locked quality tools
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install --no-compile --require-hashes --only-binary=:all:
+          -r release/tooling-requirements.lock
+
+      - name: Resolve and install the product dependency graph
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install --no-compile --no-build-isolation
+          --only-binary=:all: -e .
+
+      - name: Run the complete repository gate
         run: python scripts/check.py
-

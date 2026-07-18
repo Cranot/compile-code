@@ -1,0 +1,5 @@
+# Hashed, binary-only backend environment for clean sdist install smokes.
+packaging==26.2
+pip==26.1.2
+setuptools==83.0.0
+wheel==0.47.0
