@@ -347,39 +347,130 @@ compile-code roam-code`.
 Releases originate only from an annotated `vX.Y.Z` tag whose target is the
 checked-out source SHA and whose version equals `pyproject.toml`. The GitHub
 workflow has read-only build permissions, uses full commit pins for every
-action, installs a hash-locked toolchain (including `pip`), builds wheel and
-sdist twice from `git archive`, normalizes both under
+action, audits every exact row in the universal build, smoke, and tooling locks
+before installing them, installs a hash-locked toolchain (including `pip`),
+builds wheel and sdist twice from `git archive`, normalizes both under
 `SOURCE_DATE_EPOCH`, and requires byte-for-byte equality. The release bundle
 contains SHA-256 and SHA-512 hashes, matching SRI values, a closed manifest,
-and a deterministic CycloneDX SBOM. GitHub provenance and PyPI PEP 740
-attestations bind the published files to the tag workflow.
+and a deterministic CycloneDX SBOM. GitHub build provenance and immutable-release
+attestations bind GitHub's files to the tag workflow. For each PyPI distribution,
+post-verification also requires the registry's PEP 740 Integrity API to expose a
+publish statement for the exact filename and SHA-256 under the
+`Cranot/compile-code` / `release.yml` / `pypi` Trusted Publisher identity.
+
+The lock audit is the reproducible, non-resolving equivalent of a `pip-audit`
+gate: it parses only the three checked-in uv graphs, requires exact versions,
+SHA-256 hashes, matching root inputs, and the canonical universal-generation
+command, then submits a sorted package/version query set directly to OSV. It
+requires exactly 47 distinct package/version queries and audits every marker
+branch without invoking `pip` and without resolving `roam-code`. A vulnerability, stale
+or malformed lock, changed query count, unavailable service,
+pagination, malformed response, or ignored/incomplete result blocks both
+`scripts/check.py` and the release workflow. This avoids the official wrapper's
+runtime installation of an open `pip-audit ~=2.0` tool graph.
 
 Before PEP 517 runs, the builder rejects legacy `setup.py`, `setup.cfg`, and
 `MANIFEST.in` inputs, validates a closed static `pyproject.toml`, removes the
-source tree from the tool launch path, and uses a scrubbed networkless build
-environment. Transport verification uses bounded, no-follow, single-link
+source tree from the tool launch path, and uses a scrubbed build environment
+with package-index access disabled. Transport verification uses bounded, no-follow, single-link
 reads; wheel and sdist must have canonical bytes and identical package and
 Apache-2.0 license and core-metadata payloads.
 
-Publishing is tokenless and isolated from the builder. OIDC is confined to the
-GitHub provenance job and the `publish` job. Before tagging, maintainers must
+PyPI publication is tokenless and isolated from the builder. OIDC is confined
+to GitHub build provenance and PyPI Trusted Publishing; the GitHub Release
+publisher receives only `contents: write`. Before tagging, maintainers must
 create the `pypi` GitHub Environment, add the owner as its required reviewer,
-and configure the matching PyPI Trusted Publisher; the workflow targets that
-environment but cannot create or prove those external protection settings.
-Both the original tag actor and any rerun actor must be the repository owner.
-The publish job downloads an immutable artifact ID and runs pinned
-download/publish actions; it checks out no source and contains no
-repository-controlled shell steps.
-Before and after publication, unprivileged gates rebind the downloaded
-manifest to the current annotated tag and source SHA, then require exact PyPI
-bytes. A rerun is therefore a no-op only for a byte-identical release;
-same-version differences fail closed.
+configure the matching PyPI Trusted Publisher, and enable immutable releases
+for the repository. The workflow cannot create those external protections.
+PyPI preflight distinguishes a missing release from partial, mismatched, or
+attestation-pending state. Exact bytes plus both registry-hosted publish
+attestations make reruns idempotent; any partial or conflicting state blocks.
+The publisher keeps `skip-existing` disabled so an upload race fails at the
+write boundary instead of being silently accepted.
+
+GitHub's immutable-release settings API requires repository
+`Administration: read`, which is not available to the built-in workflow token.
+Its release-list API also returns drafts only to a user with push access. The
+expected external contract is the dedicated `release-guard` GitHub Environment
+with one required reviewer, `Cranot`, and `prevent_self_review=false`. It uses
+custom deployment policies only (`protected_branches=false` and
+`custom_branch_policies=true`) and contains exactly policy ID `55007746`, name
+pattern `v*`, type `tag`. This is deliberately an owner-approved gate rather
+than a two-person review gate; the workflow separately requires both the tag
+actor and rerun actor to be `Cranot` and hard-binds this release to `v0.2.0`.
+Administrator bypass is currently enabled; it is not pinned by the contract,
+so disabling bypass later is accepted as monotonic hardening.
+Store `RELEASE_GUARD_READ_TOKEN` as an environment secret there, with no
+repository-level copy. The fine-grained token must belong to the repository
+owner, be scoped only to this repository with exactly `Administration: read`
+and `Contents: read`, plus `Environments: read` and `Secrets: read` for secret
+metadata only, and have an explicit expiration. The three read-only jobs that
+consume it are all bound to `release-guard`; each validates the environment
+reviewer and exact tag-policy contract through the versioned read-only API,
+proves the token's `/user` identity, requires the named environment secret to
+exist, and rejects a repository-scoped secret of the same name. Secret values
+are never read. The token cannot mutate repository state and never reaches
+either publication job.
+Those verifier jobs do not trust the GitHub-hosted runner's preinstalled `gh`.
+They fetch only the official Linux amd64 GitHub CLI v2.96.0 archive through one
+bounded, credential-free GitHub-to-release-CDN redirect, require its exact
+14,652,560-byte length and independently checked SHA-256
+`83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60`,
+and extract only the reviewed `gh` member. The contained executable is separately
+bound to SHA-256
+`56b8bbbb27b066ecb33dbef9a256dc9d1314adaeff0908a752feba6c34053b40`,
+installed at an exclusive absolute path under `RUNNER_TEMP`, and kept outside
+`PATH`. Immediately before every attestation or release-verification command,
+the verifier rechecks the stable single-link file, size, hash, executable mode,
+controlled path, and exact v2.96.0 version output. Any redirect, header, archive,
+platform, path, hash, version, 60-second wall-clock deadline, or safe-version
+floor drift blocks the release. Network commands receive a minimal fixed `gh`
+environment containing only the bounded token, `github.com` host, read-only
+config path, noninteractive flags, locale, and color setting; inherited proxy,
+host, config, update, and credential-selection variables do not cross the boundary.
+The canonical check also runs Zizmor's auditor persona with ignores disabled at
+medium severity and above, so an inline suppression cannot silently remove this
+environment boundary.
+
+Before the first PyPI publication, an unprivileged gate binds the downloaded
+bundle to its exact Actions artifact ID, artifact digest, workflow run, source
+SHA, and annotated tag object. It verifies the immutable-release setting and
+build attestations, rejects duplicate same-tag releases and any partial or
+mismatched draft, and accepts only `missing`, byte-exact resumable `draft_exact`,
+or byte-exact immutable `exact` state. For `missing`, the source-free publisher
+re-reads the remote tag ref and exact annotated tag object, requires their object
+IDs and peeled source commit to match preflight, creates one draft, and attaches
+exactly the wheel, sdist, SBOM, and manifest. For `draft_exact`, staging is
+skipped so an interrupted run resumes the same release and asset IDs. A separate
+read-only job then revalidates the tag, build attestations, every remote asset's
+bytes, digest, size and API identity, and the closed four-item draft inventory.
+That successful draft proof (or a pre-existing immutable exact release) is a
+hard dependency of the PyPI publisher.
+
+PyPI Trusted Publishing runs next. A separate job requires both exact registry
+bytes and the registry-hosted PEP 740 statements before GitHub finalization can
+start. Only then does the second source-free GitHub job recheck the tag, every
+exact asset ID, digest, size, release metadata, and the final four-item draft
+inventory before issuing one
+exact-ID draft-to-published API transition; it has no create fallback. GitHub's
+release PATCH has no conditional-write primitive, so repository permissions
+must also exclude concurrent release writers during this final read-to-PATCH
+window. Final verification independently requires exact PyPI bytes and publish
+attestations, then repeats the GitHub byte checks against immutable state and
+verifies the release attestation. A rerun safely resumes an exact draft or skips
+an exact immutable release; contradictory, partial, mismatched, duplicate, or
+extra state fails closed. This terminal verifier runs after every successful build
+and GitHub preflight even when an intermediate publication job failed or was
+skipped, so a missing PyPI publication or missing/still-draft GitHub release cannot
+produce a green workflow.
 
 Maintainer sequence: publish `roam-code>=13.10.0`, run
 `python scripts/check.py`, verify the protected `pypi` environment and Trusted
-Publisher, create the annotated version tag, push that tag, and approve the
-environment deployment. Do not create the tag while the dependency-resolving
-wheel and sdist smokes are blocked.
+Publisher, immutable releases, and the protected `release-guard` environment
+with its read-only owner token;
+create the annotated version tag, push that tag, and approve the environment
+deployment. Do not create the tag while the dependency-resolving wheel and
+sdist smokes are blocked.
 
 ## How it relates to roam-code
 

@@ -2,8 +2,8 @@
 """Pre-push pipeline — every commit ships polished or not at all.
 
 Mirrors roam-code's prepush_check discipline at this repo's scale:
-lint, format, workflow security, tests, leak/package sweeps, README truth,
-and release-contract sanity. Wired via
+locked-graph vulnerability audit, lint, format, workflow security, tests,
+leak/package sweeps, README truth, and release-contract sanity. Wired via
 ``.githooks/pre-push`` (``git config core.hooksPath .githooks``);
 run by hand any time: ``python3 scripts/check.py``.
 """
@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +50,8 @@ RELEASE_LOCKS = (
 )
 RELEASE_REQUIREMENT = re.compile(r"(?m)^([a-z0-9][a-z0-9._-]*)==([^\s;\\]+).*$")
 MAX_SCHEMA_BYTES = 1024 * 1024
+MAX_JSON_DEPTH = 128
+MAX_CHECK_OUTPUT_BYTES = 16 * 1024 * 1024
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -59,10 +63,54 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
     return value
 
 
+def _parse_bounded_json_int(value: str) -> int:
+    if len(value.removeprefix("-")) > 128:
+        raise ValueError("JSON integer literal is oversized")
+    return int(value)
+
+
+def _parse_finite_json_float(value: str) -> float:
+    if len(value) > 128:
+        raise ValueError("JSON floating-point literal is oversized")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def _strict_json_document(data: bytes, label: str) -> object:
     if len(data) > MAX_SCHEMA_BYTES:
         raise ValueError(f"{label} exceeds {MAX_SCHEMA_BYTES} bytes")
-    return json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_json_keys)
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in data:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:
+                escaped = True
+            elif value == 0x22:
+                in_string = False
+            continue
+        if value == 0x22:
+            in_string = True
+        elif value in {0x5B, 0x7B}:
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError(f"{label} exceeds the JSON nesting limit")
+        elif value in {0x5D, 0x7D}:
+            depth -= 1
+    try:
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"non-finite JSON number: {value}")),
+            parse_float=_parse_finite_json_float,
+            parse_int=_parse_bounded_json_int,
+        )
+    except RecursionError as exc:
+        raise ValueError(f"{label} exceeds the JSON nesting limit") from exc
 
 
 def _path_is_committed_artifact(rel: str) -> bool:
@@ -72,7 +120,15 @@ def _path_is_committed_artifact(rel: str) -> bool:
 
 def run(title: str, cmd: list[str], *, env: dict[str, str] | None = None) -> bool:
     try:
-        proc = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, timeout=1200)
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            proc = subprocess.run(cmd, cwd=ROOT, env=env, stdout=stdout, stderr=stderr, timeout=1200)
+            stdout_size = os.fstat(stdout.fileno()).st_size
+            stderr_size = os.fstat(stderr.fileno()).st_size
+            output_bounded = stdout_size <= MAX_CHECK_OUTPUT_BYTES and stderr_size <= MAX_CHECK_OUTPUT_BYTES
+            if proc.returncode != 0 or not output_bounded:
+                stdout.seek(max(0, stdout_size - 2_000))
+                stderr.seek(max(0, stderr_size - 2_000))
+                detail = (stdout.read(2_000) + stderr.read(2_000)).decode("utf-8", "replace").strip()
     except FileNotFoundError:
         print(f"[check] {title}: FAIL")
         print(f"required executable not found: {cmd[0]}")
@@ -85,10 +141,13 @@ def run(title: str, cmd: list[str], *, env: dict[str, str] | None = None) -> boo
         print(f"[check] {title}: FAIL")
         print(f"command exceeded the 1200s gate timeout: {' '.join(cmd)}")
         return False
-    ok = proc.returncode == 0
+    ok = proc.returncode == 0 and output_bounded
     print(f"[check] {title}: {'PASS' if ok else 'FAIL'}")
     if not ok:
-        print((proc.stdout + proc.stderr).strip()[-2000:])
+        if not output_bounded:
+            print(f"command output exceeded the {MAX_CHECK_OUTPUT_BYTES}-byte per-stream limit")
+        if detail:
+            print(detail[-2_000:])
     return ok
 
 
@@ -124,7 +183,7 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
     for pattern, label in LEAK_PATTERNS:
         for m in re.finditer(pattern, text):
             line = text.count("\n", 0, m.start()) + 1
-            hits.append(f"  {rel}:{line}  [{label}] {m.group(0)[:40]}")
+            hits.append(f"  {rel}:{line}  [{label}] redacted match")
     return hits
 
 
@@ -213,6 +272,7 @@ def readme_sanity() -> bool:
     text = (ROOT / "README.md").read_text(encoding="utf-8")
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    normalized_text = re.sub(r"\s+", " ", text)
     problems = []
     if 'python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.0"' not in text:
         problems.append("install command missing")
@@ -220,6 +280,19 @@ def readme_sanity() -> bool:
         problems.append("future owner-gated PyPI install command missing")
     if "`roam-code 13.10.0` is available on PyPI" not in text:
         problems.append("dependency publication gate missing")
+    for release_guard in (
+        "RELEASE_GUARD_READ_TOKEN",
+        "release-guard",
+        "55007746",
+        "prevent_self_review=false",
+        "`v*`",
+        "Administration: read",
+        "Contents: read",
+        "exactly the wheel, sdist, SBOM, and manifest",
+        "without resolving `roam-code`",
+    ):
+        if release_guard not in normalized_text:
+            problems.append(f"immutable GitHub Release guidance missing: {release_guard}")
     if text.count("# compile-code") < 1:
         problems.append("title missing")
     docs = {"README.md": text, "AGENTS.md": agents}
@@ -333,10 +406,27 @@ def release_sanity() -> bool:
             raise ValueError("manifest schema root must be an object")
         if schema.get("additionalProperties") is not False:
             problems.append("manifest schema: root object is not closed")
+        evidence = schema["properties"]["evidence"]
+        if evidence.get("additionalProperties") is not False:
+            problems.append("manifest schema: evidence policy is not closed")
+        expected_evidence = {
+            "build_attestation": {"const": "github-build-provenance"},
+            "dependency_audit": {"const": "osv-locked-graphs"},
+            "pypi_publish_attestation": {"const": "pypi-integrity-api-pep740"},
+            "release_attestation": {"const": "github-immutable-release"},
+        }
+        if evidence.get("properties") != expected_evidence:
+            problems.append("manifest schema: evidence policy drift")
+        tag_object = schema["properties"]["source"]["properties"]["tag_object_sha"]
+        if tag_object.get("pattern") != "^[0-9a-f]{40}$":
+            problems.append("manifest schema: annotated tag object binding missing")
         item = schema["properties"]["files"]["items"]
         if item.get("additionalProperties") is not False:
             problems.append("manifest schema: file records are not closed")
-        role_order = [item["properties"]["role"]["const"] for item in schema["properties"]["files"]["prefixItems"]]
+        prefix_items = schema["properties"]["files"]["prefixItems"]
+        if any(prefix["allOf"][0].get("$ref") != "#/properties/files/items" for prefix in prefix_items):
+            problems.append("manifest schema: ordered records do not inherit the closed file schema")
+        role_order = [prefix["allOf"][1]["properties"]["role"]["const"] for prefix in prefix_items]
         if role_order != ["wheel", "sdist", "sbom"]:
             problems.append("manifest schema: canonical role order is not encoded")
         sbom_maximum = item["allOf"][0]["then"]["properties"]["size"]["maximum"]
@@ -347,6 +437,7 @@ def release_sanity() -> bool:
 
     try:
         release_module = _load_release_module()
+        release_module.locked_requirement_queries(ROOT)
         problems.extend(release_module.audit_repository(ROOT))
     except (ImportError, OSError, RuntimeError) as exc:
         problems.append(f"release validator failed to load: {exc}")
@@ -357,10 +448,33 @@ def release_sanity() -> bool:
         "release.yml": (
             "install-smoke --bundle release-bundle --mode package-only",
             "install-smoke --bundle release-bundle --mode resolve",
+            "python scripts/release_artifacts.py audit-locks",
             "verify --bundle release-bundle --dist pypi-dist --github-source",
-            "pypi-state --bundle release-bundle --dist pypi-dist --github-source --github-output",
+            "pypi-state --bundle release-bundle --dist pypi-dist --github-source --wait-seconds 120 --github-output",
             "pypi-state --bundle release-bundle --dist pypi-dist --github-source --require-exact",
+            "skip-existing: false",
             "actions/attest-build-provenance@",
+            "github-artifact-state",
+            "github-release-state",
+            "RELEASE_GUARD_READ_TOKEN",
+            "name: release-guard",
+            "octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae",
+            "route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}",
+            "ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd",
+            "needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id",
+            "needs.github_release_preflight.outputs.bundle_artifact_digest == needs.build.outputs.bundle_artifact_digest",
+            "needs.github_release_preflight.outputs.source_sha == github.sha",
+            'immutableCreate: "false"',
+            "artifactContentType: application/octet-stream",
+            'artifactErrorsFailBuild: "true"',
+            'replacesArtifacts: "false"',
+            "--require-draft-exact --wait-seconds 120 --github-output",
+            "github_release_draft_verify",
+            "github_release_publish",
+            "route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+            "route: PATCH /repos/{owner}/{repo}/releases/{release_id}",
+            "fromJSON(steps.remote_manifest.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_id)",
+            "pypi-state --bundle release-bundle --dist pypi-dist --github-source --require-exact --wait-seconds 300",
         ),
         "ci.yml": ("--no-compile --no-build-isolation --only-binary=:all: -e .",),
     }
@@ -380,11 +494,28 @@ def release_sanity() -> bool:
     return not problems
 
 
+def dependency_audit() -> bool:
+    """Fail closed on known vulnerabilities in the exact universal release locks."""
+    try:
+        audited = _load_release_module().audit_locked_requirements(ROOT)
+    except (ImportError, OSError, RuntimeError) as exc:
+        print("[check] locked dependency audit: FAIL")
+        print(f"  {exc}")
+        return False
+    print(f"[check] locked dependency audit: PASS ({audited} exact package versions; no resolution)")
+    return True
+
+
 def main() -> int:
     zizmor = Path(sys.executable).with_name("zizmor.exe" if sys.platform == "win32" else "zizmor")
     results = [
+        dependency_audit(),
         run("ruff check", [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"]),
         run("ruff format --check", [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"]),
+        run(
+            "zizmor auditor medium+ (ignores disabled)",
+            [str(zizmor), "--persona", "auditor", "--no-ignores", "--min-severity", "medium", ".github/workflows"],
+        ),
         run("zizmor --pedantic", [str(zizmor), "--pedantic", ".github/workflows"]),
         run("pytest", [sys.executable, "-m", "pytest", "tests/", "-q"], env=_source_test_environment()),
         leak_scan(),

@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import csv
 import email.policy
 import gzip
 import hashlib
 import io
 import json
+import math
 import os
+import platform
 import re
 import shutil
 import stat
@@ -54,6 +57,58 @@ MANIFEST_NAME = "release-manifest.json"
 MANIFEST_SCHEMA = "https://github.com/Cranot/compile-code/releases/schema/manifest-v1"
 MANIFEST_VERSION = 1
 BUILD_RECORD_SCHEMA = "compile-code-build-v1"
+GITHUB_API_VERSION = "2026-03-10"
+GITHUB_WORKFLOW_ARTIFACT_NAME = "compile-code-release-bundle"
+GITHUB_RELEASE_SIGNER_WORKFLOW = f"{REPOSITORY}/.github/workflows/release.yml"
+GITHUB_CLI_VERSION = "2.96.0"
+GITHUB_CLI_MINIMUM_SAFE_VERSION = (2, 93, 0)
+GITHUB_CLI_ARCHIVE_NAME = f"gh_{GITHUB_CLI_VERSION}_linux_amd64.tar.gz"
+GITHUB_CLI_ARCHIVE_URL = f"https://github.com/cli/cli/releases/download/v{GITHUB_CLI_VERSION}/{GITHUB_CLI_ARCHIVE_NAME}"
+# Independently matched against the official v2.96.0 checksum list, immutable
+# release-API asset digest, and downloaded bytes on 2026-07-18.  The member hash
+# additionally binds the only executable that this verifier writes and invokes.
+GITHUB_CLI_ARCHIVE_SIZE = 14_652_560
+GITHUB_CLI_ARCHIVE_SHA256 = "83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60"
+GITHUB_CLI_ARCHIVE_MEMBER = f"gh_{GITHUB_CLI_VERSION}_linux_amd64/bin/gh"
+GITHUB_CLI_ARCHIVE_ENTRIES = 231
+GITHUB_CLI_ARCHIVE_EXPANDED_SIZE = 41_089_793
+GITHUB_CLI_BINARY_SIZE = 40_722_594
+GITHUB_CLI_BINARY_SHA256 = "56b8bbbb27b066ecb33dbef9a256dc9d1314adaeff0908a752feba6c34053b40"
+GITHUB_CLI_INSTALL_DIRECTORY = f"compile-code-gh-{GITHUB_CLI_VERSION}"
+GITHUB_CLI_ENVIRONMENT_VARIABLE = "COMPILE_GITHUB_CLI"
+GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS = 60
+GITHUB_CLI_SOCKET_TIMEOUT_SECONDS = 10
+GITHUB_CLI_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+RELEASE_GUARD_ENVIRONMENT = "release-guard"
+RELEASE_GUARD_SECRET = "RELEASE_GUARD_READ_TOKEN"
+RELEASE_GUARD_POLICY_ID = 55_007_746
+RELEASE_GUARD_TAG_PATTERN = "v*"
+EXPECTED_LOCKED_VERSION_COUNT = 47
+IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
+PYPI_PUBLISH_ATTESTATION_TYPE = "https://docs.pypi.org/attestations/publish/v1"
+PYPI_INTEGRITY_MEDIA_TYPE = "application/vnd.pypi.integrity.v1+json"
+EVIDENCE_POLICY = {
+    "build_attestation": "github-build-provenance",
+    "dependency_audit": "osv-locked-graphs",
+    "pypi_publish_attestation": "pypi-integrity-api-pep740",
+    "release_attestation": "github-immutable-release",
+}
+RELEASE_ACTION_INVENTORY = {
+    "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373": 1,
+    "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0": 6,
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c": 11,
+    "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1": 6,
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": 2,
+    "ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd": 1,
+    "octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae": 10,
+    "pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b": 1,
+}
+LOCK_GRAPHS = (
+    ("build-requirements.in", "build-requirements.lock"),
+    ("smoke-requirements.in", "smoke-requirements.lock"),
+    ("tooling-requirements.in", "tooling-requirements.lock"),
+)
+OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 BUILD_REQUIRES = ["setuptools==83.0.0", "wheel==0.47.0"]
 RUNTIME_REQUIRES = ["roam-code>=13.10.0", "click>=8.0"]
 DEV_REQUIRES = ["pytest==9.1.1", "PyYAML==6.0.3", "ruff==0.15.22", "zizmor==1.27.0"]
@@ -75,15 +130,24 @@ SHA512_RE = re.compile(r"[0-9a-f]{128}\Z")
 MAX_ARCHIVE_ENTRIES = 2_048
 MAX_MEMBER_SIZE = 32 * 1024 * 1024
 MAX_ARCHIVE_SIZE = 128 * 1024 * 1024
+MAX_TAR_STREAM_SIZE = MAX_ARCHIVE_SIZE + (MAX_ARCHIVE_ENTRIES * 1_024) + 1_024
 MAX_JSON_SIZE = 8 * 1024 * 1024
+MAX_JSON_DEPTH = 128
 MAX_PYPROJECT_SIZE = 1024 * 1024
 MAX_COMMAND_DIAGNOSTIC_SIZE = 4 * 1024 * 1024
 MAX_GITHUB_OUTPUT_SIZE = 1024 * 1024
+MAX_GITHUB_RELEASE_LIST_PAGES = 100
+MAX_GITHUB_EXPRESSION_INTEGER = (1 << 53) - 1
+MAX_LOCK_SIZE = 1024 * 1024
+MAX_OSV_RESPONSE_SIZE = 8 * 1024 * 1024
+MAX_OSV_QUERIES = 1_000
+MAX_ATTESTATION_STATEMENT_SIZE = 64 * 1024
 MEDIA_TYPES = {
     "wheel": "application/zip",
     "sdist": "application/gzip",
     "sbom": "application/vnd.cyclonedx+json",
 }
+RELEASE_MEDIA_TYPES = {**MEDIA_TYPES, "manifest": "application/json"}
 ARCHIVE_LEAK_PATTERNS = (
     (re.compile(rb"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"), "GitHub token"),
     (re.compile(rb"sk-[A-Za-z0-9]{20,}"), "API secret key"),
@@ -111,6 +175,16 @@ PROJECT_KEYS = {
     "urls",
     "version",
 }
+LOCK_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3})"
+    r"(?:\s*;\s*([^\\\r\n]+))?\s*\\\s*$"
+)
+INPUT_REQUIREMENT_RE = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)==((?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3})"
+    r"(?:\s*;\s*([^\r\n]+))?\s*$"
+)
+LOCK_HASH_RE = re.compile(r"^--hash=sha256:([0-9a-f]{64})(?:\s+\\)?$")
+OSV_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 
 
 class ReleaseError(RuntimeError):
@@ -274,12 +348,60 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _parse_bounded_json_int(value: str) -> int:
+    if len(value.removeprefix("-")) > 128:
+        raise ValueError("JSON integer literal is oversized")
+    return int(value)
+
+
+def _parse_finite_json_float(value: str) -> float:
+    if len(value) > 128:
+        raise ValueError("JSON floating-point literal is oversized")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number is forbidden: {value}")
+    return parsed
+
+
+def _preflight_json_depth(data: bytes, label: str) -> None:
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in data:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == 0x5C:  # backslash
+                escaped = True
+            elif value == 0x22:  # quote
+                in_string = False
+            continue
+        if value == 0x22:
+            in_string = True
+        elif value in {0x5B, 0x7B}:  # [ {
+            depth += 1
+            _require(depth <= MAX_JSON_DEPTH, f"{label}: JSON nesting exceeds {MAX_JSON_DEPTH}")
+        elif value in {0x5D, 0x7D}:  # ] }
+            depth -= 1
+
+
 def _load_json_bytes(data: bytes, label: str) -> Any:
     _require(len(data) <= MAX_JSON_SIZE, f"{label}: JSON exceeds {MAX_JSON_SIZE} bytes")
+    _preflight_json_depth(data, label)
     try:
-        return json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ReleaseError(f"{label}: invalid UTF-8 JSON: {exc}") from exc
+        return json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_json_float,
+            parse_int=_parse_bounded_json_int,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        raise ReleaseError(f"{label}: invalid strict UTF-8 JSON: {exc}") from exc
 
 
 def _exact_keys(value: Any, expected: set[str], label: str) -> dict[str, Any]:
@@ -352,6 +474,10 @@ def _read_pyproject(root: Path) -> dict[str, Any]:
 
 
 def _validate_pyproject(parsed: dict[str, Any], label: str) -> None:
+    _require(
+        set(parsed) == {"build-system", "project", "tool"},
+        f"{label}: root table must contain only build-system, project, and tool",
+    )
     build = parsed.get("build-system")
     _require(isinstance(build, dict), f"{label}: build-system table missing")
     _require(set(build) == {"build-backend", "requires"}, f"{label}: build-system table must be closed")
@@ -377,7 +503,10 @@ def _validate_pyproject(parsed: dict[str, Any], label: str) -> None:
     _require(project.get("scripts") == CONSOLE_SCRIPTS, f"{label}: console-script contract drift")
     _require(project.get("urls") == PROJECT_URLS, f"{label}: project URL contract drift")
 
-    setuptools_config = parsed.get("tool", {}).get("setuptools", {})
+    tools = parsed.get("tool")
+    _require(isinstance(tools, dict) and set(tools) == {"ruff", "setuptools"}, f"{label}: tool table must be closed")
+    _require(tools.get("ruff") == {"line-length": 120}, f"{label}: Ruff release configuration drift")
+    setuptools_config = tools.get("setuptools", {})
     _require(isinstance(setuptools_config, dict), f"{label}: tool.setuptools must be an object")
     _require(set(setuptools_config) <= {"packages"}, f"{label}: executable/custom setuptools hooks are forbidden")
     packages = setuptools_config.get("packages", {})
@@ -423,6 +552,298 @@ def _run(
     return stdout_bytes if binary else stdout_bytes.decode("utf-8", "replace")
 
 
+def _validate_github_cli_release_url(url: Any, *, initial: bool, label: str) -> urllib.parse.ParseResult:
+    _require(isinstance(url, str) and url.isascii(), f"unsafe {label}: {url!r}")
+    _require(
+        not any(ord(character) < 0x20 or character == "\\" for character in url),
+        f"unsafe {label}: {url!r}",
+    )
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ReleaseError(f"unsafe {label}: {url!r}: {exc}") from exc
+    expected_host = "github.com" if initial else "release-assets.githubusercontent.com"
+    _require(
+        parsed.scheme == "https"
+        and parsed.hostname == expected_host
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment,
+        f"unsafe {label}: {url!r}",
+    )
+    if initial:
+        _require(url == GITHUB_CLI_ARCHIVE_URL, "GitHub CLI archive URL drift")
+    else:
+        _require(bool(parsed.path) and parsed.path != "/", "GitHub CLI release-asset path is missing")
+    return parsed
+
+
+class _GitHubCliRedirect(urllib.request.HTTPRedirectHandler):
+    """Permit one credential-free redirect from GitHub to its release CDN."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.redirect_count = 0
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        self.redirect_count += 1
+        _require(self.redirect_count == 1, "GitHub CLI archive redirected more than once")
+        _require(code in {301, 302, 307, 308}, f"GitHub CLI archive used unexpected redirect status {code}")
+        _validate_github_cli_release_url(req.full_url, initial=True, label="GitHub CLI archive URL")
+        _validate_github_cli_release_url(newurl, initial=False, label="GitHub CLI release-asset redirect")
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        _require(redirected is not None, "GitHub CLI archive redirect was not followed")
+        redirected.headers.pop("Authorization", None)
+        redirected.unredirected_hdrs.pop("Authorization", None)
+        return redirected
+
+
+def _fetch_github_cli_archive(*, opener: Any | None = None) -> bytes:
+    """Fetch exactly one reviewed official archive with bounded unauthenticated I/O."""
+    _validate_github_cli_release_url(
+        GITHUB_CLI_ARCHIVE_URL,
+        initial=True,
+        label="GitHub CLI archive URL",
+    )
+    request = urllib.request.Request(
+        GITHUB_CLI_ARCHIVE_URL,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "compile-code-release-bootstrap/1",
+        },
+    )
+    client = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _GitHubCliRedirect())
+    deadline = time.monotonic() + GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS
+    with client.open(request, timeout=GITHUB_CLI_SOCKET_TIMEOUT_SECONDS) as response:
+        _validate_github_cli_release_url(
+            response.geturl(),
+            initial=False,
+            label="final GitHub CLI release-asset URL",
+        )
+        _require(response.getcode() == 200, f"GitHub CLI archive returned HTTP {response.getcode()}")
+        _require(
+            response.headers.get("Content-Type") == "application/octet-stream",
+            "GitHub CLI archive media type mismatch",
+        )
+        _require(
+            response.headers.get("Content-Length") == str(GITHUB_CLI_ARCHIVE_SIZE),
+            "GitHub CLI archive Content-Length mismatch",
+        )
+        _require(
+            response.headers.get("Content-Disposition") == f"attachment; filename={GITHUB_CLI_ARCHIVE_NAME}",
+            "GitHub CLI archive filename metadata mismatch",
+        )
+        chunks: list[bytes] = []
+        received = 0
+        read_once = getattr(response, "read1", response.read)
+        while received < GITHUB_CLI_ARCHIVE_SIZE:
+            _require(time.monotonic() < deadline, "GitHub CLI archive download exceeded its wall-clock deadline")
+            chunk = read_once(min(GITHUB_CLI_DOWNLOAD_CHUNK_SIZE, GITHUB_CLI_ARCHIVE_SIZE - received))
+            _require(chunk, "GitHub CLI archive ended before its declared byte length")
+            received += len(chunk)
+            _require(received <= GITHUB_CLI_ARCHIVE_SIZE, "GitHub CLI archive exceeded its exact byte length")
+            chunks.append(chunk)
+            _require(time.monotonic() < deadline, "GitHub CLI archive download exceeded its wall-clock deadline")
+        archive_bytes = b"".join(chunks)
+    _require(len(archive_bytes) == GITHUB_CLI_ARCHIVE_SIZE, "GitHub CLI archive byte length mismatch")
+    _require(
+        hashlib.sha256(archive_bytes).hexdigest() == GITHUB_CLI_ARCHIVE_SHA256,
+        "GitHub CLI archive SHA-256 mismatch",
+    )
+    return archive_bytes
+
+
+def _github_cli_binary_from_archive(archive_bytes: bytes) -> bytes:
+    _require(
+        isinstance(archive_bytes, bytes) and len(archive_bytes) == GITHUB_CLI_ARCHIVE_SIZE,
+        "GitHub CLI archive byte length mismatch",
+    )
+    _require(
+        hashlib.sha256(archive_bytes).hexdigest() == GITHUB_CLI_ARCHIVE_SHA256,
+        "GitHub CLI archive SHA-256 mismatch",
+    )
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+            members = archive.getmembers()
+            _require(
+                len(members) == GITHUB_CLI_ARCHIVE_ENTRIES,
+                "GitHub CLI archive member-count mismatch",
+            )
+            _require(
+                sum(member.size for member in members) == GITHUB_CLI_ARCHIVE_EXPANDED_SIZE,
+                "GitHub CLI archive expanded-size mismatch",
+            )
+            names: set[str] = set()
+            target: tarfile.TarInfo | None = None
+            for member in members:
+                name = _safe_archive_name(member.name)
+                _require(name not in names, f"duplicate GitHub CLI archive member: {name}")
+                names.add(name)
+                _require(member.isfile(), f"GitHub CLI archive contains a non-file member: {name}")
+                _require(
+                    0 <= member.size <= GITHUB_CLI_ARCHIVE_EXPANDED_SIZE,
+                    f"GitHub CLI archive member is oversized: {name}",
+                )
+                if name == GITHUB_CLI_ARCHIVE_MEMBER:
+                    target = member
+            _require(target is not None, "GitHub CLI executable member is missing")
+            _require(target.size == GITHUB_CLI_BINARY_SIZE, "GitHub CLI executable size metadata mismatch")
+            _require(target.mode & 0o777 == 0o755, "GitHub CLI executable mode mismatch")
+            stream = archive.extractfile(target)
+            _require(stream is not None, "GitHub CLI executable member is unreadable")
+            binary = stream.read(GITHUB_CLI_BINARY_SIZE + 1)
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise ReleaseError(f"GitHub CLI archive is malformed: {exc}") from exc
+    _require(len(binary) == GITHUB_CLI_BINARY_SIZE, "GitHub CLI executable byte length mismatch")
+    _require(
+        hashlib.sha256(binary).hexdigest() == GITHUB_CLI_BINARY_SHA256,
+        "GitHub CLI executable SHA-256 mismatch",
+    )
+    return binary
+
+
+def _github_cli_target(environ: dict[str, str] | None = None) -> tuple[Path, Path]:
+    env = os.environ if environ is None else environ
+    runner_temp_value = env.get("RUNNER_TEMP", "")
+    _require(
+        runner_temp_value
+        and runner_temp_value.isascii()
+        and not any(ord(character) < 0x20 for character in runner_temp_value),
+        "RUNNER_TEMP is missing or unsafe",
+    )
+    runner_temp_path = Path(runner_temp_value)
+    _require(runner_temp_path.is_absolute(), "RUNNER_TEMP must be an absolute path")
+    runner_temp = _validated_real_directory(runner_temp_path, label="RUNNER_TEMP")
+    if os.name == "posix":
+        runner_temp_state = os.lstat(runner_temp)
+        _require(runner_temp_state.st_uid == os.geteuid(), "RUNNER_TEMP is not owned by the release user")
+        _require(runner_temp_state.st_mode & 0o022 == 0, "RUNNER_TEMP is group/world writable")
+    root = ROOT.resolve()
+    _require(
+        runner_temp != root and root not in runner_temp.parents,
+        "GitHub CLI must be installed outside the source workspace",
+    )
+    install_directory = runner_temp / GITHUB_CLI_INSTALL_DIRECTORY
+    return install_directory, install_directory / "gh"
+
+
+def _validate_github_cli_executable(
+    executable: Path,
+    *,
+    run_command: Callable[..., bytes | str] = _run,
+) -> str:
+    install_directory = _validated_real_directory(executable.parent, label="GitHub CLI install")
+    _require(install_directory.name == GITHUB_CLI_INSTALL_DIRECTORY, "GitHub CLI install directory drift")
+    directory_state = os.lstat(install_directory)
+    if os.name == "posix":
+        _require(directory_state.st_uid == os.geteuid(), "GitHub CLI install directory owner mismatch")
+        _require(directory_state.st_mode & 0o022 == 0, "GitHub CLI install directory is group/world writable")
+    payload = _read_bounded_regular_file(
+        executable,
+        label="GitHub CLI executable",
+        max_bytes=GITHUB_CLI_BINARY_SIZE,
+    )
+    _require(len(payload) == GITHUB_CLI_BINARY_SIZE, "GitHub CLI executable byte length mismatch")
+    _require(hashlib.sha256(payload).hexdigest() == GITHUB_CLI_BINARY_SHA256, "GitHub CLI executable SHA-256 mismatch")
+    executable_state = os.lstat(executable)
+    if os.name == "posix":
+        _require(executable_state.st_uid == os.geteuid(), "GitHub CLI executable owner mismatch")
+        _require(executable_state.st_mode & 0o111 != 0, "GitHub CLI executable mode is not executable")
+        _require(executable_state.st_mode & 0o022 == 0, "GitHub CLI executable is group/world writable")
+    version_environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "NO_COLOR": "1",
+    }
+    output = run_command([str(executable), "--version"], cwd=ROOT, env=version_environment, timeout=30)
+    _require(isinstance(output, str), "GitHub CLI version output is not text")
+    lines = output.rstrip("\r\n").splitlines()
+    _require(
+        len(lines) == 2
+        and re.fullmatch(
+            rf"gh version {re.escape(GITHUB_CLI_VERSION)} \([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}\)",
+            lines[0],
+        )
+        is not None
+        and lines[1] == f"https://github.com/cli/cli/releases/tag/v{GITHUB_CLI_VERSION}",
+        f"GitHub CLI must report exact version {GITHUB_CLI_VERSION}",
+    )
+    return str(executable)
+
+
+def _require_github_cli_platform() -> None:
+    _require(sys.platform == "linux", "the pinned GitHub CLI archive requires Linux")
+    _require(platform.machine().lower() in {"amd64", "x86_64"}, "the pinned GitHub CLI archive requires amd64")
+
+
+def install_github_cli(
+    *,
+    environ: dict[str, str] | None = None,
+    fetch_archive: Callable[[], bytes] = _fetch_github_cli_archive,
+    run_command: Callable[..., bytes | str] = _run,
+) -> Path:
+    """Install the one reviewed gh binary into an exclusive runner-temp path."""
+    _require_github_cli_platform()
+    version_tuple = tuple(int(part) for part in GITHUB_CLI_VERSION.split("."))
+    _require(version_tuple >= GITHUB_CLI_MINIMUM_SAFE_VERSION, "pinned GitHub CLI is below the safe version floor")
+    install_directory, executable = _github_cli_target(environ)
+    try:
+        os.mkdir(install_directory, 0o700)
+    except FileExistsError as exc:
+        raise ReleaseError(f"GitHub CLI install target already exists: {install_directory}") from exc
+    archive_bytes = fetch_archive()
+    binary = _github_cli_binary_from_archive(archive_bytes)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(executable, flags, 0o500)
+    try:
+        _write_all(descriptor, binary)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o500)
+        else:  # pragma: no cover - Windows-only compatibility for local verification
+            os.chmod(executable, 0o500)
+        os.fsync(descriptor)
+        written = os.fstat(descriptor)
+        _require(written.st_size == GITHUB_CLI_BINARY_SIZE, "GitHub CLI executable write was incomplete")
+    finally:
+        os.close(descriptor)
+    os.chmod(install_directory, 0o500)
+    _validate_github_cli_executable(executable, run_command=run_command)
+    return executable
+
+
+def _github_cli_executable(environ: dict[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    _install_directory, expected = _github_cli_target(env)
+    configured_value = env.get(GITHUB_CLI_ENVIRONMENT_VARIABLE, "")
+    _require(configured_value and Path(configured_value).is_absolute(), "controlled GitHub CLI path is missing")
+    configured = Path(os.path.abspath(configured_value))
+    _require(
+        os.path.normcase(str(configured)) == os.path.normcase(str(expected)),
+        "controlled GitHub CLI path does not match RUNNER_TEMP",
+    )
+    return _validate_github_cli_executable(configured)
+
+
+def _run_github_cli(arguments: list[str], *, timeout: int = 120) -> str:
+    """Re-prove the absolute binary hash and exact version before every gh call."""
+    executable = _github_cli_executable()
+    environment = {
+        "GH_CONFIG_DIR": str(Path(executable).parent),
+        "GH_HOST": "github.com",
+        "GH_NO_UPDATE_NOTIFIER": "1",
+        "GH_PROMPT_DISABLED": "1",
+        "GH_TOKEN": _github_token(),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "NO_COLOR": "1",
+    }
+    result = _run([executable, *arguments], cwd=ROOT, env=environment, timeout=timeout)
+    _require(isinstance(result, str), "GitHub CLI command output is not text")
+    return result
+
+
 def _git(root: Path, *args: str) -> str:
     return str(_run(["git", *args], cwd=root, timeout=60)).strip()
 
@@ -447,8 +868,21 @@ def source_context_from_github(
     _validate_sha(event_sha)
 
     _require(_git(root, "cat-file", "-t", ref) == "tag", "release tag must be an annotated tag object")
+    tag_object_sha = _git(root, "rev-parse", f"{ref}^{{tag}}")
+    _validate_sha(tag_object_sha)
     source_sha = _git(root, "rev-parse", f"{ref}^{{commit}}")
     _validate_sha(source_sha)
+    tag_headers = _git(root, "cat-file", "-p", tag_object_sha).partition("\n\n")[0].splitlines()
+    direct_headers: dict[str, list[str]] = {}
+    for line in tag_headers:
+        if line.startswith(" "):
+            continue
+        key, separator, value = line.partition(" ")
+        if separator:
+            direct_headers.setdefault(key, []).append(value)
+    _require(direct_headers.get("object") == [source_sha], "annotated tag must directly target the source commit")
+    _require(direct_headers.get("type") == ["commit"], "annotated tag target must be a commit")
+    _require(direct_headers.get("tag") == [f"v{version}"], "annotated tag name differs from the release tag")
     event_commit = _git(root, "rev-parse", f"{event_sha}^{{commit}}")
     head = _git(root, "rev-parse", "HEAD")
     _require(event_commit == source_sha == head, "event SHA, annotated tag target, and checked-out HEAD must match")
@@ -464,6 +898,7 @@ def source_context_from_github(
     return {
         "repository": REPOSITORY_URL,
         "sha": source_sha,
+        "tag_object_sha": tag_object_sha,
         "tag": f"v{version}",
         "source_date_epoch": source_date_epoch,
         "version": version,
@@ -518,9 +953,10 @@ def _extract_source_archive(data: bytes, destination: Path) -> None:
     seen: set[str] = set()
     total = 0
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
-        members = archive.getmembers()
-        _require(len(members) <= MAX_ARCHIVE_ENTRIES, "source archive has too many entries")
-        for member in members:
+        member_count = 0
+        for member in archive:
+            member_count += 1
+            _require(member_count <= MAX_ARCHIVE_ENTRIES, "source archive has too many entries")
             name = _safe_archive_name(member.name, allow_directory=True)
             folded = name.casefold()
             _require(folded not in seen, f"duplicate source archive path: {name}")
@@ -551,15 +987,65 @@ def _scan_payload(name: str, data: bytes) -> None:
         _require(pattern.search(data) is None, f"{name}: package-content leak detected ({label})")
 
 
+def _preflight_zip_archive(archive_bytes: bytes) -> int:
+    """Bound the central directory before ZipFile allocates its entry list."""
+    _require(0 < len(archive_bytes) <= MAX_ARCHIVE_SIZE, "wheel is missing or oversized")
+    minimum_eocd_size = 22
+    maximum_comment_size = 65_535
+    search_start = max(0, len(archive_bytes) - minimum_eocd_size - maximum_comment_size)
+    eocd_offset = archive_bytes.rfind(b"PK\x05\x06", search_start)
+    _require(eocd_offset >= 0 and eocd_offset + minimum_eocd_size <= len(archive_bytes), "wheel EOCD is missing")
+    (
+        signature,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", archive_bytes, eocd_offset)
+    _require(signature == b"PK\x05\x06", "wheel EOCD signature mismatch")
+    _require(disk_number == central_disk == 0, "multi-disk wheel is forbidden")
+    _require(disk_entries == total_entries, "wheel central-directory entry count mismatch")
+    _require(total_entries not in {0, 0xFFFF}, "empty or ZIP64 wheel is forbidden")
+    _require(total_entries <= MAX_ARCHIVE_ENTRIES, "wheel has too many entries")
+    _require(central_size != 0xFFFFFFFF and central_offset != 0xFFFFFFFF, "ZIP64 wheel is forbidden")
+    _require(
+        eocd_offset + minimum_eocd_size + comment_size == len(archive_bytes),
+        "wheel has trailing bytes or a malformed archive comment",
+    )
+    _require(
+        central_offset + central_size == eocd_offset,
+        "wheel central-directory bounds are non-canonical",
+    )
+    cursor = central_offset
+    counted_entries = 0
+    while cursor < eocd_offset:
+        _require(cursor + 46 <= eocd_offset, "wheel central-directory record is truncated")
+        _require(archive_bytes[cursor : cursor + 4] == b"PK\x01\x02", "wheel central-directory signature mismatch")
+        filename_size, extra_size, record_comment_size = struct.unpack_from("<3H", archive_bytes, cursor + 28)
+        record_size = 46 + filename_size + extra_size + record_comment_size
+        _require(cursor + record_size <= eocd_offset, "wheel central-directory record exceeds its bounds")
+        counted_entries += 1
+        _require(counted_entries <= MAX_ARCHIVE_ENTRIES, "wheel has too many entries")
+        cursor += record_size
+    _require(cursor == eocd_offset, "wheel central-directory does not end at the EOCD")
+    _require(counted_entries == total_entries, "wheel central-directory entry count mismatch")
+    return total_entries
+
+
 def _read_zip_files(path: Path, *, archive_bytes: bytes | None = None) -> dict[str, bytes]:
     if archive_bytes is None:
         archive_bytes = _read_bounded_regular_file(path, label="wheel", max_bytes=MAX_ARCHIVE_SIZE)
+    expected_entries = _preflight_zip_archive(archive_bytes)
     files: dict[str, bytes] = {}
     folded: set[str] = set()
     total = 0
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
             infos = archive.infolist()
+            _require(len(infos) == expected_entries, "wheel central-directory entry count changed during parsing")
             _require(len(infos) <= MAX_ARCHIVE_ENTRIES, "wheel has too many entries")
             for info in infos:
                 name = _safe_archive_name(info.filename, allow_directory=True)
@@ -573,7 +1059,9 @@ def _read_zip_files(path: Path, *, archive_bytes: bytes | None = None) -> dict[s
                 _require(0 <= info.file_size <= MAX_MEMBER_SIZE, f"wheel member is oversized: {name}")
                 total += info.file_size
                 _require(total <= MAX_ARCHIVE_SIZE, "wheel expands beyond the size limit")
-                files[name] = archive.read(info)
+                payload = archive.read(info)
+                _require(len(payload) == info.file_size, f"wheel member size mismatch: {name}")
+                files[name] = payload
     except (OSError, RuntimeError, NotImplementedError, zipfile.BadZipFile) as exc:
         raise ReleaseError(f"invalid wheel archive: {exc}") from exc
     return files
@@ -654,15 +1142,22 @@ def normalize_wheel(raw: Path, output: Path, source: dict[str, Any]) -> None:
 def _read_tar_files(path: Path, *, archive_bytes: bytes | None = None) -> tuple[str, dict[str, bytes]]:
     if archive_bytes is None:
         archive_bytes = _read_bounded_regular_file(path, label="sdist", max_bytes=MAX_ARCHIVE_SIZE)
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(archive_bytes), mode="rb") as compressed:
+            tar_bytes = compressed.read(MAX_TAR_STREAM_SIZE + 1)
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise ReleaseError(f"invalid sdist gzip stream: {exc}") from exc
+    _require(len(tar_bytes) <= MAX_TAR_STREAM_SIZE, "sdist decompressed stream exceeds the size limit")
     files: dict[str, bytes] = {}
     folded: set[str] = set()
     roots: set[str] = set()
     total = 0
     try:
-        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
-            members = archive.getmembers()
-            _require(len(members) <= MAX_ARCHIVE_ENTRIES, "sdist has too many entries")
-            for member in members:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+            member_count = 0
+            for member in archive:
+                member_count += 1
+                _require(member_count <= MAX_ARCHIVE_ENTRIES, "sdist has too many entries")
                 name = _safe_archive_name(member.name, allow_directory=True)
                 roots.add(PurePosixPath(name).parts[0])
                 key = name.casefold()
@@ -889,6 +1384,7 @@ def _manifest_bytes(source: dict[str, Any], files: list[Path]) -> bytes:
     records = [_file_record(path, roles[path.suffix]) for path in files]
     records.sort(key=lambda record: {"wheel": 0, "sdist": 1, "sbom": 2}[record["role"]])
     document = {
+        "evidence": EVIDENCE_POLICY,
         "files": records,
         "project": PROJECT,
         "schema": MANIFEST_SCHEMA,
@@ -897,6 +1393,7 @@ def _manifest_bytes(source: dict[str, Any], files: list[Path]) -> bytes:
             "repository": REPOSITORY_URL,
             "sha": source["sha"],
             "source_date_epoch": source["source_date_epoch"],
+            "tag_object_sha": source["tag_object_sha"],
         },
         "tag": source["tag"],
         "version": source["version"],
@@ -932,7 +1429,7 @@ def _validate_source_tree_for_build(source_root: Path, *, expected_version: str)
 
 
 def _closed_build_environment(epoch: int, scratch: Path) -> dict[str, str]:
-    """Build with only OS launch state plus deterministic, networkless controls."""
+    """Build with scrubbed launch state and package-index access disabled."""
     allowed = ("COMSPEC", "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR")
     env = {name: os.environ[name] for name in allowed if os.environ.get(name)}
     env.update(
@@ -1293,7 +1790,9 @@ def _inspect_sdist(
 
 def _validate_manifest(document: Any, canonical_bytes: bytes) -> dict[str, Any]:
     manifest = _exact_keys(
-        document, {"files", "project", "schema", "schema_version", "source", "tag", "version"}, "manifest"
+        document,
+        {"evidence", "files", "project", "schema", "schema_version", "source", "tag", "version"},
+        "manifest",
     )
     _require(_canonical_json(manifest) == canonical_bytes, "manifest must use canonical JSON encoding")
     _require(
@@ -1303,11 +1802,21 @@ def _validate_manifest(document: Any, canonical_bytes: bytes) -> dict[str, Any]:
         "manifest schema mismatch",
     )
     _require(manifest["project"] == PROJECT, "manifest project mismatch")
+    evidence = _exact_keys(
+        manifest["evidence"],
+        set(EVIDENCE_POLICY),
+        "manifest.evidence",
+    )
+    _require(evidence == EVIDENCE_POLICY, "manifest evidence policy mismatch")
     version = _validate_version(manifest["version"])
     _validate_tag(manifest["tag"], version)
-    source = _exact_keys(manifest["source"], {"repository", "sha", "source_date_epoch"}, "manifest.source")
+    source = _exact_keys(
+        manifest["source"], {"repository", "sha", "source_date_epoch", "tag_object_sha"}, "manifest.source"
+    )
     _require(source["repository"] == REPOSITORY_URL, "manifest source repository mismatch")
     _validate_sha(source["sha"])
+    _validate_sha(source["tag_object_sha"])
+    _require(source["tag_object_sha"] != source["sha"], "annotated tag object must differ from its source commit")
     _validate_epoch(source["source_date_epoch"])
 
     records = manifest["files"]
@@ -1365,6 +1874,10 @@ def verify_bundle(
         _require(manifest["version"] == expected_source["version"], "manifest version differs from validated source")
         _require(manifest["tag"] == expected_source["tag"], "manifest tag differs from validated source")
         _require(manifest["source"]["sha"] == expected_source["sha"], "manifest SHA differs from validated source")
+        _require(
+            manifest["source"]["tag_object_sha"] == expected_source["tag_object_sha"],
+            "manifest tag object differs from validated source",
+        )
         _require(
             manifest["source"]["source_date_epoch"] == expected_source["source_date_epoch"],
             "manifest epoch differs from validated source",
@@ -1478,32 +1991,267 @@ def twine_check(bundle: Path) -> None:
     )
 
 
+def _release_text(path: Path, *, label: str) -> str:
+    data = _read_bounded_regular_file(path, label=label, max_bytes=MAX_LOCK_SIZE)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReleaseError(f"{label} must be UTF-8: {exc}") from exc
+    _require("\x00" not in text, f"{label} contains a NUL byte")
+    text = text.replace("\r\n", "\n")
+    _require("\r" not in text, f"{label} contains a bare carriage return")
+    return text
+
+
+def _validate_requirement_marker(marker: str | None, *, label: str) -> None:
+    if marker is None:
+        return
+    _require(
+        0 < len(marker) <= 1_000 and marker.isascii() and not any(ord(character) < 0x20 for character in marker),
+        f"{label} contains an unsafe environment marker",
+    )
+
+
+def _parse_release_input(path: Path) -> dict[str, str]:
+    label = f"release input {path.name}"
+    text = _release_text(path, label=label)
+    requirements: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = INPUT_REQUIREMENT_RE.fullmatch(stripped)
+        _require(match is not None, f"{label}:{line_number}: requirement must use one exact version")
+        name = _canonical_name(match.group(1))
+        _require(name != "roam-code", f"{label} must not resolve the unpublished roam-code dependency")
+        _require(name not in requirements, f"{label} contains a duplicate requirement: {name}")
+        _validate_requirement_marker(match.group(3), label=f"{label}:{line_number}")
+        requirements[name] = match.group(2)
+    _require(requirements, f"{label} contains no requirements")
+    return requirements
+
+
+def _parse_release_lock(path: Path, *, input_name: str) -> dict[str, str]:
+    label = f"release lock {path.name}"
+    text = _release_text(path, label=label)
+    lines = text.splitlines()
+    _require(len(lines) >= 3, f"{label} is truncated")
+    _require(
+        lines[0] == "# This file was autogenerated by uv via the following command:",
+        f"{label} is missing the uv provenance header",
+    )
+    expected_command = (
+        f"#    uv pip compile release/{input_name} --universal --python-version 3.10 --generate-hashes "
+        f"--no-emit-index-url --output-file release/{path.name}"
+    )
+    _require(
+        lines[1].replace("\\", "/") == expected_command,
+        f"{label} generation command drift",
+    )
+    lowered = text.lower()
+    for forbidden in (
+        "--config-settings",
+        "--editable",
+        "--extra-index-url",
+        "--find-links",
+        "--global-option",
+        "--index-url",
+        "--install-option",
+        "--no-binary",
+        "--trusted-host",
+        " @ ",
+        " -e ",
+        "git+",
+        "http://",
+        "https://",
+    ):
+        _require(forbidden not in lowered, f"{label} contains forbidden construct: {forbidden.strip()}")
+
+    starts: list[tuple[int, re.Match[str]]] = []
+    for line_number, line in enumerate(lines, 1):
+        match = LOCK_REQUIREMENT_RE.fullmatch(line)
+        if match is not None:
+            starts.append((line_number, match))
+            continue
+        stripped = line.strip()
+        _require(
+            not stripped or stripped.startswith("#") or LOCK_HASH_RE.fullmatch(stripped) is not None,
+            f"{label}:{line_number}: unexpected or unpinned requirement syntax",
+        )
+    _require(starts, f"{label} contains no exact requirements")
+    first_requirement_line = starts[0][0]
+    _require(
+        not any(LOCK_HASH_RE.fullmatch(line.strip()) for line in lines[: first_requirement_line - 1]),
+        f"{label} contains an orphaned hash",
+    )
+
+    requirements: dict[str, str] = {}
+    for index, (line_number, match) in enumerate(starts):
+        block_end = starts[index + 1][0] - 1 if index + 1 < len(starts) else len(lines)
+        hashes = [
+            hash_match.group(1)
+            for line in lines[line_number:block_end]
+            if (hash_match := LOCK_HASH_RE.fullmatch(line.strip())) is not None
+        ]
+        name = _canonical_name(match.group(1))
+        _require(name != "roam-code", f"{label} must not resolve the unpublished roam-code dependency")
+        _require(name not in requirements, f"{label} contains a duplicate requirement: {name}")
+        _require(hashes, f"{label}:{line_number}: {name} has no SHA-256 hashes")
+        _require(len(hashes) == len(set(hashes)), f"{label}:{line_number}: {name} has duplicate hashes")
+        _validate_requirement_marker(match.group(3), label=f"{label}:{line_number}")
+        requirements[name] = match.group(2)
+    return requirements
+
+
+def locked_requirement_queries(
+    root: Path = ROOT,
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], tuple[str, ...]]]:
+    """Return a stable OSV query set from the three universal hashed graphs."""
+    release_dir = _validated_real_directory(root / "release", label="release lock")
+    provenance: dict[tuple[str, str], set[str]] = {}
+    for input_name, lock_name in LOCK_GRAPHS:
+        roots = _parse_release_input(release_dir / input_name)
+        locked = _parse_release_lock(release_dir / lock_name, input_name=input_name)
+        for name, version in roots.items():
+            _require(
+                locked.get(name) == version,
+                f"release lock {lock_name} is stale for root {name}=={version}",
+            )
+        for name, version in locked.items():
+            provenance.setdefault((name, version), set()).add(lock_name)
+    _require(
+        len(provenance) == EXPECTED_LOCKED_VERSION_COUNT,
+        f"locked dependency query count must remain exactly {EXPECTED_LOCKED_VERSION_COUNT}; got {len(provenance)}",
+    )
+    ordered = sorted(provenance)
+    queries = [{"package": {"ecosystem": "PyPI", "name": name}, "version": version} for name, version in ordered]
+    return queries, {key: tuple(sorted(provenance[key])) for key in ordered}
+
+
+class _RejectOSVRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise ReleaseError(f"OSV audit endpoint unexpectedly redirected with HTTP {code}")
+
+
+def _fetch_osv_batch(payload: bytes) -> Any:
+    _require(0 < len(payload) <= MAX_JSON_SIZE, "OSV query payload is missing or oversized")
+    request = urllib.request.Request(
+        OSV_QUERY_BATCH_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "compile-code-release-audit/1",
+        },
+    )
+    opener = urllib.request.build_opener(_RejectOSVRedirect())
+    try:
+        with opener.open(request, timeout=30) as response:
+            _require(response.geturl() == OSV_QUERY_BATCH_URL, "OSV audit response came from an unexpected URL")
+            _require(response.getcode() == 200, f"OSV audit returned HTTP {response.getcode()}")
+            content_type = response.headers.get_content_type()
+            _require(content_type == "application/json", f"OSV audit returned unexpected media type: {content_type}")
+            data = response.read(MAX_OSV_RESPONSE_SIZE + 1)
+    except urllib.error.HTTPError as exc:
+        raise ReleaseError(f"OSV audit request failed: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise ReleaseError(f"OSV audit request failed: {exc.reason}") from exc
+    _require(len(data) <= MAX_OSV_RESPONSE_SIZE, "OSV audit response is oversized")
+    return _load_json_bytes(data, "OSV querybatch response")
+
+
+def audit_locked_requirements(
+    root: Path = ROOT,
+    *,
+    fetch_json: Callable[[bytes], Any] = _fetch_osv_batch,
+) -> int:
+    """Audit only exact lock rows; never invoke pip or resolve project dependencies."""
+    queries, provenance = locked_requirement_queries(root)
+    document = fetch_json(_canonical_json({"queries": queries}))
+    response = _exact_keys(document, {"results"}, "OSV querybatch response")
+    results = response["results"]
+    _require(isinstance(results, list), "OSV querybatch results must be an array")
+    _require(len(results) == len(queries), "OSV querybatch result count mismatch")
+
+    findings: list[str] = []
+    for index, (query, result) in enumerate(zip(queries, results, strict=True)):
+        _require(isinstance(result, dict), f"OSV querybatch result {index} must be an object")
+        _require(
+            set(result) <= {"vulns", "next_page_token"},
+            f"OSV querybatch result {index} contains unknown fields",
+        )
+        _require("next_page_token" not in result, f"OSV querybatch result {index} is incomplete and paginated")
+        vulnerabilities = result.get("vulns", [])
+        _require(isinstance(vulnerabilities, list), f"OSV querybatch result {index} vulnerabilities must be an array")
+        package = query["package"]["name"]
+        version = query["version"]
+        seen_ids: set[str] = set()
+        for vulnerability in vulnerabilities:
+            row = _exact_keys(vulnerability, {"id", "modified"}, f"OSV vulnerability for {package}=={version}")
+            identifier = row["id"]
+            modified = row["modified"]
+            _require(
+                isinstance(identifier, str) and OSV_ID_RE.fullmatch(identifier) is not None,
+                f"OSV vulnerability ID is malformed for {package}=={version}",
+            )
+            _require(
+                isinstance(modified, str)
+                and 10 <= len(modified) <= 100
+                and modified.isascii()
+                and modified.endswith("Z"),
+                f"OSV vulnerability modified timestamp is malformed for {package}=={version}",
+            )
+            _require(identifier not in seen_ids, f"OSV returned a duplicate vulnerability ID for {package}=={version}")
+            seen_ids.add(identifier)
+            graphs = ",".join(provenance[(package, version)])
+            findings.append(f"{package}=={version}:{identifier}[{graphs}]")
+    if findings:
+        display = "; ".join(sorted(findings)[:20])
+        suffix = "" if len(findings) <= 20 else f"; plus {len(findings) - 20} more"
+        raise ReleaseError(f"locked dependency vulnerabilities found ({len(findings)}): {display}{suffix}")
+    return len(queries)
+
+
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        parsed = urllib.parse.urlparse(newurl)
-        _require(
-            parsed.scheme == "https" and parsed.hostname in {"pypi.org", "files.pythonhosted.org"},
-            "unsafe registry redirect",
-        )
+        _validate_registry_url(newurl, label="registry redirect")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def _fetch_url(url: str, *, max_bytes: int) -> bytes:
-    parsed = urllib.parse.urlparse(url)
+def _validate_registry_url(url: Any, *, label: str = "registry URL") -> urllib.parse.ParseResult:
+    _require(isinstance(url, str), f"unsafe {label}: {url!r}")
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ReleaseError(f"unsafe {label}: {url!r}: {exc}") from exc
     _require(
-        parsed.scheme == "https" and parsed.hostname in {"pypi.org", "files.pythonhosted.org"},
-        f"unsafe registry URL: {url}",
+        parsed.scheme == "https"
+        and parsed.hostname in {"pypi.org", "files.pythonhosted.org"}
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment,
+        f"unsafe {label}: {url}",
     )
-    request = urllib.request.Request(
-        url, headers={"Accept": "application/json", "User-Agent": "compile-code-release/1"}
+    return parsed
+
+
+def _fetch_url(url: str, *, max_bytes: int, accept: str = "application/octet-stream") -> bytes:
+    _validate_registry_url(url)
+    _require(
+        isinstance(accept, str)
+        and 0 < len(accept) <= 200
+        and accept.isascii()
+        and not any(character.isspace() or ord(character) < 0x20 for character in accept),
+        "unsafe registry Accept media type",
     )
+    request = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "compile-code-release/1"})
     opener = urllib.request.build_opener(_SafeRedirect())
     with opener.open(request, timeout=30) as response:
-        final = urllib.parse.urlparse(response.geturl())
-        _require(
-            final.scheme == "https" and final.hostname in {"pypi.org", "files.pythonhosted.org"},
-            "unsafe final registry URL",
-        )
+        _validate_registry_url(response.geturl(), label="final registry URL")
+        _require(response.getcode() == 200, f"registry request returned HTTP {response.getcode()}")
         data = response.read(max_bytes + 1)
     _require(len(data) <= max_bytes, f"registry response exceeds {max_bytes} bytes")
     return data
@@ -1511,7 +2259,11 @@ def _fetch_url(url: str, *, max_bytes: int) -> bytes:
 
 def _fetch_pypi_json() -> dict[str, Any] | None:
     try:
-        data = _fetch_url(f"https://pypi.org/pypi/{PROJECT}/json", max_bytes=MAX_JSON_SIZE)
+        data = _fetch_url(
+            f"https://pypi.org/pypi/{PROJECT}/json",
+            max_bytes=MAX_JSON_SIZE,
+            accept="application/json",
+        )
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
@@ -1521,6 +2273,128 @@ def _fetch_pypi_json() -> dict[str, Any] | None:
     return document
 
 
+def _fetch_pypi_provenance(version: str, filename: str) -> dict[str, Any] | None:
+    version = _validate_version(version)
+    filename = _safe_bundle_filename(filename)
+    url = (
+        f"https://pypi.org/integrity/{urllib.parse.quote(PROJECT, safe='')}/"
+        f"{urllib.parse.quote(version, safe='')}/{urllib.parse.quote(filename, safe='')}/provenance"
+    )
+    try:
+        data = _fetch_url(url, max_bytes=MAX_JSON_SIZE, accept=PYPI_INTEGRITY_MEDIA_TYPE)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise ReleaseError(f"PyPI Integrity API request failed: HTTP {exc.code}") from exc
+    document = _load_json_bytes(data, f"PyPI provenance for {filename}")
+    _require(isinstance(document, dict), f"PyPI provenance must be an object: {filename}")
+    return document
+
+
+def _decode_bounded_base64(value: Any, *, label: str, max_bytes: int) -> bytes:
+    _require(isinstance(value, str) and value.isascii(), f"{label} must be base64 text")
+    _require(0 < len(value) <= ((max_bytes + 2) // 3) * 4, f"{label} exceeds the encoded size limit")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ReleaseError(f"{label} is not canonical base64") from exc
+    _require(0 < len(decoded) <= max_bytes, f"{label} exceeds the decoded size limit")
+    return decoded
+
+
+def _validate_pypi_publish_provenance(document: Any, *, filename: str, sha256: str) -> None:
+    provenance = _exact_keys(document, {"attestation_bundles", "version"}, f"PyPI provenance for {filename}")
+    _require(type(provenance["version"]) is int and provenance["version"] == 1, "PyPI provenance version mismatch")
+    bundles = provenance["attestation_bundles"]
+    _require(isinstance(bundles, list) and 0 < len(bundles) <= 128, "PyPI provenance bundle inventory is malformed")
+    matched_publish_attestations = 0
+    for bundle_index, bundle_value in enumerate(bundles):
+        bundle = _exact_keys(
+            bundle_value,
+            {"attestations", "publisher"},
+            f"PyPI provenance bundle {bundle_index}",
+        )
+        publisher = bundle["publisher"]
+        _require(isinstance(publisher, dict), f"PyPI provenance publisher {bundle_index} must be an object")
+        _require(
+            {"claims", "kind"} <= set(publisher),
+            f"PyPI provenance publisher {bundle_index} is missing required identity fields",
+        )
+        claims = publisher["claims"]
+        _require(claims is None or isinstance(claims, dict), "PyPI provenance publisher claims are malformed")
+        expected_publisher = (
+            publisher.get("kind") == "GitHub"
+            and publisher.get("repository") == REPOSITORY
+            and publisher.get("workflow") == "release.yml"
+            and publisher.get("environment") == "pypi"
+        )
+        attestations = bundle["attestations"]
+        _require(
+            isinstance(attestations, list) and 0 < len(attestations) <= 128,
+            f"PyPI provenance attestation inventory is malformed: bundle {bundle_index}",
+        )
+        if not expected_publisher:
+            continue
+        for attestation_index, attestation_value in enumerate(attestations):
+            label = f"PyPI attestation {bundle_index}:{attestation_index} for {filename}"
+            _require(isinstance(attestation_value, dict), f"{label} must be an object")
+            _require(
+                {"envelope", "verification_material", "version"} <= set(attestation_value),
+                f"{label} is missing required fields",
+            )
+            _require(
+                type(attestation_value["version"]) is int and attestation_value["version"] == 1,
+                f"{label} version mismatch",
+            )
+            verification_material = attestation_value["verification_material"]
+            _require(isinstance(verification_material, dict), f"{label} verification material must be an object")
+            _require(
+                {"certificate", "transparency_entries"} <= set(verification_material),
+                f"{label} verification material is incomplete",
+            )
+            _decode_bounded_base64(
+                verification_material["certificate"],
+                label=f"{label} certificate",
+                max_bytes=64 * 1024,
+            )
+            transparency_entries = verification_material["transparency_entries"]
+            _require(
+                isinstance(transparency_entries, list)
+                and 0 < len(transparency_entries) <= 128
+                and all(isinstance(entry, dict) for entry in transparency_entries),
+                f"{label} transparency log evidence is missing",
+            )
+            envelope = attestation_value["envelope"]
+            _require(isinstance(envelope, dict), f"{label} envelope must be an object")
+            _require({"signature", "statement"} <= set(envelope), f"{label} envelope is incomplete")
+            _decode_bounded_base64(envelope["signature"], label=f"{label} signature", max_bytes=4 * 1024)
+            statement_bytes = _decode_bounded_base64(
+                envelope["statement"],
+                label=f"{label} statement",
+                max_bytes=MAX_ATTESTATION_STATEMENT_SIZE,
+            )
+            statement = _exact_keys(
+                _load_json_bytes(statement_bytes, f"{label} statement"),
+                {"_type", "predicate", "predicateType", "subject"},
+                f"{label} statement",
+            )
+            _require(statement["_type"] == IN_TOTO_STATEMENT_TYPE, f"{label} in-toto statement type mismatch")
+            subjects = statement["subject"]
+            _require(isinstance(subjects, list) and len(subjects) == 1, f"{label} must bind exactly one subject")
+            subject = _exact_keys(subjects[0], {"digest", "name"}, f"{label} subject")
+            _require(subject["name"] == filename, f"{label} subject filename mismatch")
+            digest = subject["digest"]
+            _require(isinstance(digest, dict), f"{label} subject digest must be an object")
+            _require(digest.get("sha256") == sha256, f"{label} subject SHA-256 mismatch")
+            if statement["predicateType"] == PYPI_PUBLISH_ATTESTATION_TYPE:
+                _require(statement["predicate"] in ({}, None), f"{label} publish predicate must be empty")
+                matched_publish_attestations += 1
+    _require(
+        matched_publish_attestations >= 1,
+        f"PyPI provenance lacks the expected Cranot/compile-code release.yml pypi publish attestation: {filename}",
+    )
+
+
 def _remote_release_state(
     bundle: Path,
     dist: Path,
@@ -1528,6 +2402,7 @@ def _remote_release_state(
     expected_source: dict[str, Any] | None = None,
     fetch_project: Callable[[], dict[str, Any] | None] = _fetch_pypi_json,
     fetch_bytes: Callable[[str], bytes] | None = None,
+    fetch_provenance: Callable[[str, str], dict[str, Any] | None] = _fetch_pypi_provenance,
 ) -> str:
     manifest = verify_bundle(bundle, dist=dist, expected_source=expected_source)
     project = fetch_project()
@@ -1558,6 +2433,7 @@ def _remote_release_state(
         "PyPI release has missing, duplicate, or extra files",
     )
     downloader = fetch_bytes or (lambda url: _fetch_url(url, max_bytes=MAX_ARCHIVE_SIZE))
+    attestation_pending = False
     for row in rows:
         filename = _safe_bundle_filename(row.get("filename"))
         record = records[filename]
@@ -1572,11 +2448,7 @@ def _remote_release_state(
         )
         url = row.get("url")
         _require(isinstance(url, str), f"PyPI URL missing: {filename}")
-        parsed_url = urllib.parse.urlparse(url)
-        _require(
-            parsed_url.scheme == "https" and parsed_url.hostname in {"pypi.org", "files.pythonhosted.org"},
-            f"unsafe registry URL: {url}",
-        )
+        _validate_registry_url(url)
         remote = downloader(url)
         _require(
             isinstance(remote, bytes) and len(remote) <= MAX_ARCHIVE_SIZE, f"PyPI payload is oversized: {filename}"
@@ -1585,7 +2457,16 @@ def _remote_release_state(
             dist / filename, label=f"local publication {filename}", max_bytes=MAX_ARCHIVE_SIZE
         )
         _require(remote == local, f"PyPI exact-byte mismatch: {filename}")
-    return "exact"
+        provenance = fetch_provenance(manifest["version"], filename)
+        if provenance is None:
+            attestation_pending = True
+        else:
+            _validate_pypi_publish_provenance(
+                provenance,
+                filename=filename,
+                sha256=record["hashes"]["sha256"],
+            )
+    return "attestation_pending" if attestation_pending else "exact"
 
 
 def pypi_state(
@@ -1601,10 +2482,12 @@ def pypi_state(
         state = _remote_release_state(bundle, dist, expected_source=expected_source)
         if state == "exact":
             return state
-        if not require_exact:
+        if state == "missing" and not require_exact:
             return state
+        if state == "attestation_pending" and wait_seconds == 0:
+            raise ReleaseError("PyPI files are exact but their publish attestations are not yet available")
         if time.monotonic() >= deadline:
-            raise ReleaseError("PyPI release did not become byte-exact before the deadline")
+            raise ReleaseError("PyPI release did not become byte-exact with publish attestations before the deadline")
         time.sleep(min(10, max(1, int(deadline - time.monotonic()))))
 
 
@@ -1618,6 +2501,629 @@ def _write_github_output(state: str) -> None:
     )
 
 
+def _release_name(version: str) -> str:
+    return f"compile-code v{_validate_version(version)}"
+
+
+def _release_body(version: str) -> str:
+    version = _validate_version(version)
+    return (
+        f"compile-code {version} release artifacts. The closed asset set is byte-bound by "
+        f"{MANIFEST_NAME} and requires GitHub build-provenance plus immutable-release attestations."
+    )
+
+
+def _validate_github_token(token: Any, label: str) -> str:
+    _require(
+        isinstance(token, str)
+        and 20 <= len(token) <= 2_048
+        and token.isascii()
+        and not any(character.isspace() or ord(character) < 0x20 for character in token),
+        f"{label} must contain one bounded GitHub token",
+    )
+    return token
+
+
+def _github_token(environ: dict[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    return _validate_github_token(env.get("GH_TOKEN") or env.get("GITHUB_TOKEN"), "GH_TOKEN or GITHUB_TOKEN")
+
+
+def _immutable_releases_token(environ: dict[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    return _validate_github_token(
+        env.get("IMMUTABLE_RELEASES_TOKEN"),
+        (
+            "IMMUTABLE_RELEASES_TOKEN with owner identity and repository Administration:read, Contents:read, "
+            "Environments:read, and Secrets:read"
+        ),
+    )
+
+
+class _GitHubAssetRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        parsed = urllib.parse.urlparse(newurl)
+        _require(
+            parsed.scheme == "https"
+            and parsed.hostname
+            in {"api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+            and parsed.port in {None, 443}
+            and parsed.username is None
+            and parsed.password is None,
+            "unsafe GitHub release-asset redirect",
+        )
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and parsed.hostname != "api.github.com":
+            redirected.headers.pop("Authorization", None)
+            redirected.unredirected_hdrs.pop("Authorization", None)
+        return redirected
+
+
+class _RejectGitHubAPIRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        raise ReleaseError(f"GitHub JSON API unexpectedly redirected with HTTP {code}")
+
+
+def _github_api_json(path: str, allow_not_found: bool = False, *, token: str | None = None) -> Any | None:
+    _require(isinstance(path, str), f"unsafe GitHub API path: {path!r}")
+    prefix = f"/repos/{REPOSITORY}/"
+    safe_user_path = path == "/user"
+    release_list_match = re.fullmatch(rf"{re.escape(prefix)}releases\?per_page=100&page=([1-9][0-9]{{0,2}})", path)
+    safe_release_list_query = (
+        release_list_match is not None and int(release_list_match.group(1)) <= MAX_GITHUB_RELEASE_LIST_PAGES
+    )
+    _require(
+        isinstance(path, str)
+        and (path.startswith(prefix) or safe_user_path)
+        and ".." not in path
+        and "#" not in path
+        and path.isascii()
+        and not any(character.isspace() or ord(character) < 0x20 for character in path)
+        and ("?" not in path or safe_release_list_query),
+        f"unsafe GitHub API path: {path!r}",
+    )
+    auth_token = _github_token() if token is None else _validate_github_token(token, "GitHub API token")
+    url = f"https://api.github.com{path}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {auth_token}",
+            "User-Agent": "compile-code-release/1",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+    )
+    opener = urllib.request.build_opener(_RejectGitHubAPIRedirect())
+    try:
+        with opener.open(request, timeout=30) as response:
+            _require(response.geturl() == url, "GitHub JSON API unexpectedly redirected")
+            _require(response.getcode() == 200, f"GitHub JSON API returned HTTP {response.getcode()}")
+            data = response.read(MAX_JSON_SIZE + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404 and allow_not_found:
+            return None
+        raise ReleaseError(f"GitHub API request failed for {path}: HTTP {exc.code}") from exc
+    _require(len(data) <= MAX_JSON_SIZE, f"GitHub API response exceeds {MAX_JSON_SIZE} bytes")
+    return _load_json_bytes(data, f"GitHub API {path}")
+
+
+def _fetch_github_release_asset(asset_id: int, *, token: str, max_bytes: int) -> bytes:
+    _require(type(asset_id) is int and asset_id > 0, "GitHub release asset ID must be a positive integer")
+    token = _validate_github_token(token, "GitHub release asset token")
+    url = f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{asset_id}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "compile-code-release/1",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+    )
+    opener = urllib.request.build_opener(_GitHubAssetRedirect())
+    with opener.open(request, timeout=30) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        _require(
+            final.scheme == "https"
+            and final.hostname
+            in {"api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+            and final.port in {None, 443}
+            and final.username is None
+            and final.password is None,
+            "unsafe final GitHub release-asset URL",
+        )
+        _require(response.getcode() == 200, f"GitHub release asset returned HTTP {response.getcode()}")
+        data = response.read(max_bytes + 1)
+    _require(len(data) <= max_bytes, f"GitHub release asset exceeds {max_bytes} bytes")
+    return data
+
+
+def _validate_workflow_artifact_metadata(
+    document: Any,
+    *,
+    artifact_id: str,
+    artifact_digest: str,
+    source_sha: str,
+    run_id: str,
+) -> None:
+    _require(isinstance(document, dict), "GitHub Actions artifact metadata must be an object")
+    _require(re.fullmatch(r"[1-9][0-9]{0,19}", artifact_id) is not None, "artifact ID must be a positive integer")
+    _require(HASH_RE.fullmatch(artifact_digest) is not None, "artifact digest must be lowercase SHA-256")
+    _validate_sha(source_sha)
+    _require(re.fullmatch(r"[1-9][0-9]{0,19}", run_id) is not None, "GITHUB_RUN_ID must be a positive integer")
+    expected_id = int(artifact_id)
+    _require(type(document.get("id")) is int and document["id"] == expected_id, "Actions artifact ID mismatch")
+    _require(document.get("name") == GITHUB_WORKFLOW_ARTIFACT_NAME, "Actions artifact name mismatch")
+    _require(document.get("expired") is False, "Actions artifact is expired")
+    _require(document.get("digest") == f"sha256:{artifact_digest}", "Actions artifact digest mismatch")
+    workflow_run = document.get("workflow_run")
+    _require(isinstance(workflow_run, dict), "Actions artifact workflow binding is missing")
+    _require(
+        type(workflow_run.get("id")) is int and workflow_run["id"] == int(run_id),
+        "Actions artifact workflow-run ID mismatch",
+    )
+    _require(workflow_run.get("head_sha") == source_sha, "Actions artifact source SHA mismatch")
+
+
+def verify_github_workflow_artifact(
+    *,
+    artifact_id: str,
+    artifact_digest: str,
+    expected_source: dict[str, Any],
+    environ: dict[str, str] | None = None,
+    fetch_json: Callable[[str, bool], Any | None] | None = None,
+) -> None:
+    env = os.environ if environ is None else environ
+    run_id = env.get("GITHUB_RUN_ID", "")
+    token = _github_token(env)
+    reader = fetch_json or (lambda path, missing: _github_api_json(path, missing, token=token))
+    document = reader(f"/repos/{REPOSITORY}/actions/artifacts/{artifact_id}", False)
+    _validate_workflow_artifact_metadata(
+        document,
+        artifact_id=artifact_id,
+        artifact_digest=artifact_digest,
+        source_sha=expected_source["sha"],
+        run_id=run_id,
+    )
+
+
+def _validate_remote_annotated_tag(
+    source: dict[str, Any],
+    reader: Callable[[str, bool], Any | None],
+) -> None:
+    version = _validate_version(source["version"])
+    tag = _validate_tag(source["tag"], version)
+    source_sha = _validate_sha(source["sha"])
+    tag_object_sha = _validate_sha(source["tag_object_sha"])
+    ref = reader(f"/repos/{REPOSITORY}/git/ref/tags/{tag}", False)
+    _require(isinstance(ref, dict) and ref.get("ref") == f"refs/tags/{tag}", "remote release tag ref mismatch")
+    ref_object = ref.get("object")
+    _require(isinstance(ref_object, dict), "remote release tag object is missing")
+    _require(ref_object.get("type") == "tag", "remote release tag must remain annotated")
+    _require(ref_object.get("sha") == tag_object_sha, "remote annotated tag object SHA mismatch")
+    tag_object = reader(f"/repos/{REPOSITORY}/git/tags/{tag_object_sha}", False)
+    _require(isinstance(tag_object, dict), "remote annotated tag record is missing")
+    _require(tag_object.get("sha") == tag_object_sha, "remote annotated tag record SHA mismatch")
+    _require(tag_object.get("tag") == tag, "remote annotated tag name mismatch")
+    target = tag_object.get("object")
+    _require(isinstance(target, dict), "remote annotated tag target is missing")
+    _require(target.get("type") == "commit", "remote annotated tag target must be a commit")
+    _require(target.get("sha") == source_sha, "remote annotated tag source SHA mismatch")
+
+
+def _validate_release_guard_identity(reader: Callable[[str, bool], Any | None]) -> None:
+    user = reader("/user", False)
+    _require(isinstance(user, dict), "release guard identity response must be an object")
+    _require(user.get("login") == OWNER, f"release guard token must belong to {OWNER}")
+    _require(type(user.get("id")) is int and user["id"] > 0, "release guard identity ID is invalid")
+    _require(user.get("type") == "User", "release guard identity must be a GitHub user")
+
+
+def _validate_release_guard_environment(reader: Callable[[str, bool], Any | None]) -> None:
+    base = f"/repos/{REPOSITORY}/environments/{RELEASE_GUARD_ENVIRONMENT}"
+    document = reader(base, False)
+    _require(isinstance(document, dict), "release-guard environment response must be an object")
+    _require(document.get("name") == RELEASE_GUARD_ENVIRONMENT, "release-guard environment name mismatch")
+    _require(type(document.get("can_admins_bypass")) is bool, "release-guard admin-bypass state is malformed")
+    branch_policy = _exact_keys(
+        document.get("deployment_branch_policy"),
+        {"custom_branch_policies", "protected_branches"},
+        "release-guard deployment branch policy",
+    )
+    _require(
+        branch_policy == {"custom_branch_policies": True, "protected_branches": False},
+        "release-guard must use custom deployment branch/tag policies only",
+    )
+
+    rules = document.get("protection_rules")
+    _require(isinstance(rules, list), "release-guard protection rules must be an array")
+    _require(all(isinstance(rule, dict) for rule in rules), "release-guard protection rule must be an object")
+    required_reviewers = [rule for rule in rules if rule.get("type") == "required_reviewers"]
+    branch_rules = [rule for rule in rules if rule.get("type") == "branch_policy"]
+    _require(len(required_reviewers) == 1, "release-guard must have one required-reviewers rule")
+    _require(len(branch_rules) == 1, "release-guard must have one branch-policy protection rule")
+    reviewer_rule = required_reviewers[0]
+    _require(
+        reviewer_rule.get("prevent_self_review") is False,
+        "release-guard prevent_self_review must remain false for the owner-reviewer contract",
+    )
+    reviewers = reviewer_rule.get("reviewers")
+    _require(isinstance(reviewers, list) and len(reviewers) == 1, "release-guard must require only reviewer Cranot")
+    reviewer_row = reviewers[0]
+    _require(
+        isinstance(reviewer_row, dict) and reviewer_row.get("type") == "User", "release-guard reviewer type mismatch"
+    )
+    reviewer = reviewer_row.get("reviewer")
+    _require(isinstance(reviewer, dict), "release-guard reviewer record is missing")
+    _require(reviewer.get("login") == OWNER, "release-guard required reviewer must be Cranot")
+    _require(type(reviewer.get("id")) is int and reviewer["id"] > 0, "release-guard reviewer ID is invalid")
+    _require(reviewer.get("type") == "User", "release-guard reviewer account type mismatch")
+
+    policies = reader(f"{base}/deployment-branch-policies", False)
+    _require(isinstance(policies, dict), "release-guard deployment policy response must be an object")
+    rows = policies.get("branch_policies")
+    _require(
+        type(policies.get("total_count")) is int and policies["total_count"] == 1,
+        "release-guard must have one deployment tag policy",
+    )
+    _require(
+        isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict),
+        "release-guard deployment tag policy is missing",
+    )
+    policy = rows[0]
+    _require(policy.get("id") == RELEASE_GUARD_POLICY_ID, "release-guard deployment policy ID mismatch")
+    _require(policy.get("name") == RELEASE_GUARD_TAG_PATTERN, "release-guard deployment tag pattern mismatch")
+    _require(policy.get("type") == "tag", "release-guard deployment policy must target tags")
+
+
+def _validate_release_guard_secret_scope(reader: Callable[[str, bool], Any | None]) -> None:
+    """Prove the credential came from the protected environment, not fallback scope."""
+    environment_path = f"/repos/{REPOSITORY}/environments/{RELEASE_GUARD_ENVIRONMENT}/secrets/{RELEASE_GUARD_SECRET}"
+    environment_secret = reader(environment_path, False)
+    _require(isinstance(environment_secret, dict), "release-guard environment secret metadata is missing")
+    _require(
+        environment_secret.get("name") == RELEASE_GUARD_SECRET,
+        "release-guard environment secret name mismatch",
+    )
+    repository_secret = reader(f"/repos/{REPOSITORY}/actions/secrets/{RELEASE_GUARD_SECRET}", True)
+    _require(
+        repository_secret is None,
+        "RELEASE_GUARD_READ_TOKEN must not exist at repository scope",
+    )
+
+
+def _github_release_inventory(reader: Callable[[str, bool], Any | None], *, tag: str) -> list[dict[str, Any]]:
+    """Scan the bounded inventory while retaining only same-tag collision rows."""
+    matching: list[dict[str, Any]] = []
+    for page in range(1, MAX_GITHUB_RELEASE_LIST_PAGES + 1):
+        rows = reader(f"/repos/{REPOSITORY}/releases?per_page=100&page={page}", False)
+        _require(isinstance(rows, list), "GitHub release inventory page must be an array")
+        _require(len(rows) <= 100, "GitHub release inventory page exceeds the requested bound")
+        _require(all(isinstance(row, dict) for row in rows), "GitHub release inventory row must be an object")
+        matching.extend(row for row in rows if row.get("tag_name") == tag)
+        _require(len(matching) <= 1, "GitHub release inventory contains duplicate same-tag releases")
+        if len(rows) < 100:
+            return matching
+    raise ReleaseError(
+        f"GitHub release inventory exceeds the fail-closed {MAX_GITHUB_RELEASE_LIST_PAGES * 100}-release bound"
+    )
+
+
+def _reconcile_github_release(
+    *,
+    tag: str,
+    release_by_tag: Any | None,
+    inventory: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    matching = [row for row in inventory if row.get("tag_name") == tag]
+    _require(len(matching) <= 1, "GitHub release inventory contains duplicate same-tag releases")
+    if release_by_tag is None:
+        if not matching:
+            return None
+        _require(matching[0].get("draft") is True, "GitHub release API views disagree for a published release")
+        return matching[0]
+
+    _require(isinstance(release_by_tag, dict), "GitHub release response must be an object")
+    _require(len(matching) == 1, "GitHub release API views disagree for the release tag")
+    release_id = release_by_tag.get("id")
+    _require(
+        type(release_id) is int and matching[0].get("id") == release_id,
+        "GitHub release API views disagree for the release ID",
+    )
+    return release_by_tag
+
+
+def _release_asset_payloads(bundle: Path, manifest: dict[str, Any]) -> dict[str, bytes]:
+    payloads: dict[str, bytes] = {}
+    for record in manifest["files"]:
+        role = record["role"]
+        limit = MAX_JSON_SIZE if role == "sbom" else MAX_ARCHIVE_SIZE
+        payloads[record["filename"]] = _read_bounded_regular_file(
+            bundle / record["filename"], label=f"GitHub release {role}", max_bytes=limit
+        )
+    payloads[MANIFEST_NAME] = _read_bounded_regular_file(
+        bundle / MANIFEST_NAME, label="GitHub release manifest", max_bytes=MAX_JSON_SIZE
+    )
+    _require(len(payloads) == 4, "GitHub release asset set must contain exactly four files")
+    return payloads
+
+
+def _verify_build_attestations(bundle: Path, manifest: dict[str, Any]) -> None:
+    payloads = _release_asset_payloads(bundle, manifest)
+    for filename in sorted(payloads):
+        _run_github_cli(
+            [
+                "attestation",
+                "verify",
+                str(bundle / filename),
+                "--repo",
+                REPOSITORY,
+                "--signer-workflow",
+                GITHUB_RELEASE_SIGNER_WORKFLOW,
+                "--signer-digest",
+                manifest["source"]["sha"],
+                "--source-ref",
+                f"refs/tags/{manifest['tag']}",
+                "--source-digest",
+                manifest["source"]["sha"],
+                "--deny-self-hosted-runners",
+            ],
+            timeout=120,
+        )
+
+
+def _verify_immutable_release_attestation(bundle: Path, manifest: dict[str, Any]) -> None:
+    _run_github_cli(["release", "verify", manifest["tag"], "--repo", REPOSITORY], timeout=120)
+    for filename in sorted(_release_asset_payloads(bundle, manifest)):
+        _run_github_cli(
+            [
+                "release",
+                "verify-asset",
+                manifest["tag"],
+                str(bundle / filename),
+                "--repo",
+                REPOSITORY,
+            ],
+            timeout=120,
+        )
+
+
+def _remote_github_release_state(
+    bundle: Path,
+    *,
+    expected_source: dict[str, Any],
+    required_state: str = "recoverable",
+    details: dict[str, int | str] | None = None,
+    fetch_json: Callable[[str, bool], Any | None] | None = None,
+    fetch_bytes: Callable[[str], bytes] | None = None,
+    verify_build_attestations: Callable[[Path, dict[str, Any]], None] = _verify_build_attestations,
+    verify_release_attestation: Callable[[Path, dict[str, Any]], None] = _verify_immutable_release_attestation,
+    environ: dict[str, str] | None = None,
+) -> str:
+    _require(
+        required_state in {"recoverable", "draft", "immutable"},
+        "invalid required GitHub release state",
+    )
+    if details is not None:
+        details.clear()
+    manifest = verify_bundle(bundle, expected_source=expected_source)
+    env = os.environ if environ is None else environ
+    token = _github_token(env)
+    reader = fetch_json or (lambda path, missing: _github_api_json(path, missing, token=token))
+
+    # Bind the remote annotated tag before touching the Releases API.  The tag
+    # object's SHA and its direct commit target are both part of the manifest.
+    source = {**expected_source, "version": manifest["version"], "tag": manifest["tag"]}
+    _validate_remote_annotated_tag(source, reader)
+    _validate_release_guard_environment(reader)
+    release_guard_token: str | None = None
+    if fetch_json is None:
+        release_guard_token = _immutable_releases_token(env)
+
+        def authenticated_release_reader(path: str, missing: bool) -> Any | None:
+            return _github_api_json(path, missing, token=release_guard_token)
+
+        release_reader = authenticated_release_reader
+    else:
+        release_reader = reader
+    _validate_release_guard_identity(release_reader)
+    _validate_release_guard_secret_scope(release_reader)
+    immutable_settings = release_reader(f"/repos/{REPOSITORY}/immutable-releases", True)
+    _require(isinstance(immutable_settings, dict), "GitHub immutable releases are not enabled")
+    _require(immutable_settings.get("enabled") is True, "GitHub immutable releases are not enabled")
+    _require(
+        type(immutable_settings.get("enforced_by_owner")) is bool,
+        "GitHub immutable-release settings response is malformed",
+    )
+    verify_build_attestations(bundle, manifest)
+
+    release_by_tag = release_reader(f"/repos/{REPOSITORY}/releases/tags/{manifest['tag']}", True)
+    inventory = _github_release_inventory(release_reader, tag=manifest["tag"])
+    release = _reconcile_github_release(
+        tag=manifest["tag"],
+        release_by_tag=release_by_tag,
+        inventory=inventory,
+    )
+    if release is None:
+        _require(required_state == "recoverable", "GitHub release is missing")
+        return "missing"
+    release_id = release.get("id")
+    _require(
+        type(release_id) is int and 0 < release_id <= MAX_GITHUB_EXPRESSION_INTEGER,
+        "GitHub release ID is invalid",
+    )
+    if details is not None:
+        details["release_id"] = release_id
+    _require(release.get("tag_name") == manifest["tag"], "GitHub release tag mismatch")
+    _require(release.get("name") == _release_name(manifest["version"]), "GitHub release name mismatch")
+    _require(release.get("body") == _release_body(manifest["version"]), "GitHub release body mismatch")
+    _require(release.get("prerelease") is False, "GitHub release must not be a prerelease")
+    draft_state = release.get("draft")
+    if draft_state is True:
+        _require(required_state != "immutable", "GitHub release is not the expected immutable release")
+        _require(release.get("immutable") is False, "draft GitHub release unexpectedly reports immutable state")
+        _require(release.get("published_at") is None, "draft GitHub release already has a publication timestamp")
+        result_state = "draft_exact"
+    elif draft_state is False:
+        _require(required_state != "draft", "GitHub release is not the expected draft")
+        _require(release.get("immutable") is True, "existing GitHub release is mutable")
+        _require(isinstance(release.get("published_at"), str) and release["published_at"], "release is not published")
+        result_state = "exact"
+    else:
+        raise ReleaseError("GitHub release draft state is malformed")
+
+    payloads = _release_asset_payloads(bundle, manifest)
+    assets = release.get("assets")
+    _require(isinstance(assets, list), "GitHub release asset inventory is missing")
+    _require(all(isinstance(asset, dict) for asset in assets), "GitHub release asset row must be an object")
+    names = [asset.get("name") for asset in assets]
+    _require(
+        all(isinstance(name, str) for name in names) and len(names) == len(set(names)) and set(names) == set(payloads),
+        "GitHub release has missing, duplicate, or extra assets",
+    )
+    asset_ids: set[int] = set()
+    roles_by_filename = {record["filename"]: record["role"] for record in manifest["files"]}
+    roles_by_filename[MANIFEST_NAME] = "manifest"
+    for asset in assets:
+        filename = _safe_bundle_filename(asset["name"])
+        payload = payloads[filename]
+        asset_id = asset.get("id")
+        _require(
+            type(asset_id) is int and 0 < asset_id <= MAX_GITHUB_EXPRESSION_INTEGER and asset_id not in asset_ids,
+            "GitHub release asset ID drift",
+        )
+        asset_ids.add(asset_id)
+        _require(asset.get("state") == "uploaded", f"GitHub release asset is not uploaded: {filename}")
+        _require(
+            asset.get("content_type") == "application/octet-stream",
+            f"GitHub release asset content type mismatch: {filename}",
+        )
+        _require(asset.get("size") == len(payload), f"GitHub release asset size mismatch: {filename}")
+        asset_digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+        _require(
+            asset.get("digest") == asset_digest,
+            f"GitHub release asset digest mismatch: {filename}",
+        )
+        expected_url = f"{REPOSITORY_URL}/releases/download/{manifest['tag']}/{filename}"
+        url = asset.get("browser_download_url")
+        _require(url == expected_url, f"GitHub release asset URL mismatch: {filename}")
+        api_url = asset.get("url")
+        expected_api_url = f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{asset_id}"
+        _require(api_url == expected_api_url, f"GitHub release asset API URL mismatch: {filename}")
+        if fetch_bytes is not None:
+            remote = fetch_bytes(url)
+        else:
+            _require(release_guard_token is not None, "authenticated release asset reader is unavailable")
+            remote = _fetch_github_release_asset(
+                asset_id,
+                token=release_guard_token,
+                max_bytes=len(payload),
+            )
+        _require(isinstance(remote, bytes), f"GitHub release asset payload is not bytes: {filename}")
+        _require(remote == payload, f"GitHub release exact-byte mismatch: {filename}")
+        if details is not None:
+            role = roles_by_filename[filename]
+            details[f"{role}_asset_id"] = asset_id
+            details[f"{role}_asset_digest"] = asset_digest
+            details[f"{role}_asset_size"] = len(payload)
+    if result_state == "exact":
+        verify_release_attestation(bundle, manifest)
+    return result_state
+
+
+def github_release_state(
+    bundle: Path,
+    *,
+    expected_source: dict[str, Any],
+    require_exact: bool,
+    require_draft_exact: bool,
+    wait_seconds: int,
+    details: dict[str, int | str] | None = None,
+) -> str:
+    _require(not (require_exact and require_draft_exact), "choose only one required GitHub release state")
+    required_state = "draft" if require_draft_exact else "immutable" if require_exact else "recoverable"
+    expected_result = "draft_exact" if require_draft_exact else "exact"
+    deadline = time.monotonic() + wait_seconds
+    last_error: ReleaseError | None = None
+    while True:
+        try:
+            state = _remote_github_release_state(
+                bundle,
+                expected_source=expected_source,
+                required_state=required_state,
+                details=details,
+            )
+            if state == expected_result or not (require_exact or require_draft_exact):
+                return state
+            last_error = ReleaseError(f"GitHub release state is {state}; expected {expected_result}")
+        except ReleaseError as exc:
+            if not (require_exact or require_draft_exact):
+                raise
+            last_error = exc
+        if time.monotonic() >= deadline:
+            label = "byte-exact draft" if require_draft_exact else "byte-exact immutable release"
+            raise ReleaseError(f"GitHub release did not become a {label}: {last_error}") from last_error
+        time.sleep(min(10, max(1, int(deadline - time.monotonic()))))
+
+
+def _write_github_artifact_output(
+    artifact_id: str,
+    artifact_digest: str,
+    source: dict[str, Any],
+) -> None:
+    _append_github_output(
+        [
+            f"artifact_id={artifact_id}",
+            f"artifact_digest={artifact_digest}",
+            f"source_sha={source['sha']}",
+            f"tag={source['tag']}",
+            f"tag_object_sha={source['tag_object_sha']}",
+        ]
+    )
+
+
+def _write_github_release_output(state: str, *, details: dict[str, int | str] | None = None) -> None:
+    _require(state in {"missing", "draft_exact", "exact"}, "invalid GitHub release state")
+    lines = [
+        f"state={state}",
+        f"release_required={'true' if state == 'missing' else 'false'}",
+        f"publish_required={'true' if state == 'draft_exact' else 'false'}",
+    ]
+    if state == "draft_exact":
+        _require(details is not None, "draft release details are missing")
+        release_id = details.get("release_id")
+        _require(
+            type(release_id) is int and 0 < release_id <= MAX_GITHUB_EXPRESSION_INTEGER,
+            "draft release ID is missing",
+        )
+        lines.append(f"release_id={release_id}")
+        for role in ("wheel", "sdist", "sbom", "manifest"):
+            asset_id = details.get(f"{role}_asset_id")
+            asset_digest = details.get(f"{role}_asset_digest")
+            asset_size = details.get(f"{role}_asset_size")
+            _require(
+                type(asset_id) is int and 0 < asset_id <= MAX_GITHUB_EXPRESSION_INTEGER,
+                f"draft {role} asset ID is missing",
+            )
+            _require(
+                isinstance(asset_digest, str)
+                and asset_digest.startswith("sha256:")
+                and HASH_RE.fullmatch(asset_digest.removeprefix("sha256:")) is not None,
+                f"draft {role} asset digest is malformed",
+            )
+            _require(type(asset_size) is int and 0 < asset_size <= MAX_ARCHIVE_SIZE, f"draft {role} size is invalid")
+            if role in {"sbom", "manifest"}:
+                _require(asset_size <= MAX_JSON_SIZE, f"draft {role} exceeds the JSON size limit")
+            lines.extend(
+                (
+                    f"{role}_asset_id={asset_id}",
+                    f"{role}_asset_digest={asset_digest}",
+                    f"{role}_asset_size={asset_size}",
+                )
+            )
+    _append_github_output(lines)
+
+
 def _venv_python(directory: Path) -> Path:
     return directory / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
@@ -1627,8 +3133,16 @@ def _smoke_environment() -> dict[str, str]:
     for name in tuple(env):
         normalized_name = name.upper()
         if normalized_name.startswith(("PIP_", "UV_")) or normalized_name in {
+            "ALL_PROXY",
+            "CURL_CA_BUNDLE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
             "PYTHONHOME",
             "PYTHONPATH",
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE",
             "SETUPTOOLS_SCM_PRETEND_VERSION",
             "SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMPILE_CODE",
         }:
@@ -1653,7 +3167,18 @@ def _run_install_smoke(artifact: Path, version: str, mode: str, temp_root: Path)
         environment_root = Path(temporary) / "venv"
         venv.EnvBuilder(with_pip=True, clear=True, symlinks=False).create(environment_root)
         python = _venv_python(environment_root)
-        common = [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-cache-dir", "--no-compile"]
+        common = [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--isolated",
+            "--disable-pip-version-check",
+            "--index-url",
+            "https://pypi.org/simple",
+            "--no-cache-dir",
+            "--no-compile",
+        ]
         _run(
             [
                 *common,
@@ -1666,6 +3191,12 @@ def _run_install_smoke(artifact: Path, version: str, mode: str, temp_root: Path)
             env=environment,
             timeout=180,
         )
+        backend_assertion = (
+            "import importlib.metadata as m; "
+            "assert {n: m.version(n) for n in ('packaging', 'pip', 'setuptools', 'wheel')} == "
+            "{'packaging': '26.2', 'pip': '26.1.2', 'setuptools': '83.0.0', 'wheel': '0.47.0'}"
+        )
+        _run([str(python), "-I", "-c", backend_assertion], cwd=temp_root, env=environment, timeout=60)
         if mode == "package-only":
             _run(
                 [
@@ -1761,6 +3292,12 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         problems.append("release.yml missing")
         return problems
     release = release_path.read_text(encoding="utf-8")
+    release_actions = re.findall(r"(?m)^\s+uses:\s*([^\s#]+)", release)
+    action_inventory = {action: release_actions.count(action) for action in set(release_actions)}
+    if action_inventory != RELEASE_ACTION_INVENTORY:
+        problems.append(
+            f"release.yml exact action inventory drift: expected {RELEASE_ACTION_INVENTORY}; got {action_inventory}"
+        )
     required_fragments = (
         "github.repository == 'Cranot/compile-code'",
         "github.actor == 'Cranot'",
@@ -1769,22 +3306,65 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         "github.triggering_actor == 'Cranot'",
         "id-token: write",
         "attestations: write",
-        "skip-existing: true",
+        "skip-existing: false",
         "attestations: true",
+        "python scripts/release_artifacts.py audit-locks",
         "verify --bundle release-bundle --dist pypi-dist --github-source",
-        "--github-source --github-output",
+        "--github-source --wait-seconds 120 --github-output",
         "--github-source --require-exact",
+        "github-artifact-state",
+        "github-release-state",
+        "needs: [build, prepublish, github_release_preflight]",
+        "needs: [build, prepublish, github_release_preflight, github_release_draft_verify]",
+        "needs: [github_release_preflight, github_release_draft_verify, postpublish]",
+        "name: release-guard",
+        "needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id",
+        "needs.github_release_preflight.outputs.bundle_artifact_digest == needs.build.outputs.bundle_artifact_digest",
+        "secrets.RELEASE_GUARD_READ_TOKEN",
+        "octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae",
+        "route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}",
+        "ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd",
+        'draft: "true"',
+        'immutableCreate: "false"',
+        "artifactContentType: application/octet-stream",
+        'artifactErrorsFailBuild: "true"',
+        'allowUpdates: "false"',
+        'removeArtifacts: "false"',
+        'replacesArtifacts: "false"',
+        'skipIfReleaseExists: "true"',
+        "install-github-cli --github-output",
+        "COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}",
+        "--require-draft-exact --wait-seconds 120 --github-output",
+        "route: PATCH /repos/{owner}/{repo}/releases/{release_id}",
+        "--require-exact --wait-seconds 300",
     )
     for fragment in required_fragments:
         if fragment not in release:
             problems.append(f"release.yml missing hardened release fragment: {fragment}")
-    if "workflow_dispatch:" in release or "inputs:" in release or "secrets." in release:
-        problems.append("release.yml may not accept user inputs or static publication secrets")
+    if "workflow_dispatch:" in release or "inputs:" in release:
+        problems.append("release.yml may not accept user-controlled release inputs")
+    if release.find("python scripts/release_artifacts.py audit-locks") > release.find("python -m pip install"):
+        problems.append("release.yml must audit locked graphs before installing release tooling")
+    secret_names = set(re.findall(r"secrets\.([A-Z0-9_]+)", release))
+    if secret_names != {"RELEASE_GUARD_READ_TOKEN"}:
+        problems.append("release.yml secret inventory must contain only the read-only owner release guard token")
+    if release.count("secrets.RELEASE_GUARD_READ_TOKEN") != 3:
+        problems.append("release.yml must pass the read-only owner token only to the three GitHub verifier steps")
+    if release.count("name: release-guard") != 3:
+        problems.append("release.yml must bind all three owner-token verifier jobs to release-guard")
+    if release.count("install-github-cli --github-output") != 3:
+        problems.append("release.yml must install the exact GitHub CLI in all three verifier jobs")
+    if release.count("COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}") != 3:
+        problems.append("release.yml must pass only the controlled GitHub CLI path to all verifier commands")
+    if "create-github-app-token" in release:
+        problems.append("release.yml may not use an installation identity that can hide draft releases")
     if release.count("id-token: write") != 2 or release.count("attestations: write") != 1:
         problems.append("release.yml elevated permission inventory drift")
-    if release.count("fetch-depth: 0") != 3:
-        problems.append("release.yml must fetch annotated tag objects in all three source-verifying jobs")
-    for forbidden_permission in ("actions: write", "contents: write", "packages: write", "write-all"):
+    if release.count("fetch-depth: 0") != 6:
+        problems.append("release.yml must fetch annotated tag objects in all six source-verifying jobs")
+    if release.count("contents: write") != 2:
+        problems.append("release.yml must isolate draft staging from the exact-ID publication boundary")
+    for forbidden_permission in ("actions: write", "packages: write", "write-all"):
         if forbidden_permission in release:
             problems.append(f"release.yml forbidden permission: {forbidden_permission}")
     if "continue-on-error:" in release:
@@ -1794,6 +3374,146 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         problems.append("privileged publish job must contain no run steps")
     elif "actions/checkout@" in publish_match.group(1) or "actions/setup-python@" in publish_match.group(1):
         problems.append("privileged publish job may not check out or execute source")
+    else:
+        publish_job = publish_match.group(1)
+        for binding in (
+            "github.ref == 'refs/tags/v0.2.0'",
+            "needs.prepublish.outputs.publish_required == 'true'",
+            "needs.github_release_preflight.outputs.source_sha == github.sha",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.0'",
+            "needs.github_release_preflight.outputs.release_state == 'exact'",
+            "needs.github_release_draft_verify.outputs.state == 'draft_exact'",
+            "needs.github_release_draft_verify.result == 'success'",
+            "artifact-ids: ${{ needs.build.outputs.dist_artifact_id }}",
+            "digest-mismatch: error",
+            "skip-existing: false",
+            "attestations: true",
+        ):
+            if binding not in publish_job:
+                problems.append(f"PyPI publication binding drift: {binding}")
+    privileged_jobs: dict[str, str] = {}
+    for job_name in ("github_release_stage", "github_release_publish"):
+        match = re.search(rf"(?ms)^  {job_name}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+        if not match:
+            problems.append(f"privileged GitHub Release job missing: {job_name}")
+            continue
+        job = match.group(1)
+        privileged_jobs[job_name] = job
+        if re.search(r"(?m)^\s+run:", job):
+            problems.append(f"{job_name} must contain no run steps")
+        if "actions/checkout@" in job or "actions/setup-python@" in job:
+            problems.append(f"{job_name} may not check out or execute source")
+        if job.count("contents: write") != 1 or "id-token: write" in job:
+            problems.append(f"{job_name} permission inventory drift")
+        if "RELEASE_GUARD_READ_TOKEN" in job or "IMMUTABLE_RELEASES_TOKEN" in job:
+            problems.append(f"{job_name} must not receive the release guard credential")
+        if "name: release-guard" in job:
+            problems.append(f"{job_name} must not cross the read-token release-guard environment")
+        if job.count("route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}") != 1:
+            problems.append(f"{job_name} must URL-bind the annotated tag SHA as an API parameter")
+        for binding in (
+            "github.ref == 'refs/tags/v0.2.0'",
+            "needs.github_release_preflight.outputs.source_sha == github.sha",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.0'",
+            "fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag'",
+            "fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha",
+            "fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit'",
+            "fromJSON(steps.remote_tag_object.outputs.data).object.sha == github.sha",
+        ):
+            if binding not in job:
+                problems.append(f"{job_name} tag binding drift: {binding}")
+
+    for job_name in ("github_release_preflight", "github_release_draft_verify", "github_release_postverify"):
+        match = re.search(rf"(?ms)^  {job_name}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+        if not match:
+            problems.append(f"release-guard verifier job missing: {job_name}")
+            continue
+        job = match.group(1)
+        if job.count("name: release-guard") != 1:
+            problems.append(f"{job_name} must use exactly one release-guard environment")
+        if job.count("secrets.RELEASE_GUARD_READ_TOKEN") != 1:
+            problems.append(f"{job_name} must receive exactly one environment-scoped release guard secret")
+        if job.count("install-github-cli --github-output") != 1:
+            problems.append(f"{job_name} must install exactly one checksum-pinned GitHub CLI")
+        if job.count("COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}") != 1:
+            problems.append(f"{job_name} must invoke gh only through its controlled absolute path")
+
+    github_publish = privileged_jobs.get("github_release_publish", "")
+    if github_publish:
+        if github_publish.count("octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae") != 8:
+            problems.append("publication must perform seven exact reads and one exact-ID PATCH")
+        mutation_routes = re.findall(r"(?m)^\s+route:\s+(POST|PATCH|PUT|DELETE)\b", github_publish)
+        if mutation_routes != ["PATCH"]:
+            problems.append("publication must perform exactly one PATCH and no create/delete request")
+        for binding in (
+            "route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}",
+            "fromJSON(steps.remote_wheel.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id)",
+            "fromJSON(steps.remote_sdist.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_id)",
+            "fromJSON(steps.remote_sbom.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_id)",
+            "fromJSON(steps.remote_manifest.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_id)",
+            "fromJSON(steps.remote_draft.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.release_id)",
+            "fromJSON(steps.remote_draft.outputs.data).draft == true",
+            "fromJSON(steps.remote_draft.outputs.data).immutable == false",
+            "fromJSON(steps.remote_draft.outputs.data).published_at == null",
+            "fromJSON(steps.remote_draft.outputs.data).assets[3] != null",
+            "fromJSON(steps.remote_draft.outputs.data).assets[4] == null",
+            "needs.postpublish.result == 'success'",
+            "tag_name: v0.2.0",
+            "name: compile-code v0.2.0",
+            "prerelease: false",
+        ):
+            if binding not in github_publish:
+                problems.append(f"publication draft binding drift: {binding}")
+        if github_publish.count("route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}") != 4:
+            problems.append("publication must re-read each of the four byte-verified asset IDs")
+
+    github_stage = privileged_jobs.get("github_release_stage", "")
+    if github_stage:
+        if "needs: [build, prepublish, github_release_preflight]" not in github_stage or "postpublish" in github_stage:
+            problems.append("draft staging must depend on preflight and precede PyPI post-verification")
+        if github_stage.count("octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae") != 2:
+            problems.append("draft staging must re-read exactly the tag ref and annotated tag object")
+        if re.search(r"(?m)^\s+route:\s+(?:POST|PATCH|PUT|DELETE)\b", github_stage):
+            problems.append("draft staging tag guard may perform only GET requests outside the pinned staging action")
+        expected_assets = (
+            "compile_code-0.2.0-py3-none-any.whl",
+            "compile_code-0.2.0.tar.gz",
+            "compile_code-0.2.0.cdx.json",
+        )
+        for asset in expected_assets:
+            if github_stage.count(asset) != 1:
+                problems.append(f"GitHub Release closed asset inventory drift: {asset}")
+        if github_stage.count(MANIFEST_NAME) != 2:
+            problems.append("GitHub Release manifest must appear once in the body and once in the closed asset set")
+
+    postpublish_match = re.search(r"(?ms)^  postpublish:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+    if not postpublish_match:
+        problems.append("PyPI post-verification job missing")
+    else:
+        postpublish_job = postpublish_match.group(1)
+        for binding in (
+            "needs: [build, prepublish, github_release_preflight, github_release_draft_verify, publish]",
+            "needs.prepublish.outputs.publish_required == 'false'",
+            "needs.github_release_draft_verify.outputs.state == 'draft_exact'",
+        ):
+            if binding not in postpublish_job:
+                problems.append(f"PyPI post-verification ordering drift: {binding}")
+
+    postverify_match = re.search(r"(?ms)^  github_release_postverify:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+    if not postverify_match:
+        problems.append("terminal GitHub Release verifier job missing")
+    else:
+        postverify_job = postverify_match.group(1)
+        for binding in (
+            "always() && needs.build.result == 'success'",
+            "needs.github_release_preflight.result == 'success'",
+            "artifact-ids: ${{ needs.build.outputs.dist_artifact_id }}",
+            "pypi-state --bundle release-bundle --dist pypi-dist",
+            "--github-source --require-exact --wait-seconds 300",
+            "--require-exact --wait-seconds 300",
+        ):
+            if binding not in postverify_job:
+                problems.append(f"terminal GitHub Release verification drift: {binding}")
     return problems
 
 
@@ -1802,6 +3522,16 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("assert-runner", help="Prove the builder has no root/OIDC/publication credentials.")
+
+    github_cli = subparsers.add_parser(
+        "install-github-cli",
+        help="Install and verify the exact reviewed GitHub CLI under RUNNER_TEMP.",
+    )
+    github_cli.add_argument(
+        "--github-output",
+        action="store_true",
+        help="Append the controlled absolute executable path to GITHUB_OUTPUT.",
+    )
 
     source = subparsers.add_parser("source", help="Validate the GitHub tag/source context.")
     source.add_argument("--github-output", action="store_true", help="Append closed validated values to GITHUB_OUTPUT.")
@@ -1824,6 +3554,11 @@ def _parser() -> argparse.ArgumentParser:
     twine = subparsers.add_parser("twine-check", help="Run strict Twine metadata checks over the closed distributions.")
     twine.add_argument("--bundle", type=Path, required=True)
 
+    subparsers.add_parser(
+        "audit-locks",
+        help="Audit the exact build, smoke, and tooling lock rows without resolving dependencies.",
+    )
+
     registry = subparsers.add_parser("pypi-state", help="Require missing or exact-byte-idempotent PyPI state.")
     registry.add_argument("--bundle", type=Path, required=True)
     registry.add_argument("--dist", type=Path, required=True)
@@ -1835,6 +3570,22 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Bind the registry decision back to the current GitHub tag checkout.",
     )
+
+    artifact = subparsers.add_parser(
+        "github-artifact-state", help="Bind one Actions artifact ID and digest to this release run and source."
+    )
+    artifact.add_argument("--artifact-id", required=True)
+    artifact.add_argument("--artifact-digest", required=True)
+    artifact.add_argument("--github-output", action="store_true")
+
+    github_release = subparsers.add_parser(
+        "github-release-state", help="Require missing, exact resumable-draft, or exact immutable release state."
+    )
+    github_release.add_argument("--bundle", type=Path, required=True)
+    github_release.add_argument("--require-exact", action="store_true")
+    github_release.add_argument("--require-draft-exact", action="store_true")
+    github_release.add_argument("--wait-seconds", type=int, default=0)
+    github_release.add_argument("--github-output", action="store_true")
 
     smoke = subparsers.add_parser(
         "install-smoke", help="Install wheel and sdist in separate clean virtual environments."
@@ -1855,12 +3606,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "assert-runner":
             assert_unprivileged_runner()
             print("release runner: unprivileged and publication-credential-free")
+        elif args.command == "install-github-cli":
+            executable = install_github_cli()
+            print(f"GitHub CLI: verified {GITHUB_CLI_VERSION} at {executable}")
+            if args.github_output:
+                _append_github_output([f"github_cli_path={executable}"])
         elif args.command == "source":
             context = source_context_from_github(ROOT)
             print(json.dumps(context, sort_keys=True))
             if args.github_output:
                 _append_github_output(
-                    [f"{key}={context[key]}" for key in ("version", "tag", "sha", "source_date_epoch")]
+                    [
+                        f"{key}={context[key]}"
+                        for key in ("version", "tag", "sha", "tag_object_sha", "source_date_epoch")
+                    ]
                 )
         elif args.command == "build":
             context = source_context_from_github(ROOT)
@@ -1877,6 +3636,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "twine-check":
             twine_check(args.bundle.resolve())
             print("twine check: PASS")
+        elif args.command == "audit-locks":
+            audited = audit_locked_requirements(ROOT)
+            print(f"locked dependency audit: PASS ({audited} exact package versions; no resolution)")
         elif args.command == "pypi-state":
             _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
             expected_source = source_context_from_github(ROOT, allow_untracked=True) if args.github_source else None
@@ -1890,6 +3652,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"PyPI state: {state}")
             if args.github_output:
                 _write_github_output(state)
+        elif args.command == "github-artifact-state":
+            context = source_context_from_github(ROOT)
+            verify_github_workflow_artifact(
+                artifact_id=args.artifact_id,
+                artifact_digest=args.artifact_digest,
+                expected_source=context,
+            )
+            print(f"GitHub Actions artifact: exact ID {args.artifact_id} and digest {args.artifact_digest}")
+            if args.github_output:
+                _write_github_artifact_output(args.artifact_id, args.artifact_digest, context)
+        elif args.command == "github-release-state":
+            _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
+            context = source_context_from_github(ROOT, allow_untracked=True)
+            details: dict[str, int | str] = {}
+            state = github_release_state(
+                args.bundle.resolve(),
+                expected_source=context,
+                require_exact=args.require_exact,
+                require_draft_exact=args.require_draft_exact,
+                wait_seconds=args.wait_seconds,
+                details=details,
+            )
+            print(f"GitHub Release state: {state}")
+            if args.github_output:
+                _write_github_release_output(state, details=details)
         elif args.command == "install-smoke":
             install_smoke(args.bundle.resolve(), args.mode, args.temp_root.resolve())
             print(f"install smoke ({args.mode}): PASS")

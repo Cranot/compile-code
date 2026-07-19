@@ -3,6 +3,30 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "build_attestation": {
+          "const": "github-build-provenance"
+        },
+        "dependency_audit": {
+          "const": "osv-locked-graphs"
+        },
+        "pypi_publish_attestation": {
+          "const": "pypi-integrity-api-pep740"
+        },
+        "release_attestation": {
+          "const": "github-immutable-release"
+        }
+      },
+      "required": [
+        "build_attestation",
+        "dependency_audit",
+        "pypi_publish_attestation",
+        "release_attestation"
+      ],
+      "type": "object"
+    },
     "files": {
       "items": {
         "additionalProperties": false,
@@ -102,33 +126,66 @@
       "minItems": 3,
       "prefixItems": [
         {
-          "properties": {
-            "role": {
-              "const": "wheel"
+          "allOf": [
+            {
+              "$ref": "#/properties/files/items"
+            },
+            {
+              "properties": {
+                "media_type": {
+                  "const": "application/zip"
+                },
+                "role": {
+                  "const": "wheel"
+                }
+              },
+              "required": [
+                "media_type",
+                "role"
+              ]
             }
-          },
-          "required": [
-            "role"
           ]
         },
         {
-          "properties": {
-            "role": {
-              "const": "sdist"
+          "allOf": [
+            {
+              "$ref": "#/properties/files/items"
+            },
+            {
+              "properties": {
+                "media_type": {
+                  "const": "application/gzip"
+                },
+                "role": {
+                  "const": "sdist"
+                }
+              },
+              "required": [
+                "media_type",
+                "role"
+              ]
             }
-          },
-          "required": [
-            "role"
           ]
         },
         {
-          "properties": {
-            "role": {
-              "const": "sbom"
+          "allOf": [
+            {
+              "$ref": "#/properties/files/items"
+            },
+            {
+              "properties": {
+                "media_type": {
+                  "const": "application/vnd.cyclonedx+json"
+                },
+                "role": {
+                  "const": "sbom"
+                }
+              },
+              "required": [
+                "media_type",
+                "role"
+              ]
             }
-          },
-          "required": [
-            "role"
           ]
         }
       ],
@@ -158,12 +215,17 @@
           "maximum": 4102444799,
           "minimum": 315532800,
           "type": "integer"
+        },
+        "tag_object_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
         }
       },
       "required": [
         "repository",
         "sha",
-        "source_date_epoch"
+        "source_date_epoch",
+        "tag_object_sha"
       ],
       "type": "object"
     },
@@ -177,6 +239,7 @@
     }
   },
   "required": [
+    "evidence",
     "files",
     "project",
     "schema",

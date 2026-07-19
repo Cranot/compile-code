@@ -1,4 +1,4 @@
-name: Release to PyPI
+name: Release to PyPI and immutable GitHub Release
 
 on:
   push:
@@ -37,10 +37,12 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12.13"
-          pip-version: "26.1.2"
 
       - name: Prove the builder is unprivileged
         run: python scripts/release_artifacts.py assert-runner
+
+      - name: Audit every exact build, smoke, and tooling lock row without resolution
+        run: python scripts/release_artifacts.py audit-locks
 
       - name: Install hash-locked release tools from wheels only
         env:
@@ -48,10 +50,11 @@ jobs:
           PIP_DISABLE_PIP_VERSION_CHECK: "1"
           PIP_NO_INPUT: "1"
         run: >-
-          python -m pip install --no-compile --require-hashes --only-binary=:all:
+          python -m pip install --isolated --no-cache-dir --no-compile --upgrade --force-reinstall
+          --require-hashes --only-binary=:all:
           -r release/tooling-requirements.lock -r release/smoke-requirements.lock
 
-      - name: Run source, workflow, privacy, and release gates
+      - name: Run source, workflow, privacy, dependency, and release gates
         env:
           PYTHONPATH: src
         run: python scripts/check.py
@@ -146,7 +149,6 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12.13"
-          pip-version: "26.1.2"
 
       - name: Download the exact closed bundle by artifact ID
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -169,12 +171,33 @@ jobs:
         id: registry
         run: >-
           python scripts/release_artifacts.py pypi-state --bundle release-bundle --dist pypi-dist
-          --github-source --github-output
+          --github-source --wait-seconds 120 --github-output
 
   publish:
     name: Publish through the protected PyPI environment
-    needs: [build, prepublish]
-    if: github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' && github.triggering_actor == 'Cranot' && needs.prepublish.outputs.publish_required == 'true'
+    needs: [build, prepublish, github_release_preflight, github_release_draft_verify]
+    if: >-
+      always() && needs.build.result == 'success' && needs.prepublish.result == 'success' &&
+      needs.github_release_preflight.result == 'success' &&
+      github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
+      github.triggering_actor == 'Cranot' && github.ref == 'refs/tags/v0.2.0' &&
+      needs.prepublish.outputs.publish_required == 'true' &&
+      needs.github_release_preflight.outputs.source_sha == github.sha &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      (
+        (
+          needs.github_release_preflight.outputs.release_state == 'exact' &&
+          needs.github_release_draft_verify.result == 'skipped'
+        ) ||
+        (
+          (
+            needs.github_release_preflight.outputs.release_state == 'missing' ||
+            needs.github_release_preflight.outputs.release_state == 'draft_exact'
+          ) &&
+          needs.github_release_draft_verify.result == 'success' &&
+          needs.github_release_draft_verify.outputs.state == 'draft_exact'
+        )
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment:
@@ -191,19 +214,42 @@ jobs:
           digest-mismatch: error
 
       - name: Publish with PyPI Trusted Publishing and PEP 740 attestations
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1, audited 2026-07-18
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
         with:
           packages-dir: pypi-dist/
           verify-metadata: true
-          skip-existing: true
+          skip-existing: false
           verbose: false
           print-hash: true
           attestations: true
 
   postpublish:
     name: Verify exact bytes on PyPI
-    needs: [build, prepublish, publish]
-    if: ${{ always() && needs.build.result == 'success' && needs.prepublish.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped') }}
+    needs: [build, prepublish, github_release_preflight, github_release_draft_verify, publish]
+    if: >-
+      always() && needs.build.result == 'success' && needs.prepublish.result == 'success' &&
+      needs.github_release_preflight.result == 'success' &&
+      (
+        needs.publish.result == 'success' ||
+        (
+          needs.prepublish.outputs.publish_required == 'false' &&
+          needs.publish.result == 'skipped'
+        )
+      ) &&
+      (
+        (
+          needs.github_release_preflight.outputs.release_state == 'exact' &&
+          needs.github_release_draft_verify.result == 'skipped'
+        ) ||
+        (
+          (
+            needs.github_release_preflight.outputs.release_state == 'missing' ||
+            needs.github_release_preflight.outputs.release_state == 'draft_exact'
+          ) &&
+          needs.github_release_draft_verify.result == 'success' &&
+          needs.github_release_draft_verify.outputs.state == 'draft_exact'
+        )
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -220,7 +266,6 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12.13"
-          pip-version: "26.1.2"
 
       - name: Download the exact closed bundle by artifact ID
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -240,3 +285,483 @@ jobs:
         run: >-
           python scripts/release_artifacts.py pypi-state --bundle release-bundle --dist pypi-dist
           --github-source --require-exact --wait-seconds 300
+
+  github_release_preflight:
+    name: Rebind source and verify all irreversible-release preconditions
+    needs: [build, provenance]
+    if: github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' && github.triggering_actor == 'Cranot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release-guard
+    permissions:
+      actions: read # Rebind the exact Actions artifact API record to this workflow run.
+      attestations: read # Verify build provenance before any release mutation.
+      contents: read
+    outputs:
+      bundle_artifact_id: ${{ steps.artifact.outputs.artifact_id }}
+      bundle_artifact_digest: ${{ steps.artifact.outputs.artifact_digest }}
+      release_required: ${{ steps.release.outputs.release_required }}
+      release_state: ${{ steps.release.outputs.state }}
+      source_sha: ${{ steps.artifact.outputs.source_sha }}
+      tag: ${{ steps.artifact.outputs.tag }}
+      tag_object_sha: ${{ steps.artifact.outputs.tag_object_sha }}
+    steps:
+      - name: Check out the exact read-only verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up verifier Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Install the exact checksum-pinned GitHub CLI
+        id: github_cli
+        run: python scripts/release_artifacts.py install-github-cli --github-output
+
+      - name: Bind the exact Actions artifact ID and digest to this run
+        id: artifact
+        env:
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.build.outputs.bundle_artifact_digest }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.build.outputs.bundle_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/release_artifacts.py github-artifact-state
+          --artifact-id "$BUNDLE_ARTIFACT_ID" --artifact-digest "$BUNDLE_ARTIFACT_DIGEST" --github-output
+
+      - name: Download the exact validated bundle by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.artifact.outputs.artifact_id }}
+          path: release-bundle
+          digest-mismatch: error
+
+      - name: Rebind the annotated tag and require exact recoverable release state
+        id: release
+        env:
+          COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_TOKEN: ${{ secrets.RELEASE_GUARD_READ_TOKEN }}
+        run: >-
+          python scripts/release_artifacts.py github-release-state
+          --bundle release-bundle --github-output
+
+  github_release_stage:
+    name: Stage the exact closed GitHub Release draft
+    needs: [build, prepublish, github_release_preflight]
+    if: >-
+      github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
+      github.triggering_actor == 'Cranot' &&
+      needs.github_release_preflight.outputs.release_required == 'true' &&
+      github.ref == 'refs/tags/v0.2.0' &&
+      needs.github_release_preflight.outputs.source_sha == github.sha &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id &&
+      needs.github_release_preflight.outputs.bundle_artifact_digest == needs.build.outputs.bundle_artifact_digest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # Source-free draft creation and exact asset upload; no OIDC.
+    steps:
+      - name: Download only the preflight-validated bundle by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.github_release_preflight.outputs.bundle_artifact_id }}
+          path: release-bundle
+          digest-mismatch: error
+
+      - name: Read the remote annotated tag ref again at the write boundary
+        id: remote_tag_ref
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Read the exact annotated tag object again at the write boundary
+        id: remote_tag_object
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}
+          owner: Cranot
+          repo: compile-code
+          tag_sha: ${{ needs.github_release_preflight.outputs.tag_object_sha }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Create one draft and attach only the closed asset set # zizmor: ignore[superfluous-actions] A shell step would violate this privileged job's no-run boundary.
+        if: >-
+          steps.remote_tag_ref.outputs.status == '200' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.0' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha &&
+          steps.remote_tag_object.outputs.status == '200' &&
+          fromJSON(steps.remote_tag_object.outputs.data).sha == needs.github_release_preflight.outputs.tag_object_sha &&
+          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.0' &&
+          fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit' &&
+          fromJSON(steps.remote_tag_object.outputs.data).object.sha == github.sha
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
+        with:
+          token: ${{ github.token }}
+          tag: v0.2.0
+          commit: ${{ github.sha }}
+          name: compile-code v0.2.0
+          body: >-
+            compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by
+            release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.
+          allowUpdates: "false"
+          artifactContentType: application/octet-stream
+          artifactErrorsFailBuild: "true"
+          artifacts: >-
+            release-bundle/compile_code-0.2.0-py3-none-any.whl,
+            release-bundle/compile_code-0.2.0.tar.gz,
+            release-bundle/compile_code-0.2.0.cdx.json,
+            release-bundle/release-manifest.json
+          draft: "true"
+          immutableCreate: "false"
+          makeLatest: "legacy"
+          prerelease: "false"
+          removeArtifacts: "false"
+          replacesArtifacts: "false"
+          skipIfReleaseExists: "true"
+
+  github_release_draft_verify:
+    name: Byte-verify the exact mutable draft before publication
+    needs: [build, github_release_preflight, github_release_stage]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      needs.github_release_preflight.result == 'success' &&
+      github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
+      github.triggering_actor == 'Cranot' &&
+      (
+        (
+          needs.github_release_preflight.outputs.release_state == 'missing' &&
+          needs.github_release_stage.result == 'success'
+        ) ||
+        (
+          needs.github_release_preflight.outputs.release_state == 'draft_exact' &&
+          needs.github_release_stage.result == 'skipped'
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release-guard
+    permissions:
+      actions: read # Rebind the exact staged Actions artifact.
+      attestations: read # Verify build provenance before publishing the draft.
+      contents: read
+    outputs:
+      manifest_asset_digest: ${{ steps.draft.outputs.manifest_asset_digest }}
+      manifest_asset_id: ${{ steps.draft.outputs.manifest_asset_id }}
+      manifest_asset_size: ${{ steps.draft.outputs.manifest_asset_size }}
+      publish_required: ${{ steps.draft.outputs.publish_required }}
+      release_id: ${{ steps.draft.outputs.release_id }}
+      sbom_asset_digest: ${{ steps.draft.outputs.sbom_asset_digest }}
+      sbom_asset_id: ${{ steps.draft.outputs.sbom_asset_id }}
+      sbom_asset_size: ${{ steps.draft.outputs.sbom_asset_size }}
+      sdist_asset_digest: ${{ steps.draft.outputs.sdist_asset_digest }}
+      sdist_asset_id: ${{ steps.draft.outputs.sdist_asset_id }}
+      sdist_asset_size: ${{ steps.draft.outputs.sdist_asset_size }}
+      state: ${{ steps.draft.outputs.state }}
+      wheel_asset_digest: ${{ steps.draft.outputs.wheel_asset_digest }}
+      wheel_asset_id: ${{ steps.draft.outputs.wheel_asset_id }}
+      wheel_asset_size: ${{ steps.draft.outputs.wheel_asset_size }}
+    steps:
+      - name: Check out the exact read-only verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up verifier Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Install the exact checksum-pinned GitHub CLI
+        id: github_cli
+        run: python scripts/release_artifacts.py install-github-cli --github-output
+
+      - name: Revalidate the exact Actions artifact ID and digest
+        env:
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.github_release_preflight.outputs.bundle_artifact_digest }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.github_release_preflight.outputs.bundle_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/release_artifacts.py github-artifact-state
+          --artifact-id "$BUNDLE_ARTIFACT_ID" --artifact-digest "$BUNDLE_ARTIFACT_DIGEST"
+
+      - name: Download the exact staged bundle by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.github_release_preflight.outputs.bundle_artifact_id }}
+          path: release-bundle
+          digest-mismatch: error
+
+      - name: Download and byte-verify every draft asset before publication
+        id: draft
+        env:
+          COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_TOKEN: ${{ secrets.RELEASE_GUARD_READ_TOKEN }}
+        run: >-
+          python scripts/release_artifacts.py github-release-state --bundle release-bundle
+          --require-draft-exact --wait-seconds 120 --github-output
+
+  github_release_publish:
+    name: Publish the exact verified draft once
+    needs: [github_release_preflight, github_release_draft_verify, postpublish]
+    if: >-
+      always() && needs.github_release_preflight.result == 'success' &&
+      needs.github_release_draft_verify.result == 'success' &&
+      needs.postpublish.result == 'success' &&
+      github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
+      github.triggering_actor == 'Cranot' &&
+      github.ref == 'refs/tags/v0.2.0' &&
+      needs.github_release_preflight.outputs.source_sha == github.sha &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      needs.github_release_draft_verify.outputs.state == 'draft_exact' &&
+      needs.github_release_draft_verify.outputs.publish_required == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # One exact-ID draft-to-published transition; no OIDC or source execution.
+    steps:
+      - name: Read the remote annotated tag ref immediately before publication
+        id: remote_tag_ref
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Read the exact annotated tag object immediately before publication
+        id: remote_tag_object
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}
+          owner: Cranot
+          repo: compile-code
+          tag_sha: ${{ needs.github_release_preflight.outputs.tag_object_sha }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Re-read the exact verified wheel asset ID
+        id: remote_wheel
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}
+          owner: Cranot
+          repo: compile-code
+          asset_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id) }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Re-read the exact verified source-distribution asset ID
+        id: remote_sdist
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}
+          owner: Cranot
+          repo: compile-code
+          asset_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_id) }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Re-read the exact verified SBOM asset ID
+        id: remote_sbom
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}
+          owner: Cranot
+          repo: compile-code
+          asset_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_id) }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Re-read the exact verified manifest asset ID
+        id: remote_manifest
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}
+          owner: Cranot
+          repo: compile-code
+          asset_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_id) }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Re-read the complete draft inventory after every exact asset ID
+        id: remote_draft
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: GET /repos/{owner}/{repo}/releases/{release_id}
+          owner: Cranot
+          repo: compile-code
+          release_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.release_id) }}
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Publish only the final exact draft and asset IDs
+        if: >-
+          steps.remote_tag_ref.outputs.status == '200' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.0' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha &&
+          steps.remote_tag_object.outputs.status == '200' &&
+          fromJSON(steps.remote_tag_object.outputs.data).sha == needs.github_release_preflight.outputs.tag_object_sha &&
+          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.0' &&
+          fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit' &&
+          fromJSON(steps.remote_tag_object.outputs.data).object.sha == github.sha &&
+          steps.remote_wheel.outputs.status == '200' &&
+          fromJSON(steps.remote_wheel.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id) &&
+          fromJSON(steps.remote_wheel.outputs.data).name == 'compile_code-0.2.0-py3-none-any.whl' &&
+          fromJSON(steps.remote_wheel.outputs.data).state == 'uploaded' &&
+          fromJSON(steps.remote_wheel.outputs.data).content_type == 'application/octet-stream' &&
+          fromJSON(steps.remote_wheel.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_size) &&
+          fromJSON(steps.remote_wheel.outputs.data).digest == needs.github_release_draft_verify.outputs.wheel_asset_digest &&
+          steps.remote_sdist.outputs.status == '200' &&
+          fromJSON(steps.remote_sdist.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_id) &&
+          fromJSON(steps.remote_sdist.outputs.data).name == 'compile_code-0.2.0.tar.gz' &&
+          fromJSON(steps.remote_sdist.outputs.data).state == 'uploaded' &&
+          fromJSON(steps.remote_sdist.outputs.data).content_type == 'application/octet-stream' &&
+          fromJSON(steps.remote_sdist.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_size) &&
+          fromJSON(steps.remote_sdist.outputs.data).digest == needs.github_release_draft_verify.outputs.sdist_asset_digest &&
+          steps.remote_sbom.outputs.status == '200' &&
+          fromJSON(steps.remote_sbom.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_id) &&
+          fromJSON(steps.remote_sbom.outputs.data).name == 'compile_code-0.2.0.cdx.json' &&
+          fromJSON(steps.remote_sbom.outputs.data).state == 'uploaded' &&
+          fromJSON(steps.remote_sbom.outputs.data).content_type == 'application/octet-stream' &&
+          fromJSON(steps.remote_sbom.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_size) &&
+          fromJSON(steps.remote_sbom.outputs.data).digest == needs.github_release_draft_verify.outputs.sbom_asset_digest &&
+          steps.remote_manifest.outputs.status == '200' &&
+          fromJSON(steps.remote_manifest.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_id) &&
+          fromJSON(steps.remote_manifest.outputs.data).name == 'release-manifest.json' &&
+          fromJSON(steps.remote_manifest.outputs.data).state == 'uploaded' &&
+          fromJSON(steps.remote_manifest.outputs.data).content_type == 'application/octet-stream' &&
+          fromJSON(steps.remote_manifest.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_size) &&
+          fromJSON(steps.remote_manifest.outputs.data).digest == needs.github_release_draft_verify.outputs.manifest_asset_digest &&
+          steps.remote_draft.outputs.status == '200' &&
+          fromJSON(steps.remote_draft.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.release_id) &&
+          fromJSON(steps.remote_draft.outputs.data).tag_name == 'v0.2.0' &&
+          fromJSON(steps.remote_draft.outputs.data).draft == true &&
+          fromJSON(steps.remote_draft.outputs.data).prerelease == false &&
+          fromJSON(steps.remote_draft.outputs.data).immutable == false &&
+          fromJSON(steps.remote_draft.outputs.data).published_at == null &&
+          fromJSON(steps.remote_draft.outputs.data).name == 'compile-code v0.2.0' &&
+          fromJSON(steps.remote_draft.outputs.data).body == 'compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.' &&
+          fromJSON(steps.remote_draft.outputs.data).assets[3] != null &&
+          fromJSON(steps.remote_draft.outputs.data).assets[4] == null &&
+          contains(fromJSON(steps.remote_draft.outputs.data).assets.*.id, fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id)) &&
+          contains(fromJSON(steps.remote_draft.outputs.data).assets.*.id, fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_id)) &&
+          contains(fromJSON(steps.remote_draft.outputs.data).assets.*.id, fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_id)) &&
+          contains(fromJSON(steps.remote_draft.outputs.data).assets.*.id, fromJSON(needs.github_release_draft_verify.outputs.manifest_asset_id))
+        uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
+        with:
+          route: PATCH /repos/{owner}/{repo}/releases/{release_id}
+          owner: Cranot
+          repo: compile-code
+          release_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.release_id) }}
+          tag_name: v0.2.0
+          name: compile-code v0.2.0
+          body: >-
+            compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by
+            release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          headers: |
+            x-github-api-version: "2026-03-10"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  github_release_postverify:
+    name: Verify immutable release bytes and signed evidence
+    needs: [build, github_release_preflight, github_release_stage, github_release_draft_verify, postpublish, github_release_publish]
+    if: >-
+      always() && needs.build.result == 'success' &&
+      needs.github_release_preflight.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release-guard
+    permissions:
+      actions: read # Rebind the exact Actions artifact API record after publication.
+      attestations: read # Verify build and immutable-release attestations.
+      contents: read
+    steps:
+      - name: Check out the exact read-only verifier
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Set up verifier Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Install the exact checksum-pinned GitHub CLI
+        id: github_cli
+        run: python scripts/release_artifacts.py install-github-cli --github-output
+
+      - name: Revalidate the exact Actions artifact ID and digest
+        env:
+          BUNDLE_ARTIFACT_DIGEST: ${{ needs.github_release_preflight.outputs.bundle_artifact_digest }}
+          BUNDLE_ARTIFACT_ID: ${{ needs.github_release_preflight.outputs.bundle_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/release_artifacts.py github-artifact-state
+          --artifact-id "$BUNDLE_ARTIFACT_ID" --artifact-digest "$BUNDLE_ARTIFACT_DIGEST"
+
+      - name: Download the exact validated bundle by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.github_release_preflight.outputs.bundle_artifact_id }}
+          path: release-bundle
+          digest-mismatch: error
+
+      - name: Download the exact publication set by artifact ID
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.dist_artifact_id }}
+          path: pypi-dist
+          digest-mismatch: error
+
+      - name: Require final exact PyPI bytes and publish attestations
+        run: >-
+          python scripts/release_artifacts.py pypi-state --bundle release-bundle --dist pypi-dist
+          --github-source --require-exact --wait-seconds 300
+
+      - name: Require exact bytes, immutable state, and both attestation families
+        env:
+          COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}
+          GH_TOKEN: ${{ github.token }}
+          IMMUTABLE_RELEASES_TOKEN: ${{ secrets.RELEASE_GUARD_READ_TOKEN }}
+        run: >-
+          python scripts/release_artifacts.py github-release-state --bundle release-bundle
+          --require-exact --wait-seconds 300
