@@ -347,8 +347,11 @@ compile-code roam-code`.
 Releases originate only from an annotated `vX.Y.Z` tag whose target is the
 checked-out source SHA and whose version equals `pyproject.toml`. The GitHub
 workflow has read-only build permissions, uses full commit pins for every
-action, audits every exact row in the universal build, smoke, and tooling locks
-before installing them, installs a hash-locked toolchain (including `pip`),
+action, and runs an early source guard that makes wrong-repository,
+wrong-owner, unauthorized-rerun, lightweight-tag, version, or checked-out-SHA
+drift fail the workflow instead of silently skipping it. It then audits every
+exact row in the universal build, smoke, and tooling locks before installing
+them, installs a hash-locked toolchain (including `pip`),
 builds wheel and sdist twice from `git archive`, normalizes both under
 `SOURCE_DATE_EPOCH`, and requires byte-for-byte equality. The release bundle
 contains SHA-256 and SHA-512 hashes, matching SRI values, a closed manifest,
@@ -372,9 +375,12 @@ runtime installation of an open `pip-audit ~=2.0` tool graph.
 Before PEP 517 runs, the builder rejects legacy `setup.py`, `setup.cfg`, and
 `MANIFEST.in` inputs, validates a closed static `pyproject.toml`, removes the
 source tree from the tool launch path, and uses a scrubbed build environment
-with package-index access disabled. Transport verification uses bounded, no-follow, single-link
-reads; wheel and sdist must have canonical bytes and identical package and
-Apache-2.0 license and core-metadata payloads.
+with package-index access disabled. After the backend returns, only the exact
+singly-linked regular wheel and sdist outputs are accepted; directories, links,
+and extra files block normalization. Transport verification uses bounded,
+no-follow, single-link reads; wheel and sdist must have canonical bytes,
+closed entry-point sections, and identical package, Apache-2.0 license, and
+core-metadata payloads.
 
 PyPI publication is tokenless and isolated from the builder. OIDC is confined
 to GitHub build provenance and PyPI Trusted Publishing; the GitHub Release

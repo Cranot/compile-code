@@ -490,6 +490,18 @@ def test_manifest_and_sbom_reads_are_bounded_duplicate_strict_and_single_linked(
         release._load_json_bytes((b"[" * 2_000) + (b"]" * 2_000), "deep document")
 
 
+def test_release_cli_preserves_bundle_symlink_identity(tmp_path: Path, capsys):
+    bundle, _ = _bundle(tmp_path / "target")
+    alias = tmp_path / "bundle-alias"
+    try:
+        alias.symlink_to(bundle, target_is_directory=True)
+    except OSError as exc:  # pragma: no cover - Windows often requires Developer Mode
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    assert release.main(["verify", "--bundle", str(alias)]) == 1
+    assert "symlink or reparse point" in capsys.readouterr().err
+
+
 def test_extra_missing_and_duplicate_artifact_inventory_fail_closed(tmp_path: Path):
     bundle, _ = _bundle(tmp_path)
     (bundle / "extra.txt").write_text("substitution", encoding="utf-8")
@@ -630,6 +642,43 @@ def test_lifecycle_inputs_are_rejected_before_the_build_backend_can_run(tmp_path
 
     with pytest.raises(release.ReleaseError, match="pre-build lifecycle input is forbidden: setup.py"):
         release._validate_source_tree_for_build(source, expected_version=VERSION)
+
+
+def test_backend_output_inventory_rejects_non_artifacts_before_normalization(tmp_path: Path):
+    expected = (release._expected_wheel_name(VERSION), release._expected_sdist_name(VERSION))
+
+    raw = tmp_path / "directory-output"
+    raw.mkdir()
+    for name in expected:
+        (raw / name).write_bytes(b"placeholder")
+    (raw / "ignored-directory").mkdir()
+    with pytest.raises(release.ReleaseError, match="only singly-linked regular artifacts"):
+        release._normalize_build(raw, tmp_path / "normalized-directory", _source())
+    assert not (tmp_path / "normalized-directory").exists()
+
+    raw = tmp_path / "extra-output"
+    raw.mkdir()
+    for name in expected:
+        (raw / name).write_bytes(b"placeholder")
+    (raw / "unexpected.txt").write_bytes(b"unexpected")
+    with pytest.raises(release.ReleaseError, match="backend artifact set mismatch"):
+        release._normalize_build(raw, tmp_path / "normalized-extra", _source())
+    assert not (tmp_path / "normalized-extra").exists()
+
+
+def test_wheel_entry_point_inventory_rejects_empty_or_duplicate_sections():
+    valid = (
+        b"[console_scripts]\n"
+        b"cmpl = compile_code.cli:cli\n"
+        b"compile = compile_code.cli:cli\n"
+        b"compile-code = compile_code.cli:cli\n"
+    )
+    release._validate_entry_points(valid)
+
+    with pytest.raises(release.ReleaseError, match="unexpected wheel entry-point section"):
+        release._validate_entry_points(valid + b"[unexpected-empty-section]\n")
+    with pytest.raises(release.ReleaseError, match="duplicate wheel entry-point section"):
+        release._validate_entry_points(valid + b"[console_scripts]\n")
 
 
 def test_build_environment_is_closed_against_python_pip_and_setuptools_injection(tmp_path: Path, monkeypatch):
@@ -820,6 +869,14 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
     assert "environment:\n      name: pypi" in workflow
     assert workflow.count("--github-source") == 4
     assert workflow.count("fetch-depth: 0") == 6
+    build = workflow.split("\n  build:\n", 1)[1].split("\n  provenance:\n", 1)[0]
+    assert "\n    if:" not in build
+    assert build.count("python scripts/release_artifacts.py source") == 1
+    assert (
+        build.index("python scripts/release_artifacts.py source")
+        < build.index("python scripts/release_artifacts.py audit-locks")
+        < build.index("python -m pip install")
+    )
     publish = workflow.split("\n  publish:\n", 1)[1].split("\n  postpublish:\n", 1)[0]
     assert "\n        run:" not in publish
     assert "id-token: write" in publish
@@ -1280,6 +1337,8 @@ def test_release_apis_use_only_the_owner_scoped_read_token(tmp_path: Path, monke
     release_paths = {
         "/user",
         settings_path,
+        f"/repos/{release.REPOSITORY}/environments/{release.RELEASE_GUARD_ENVIRONMENT}",
+        f"/repos/{release.REPOSITORY}/environments/{release.RELEASE_GUARD_ENVIRONMENT}/deployment-branch-policies",
         (
             f"/repos/{release.REPOSITORY}/environments/{release.RELEASE_GUARD_ENVIRONMENT}"
             f"/secrets/{release.RELEASE_GUARD_SECRET}"
@@ -1559,6 +1618,29 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
         )
     with pytest.raises(release.ReleaseError, match="unsafe registry URL"):
         release._fetch_url("http://files.pythonhosted.org/substitution", max_bytes=1)
+
+    for unsafe_url in (
+        "https://pypi.org/path\nheader",
+        "https://pypi.org/path\\tail",
+        "https://pypi.org/non-ascii-\N{LATIN SMALL LETTER E WITH ACUTE}",
+    ):
+        with pytest.raises(release.ReleaseError, match="unsafe registry URL"):
+            release._validate_registry_url(unsafe_url)
+
+
+def test_release_asset_urls_and_attestation_base64_are_canonical():
+    for unsafe_url in (
+        "https://release-assets.githubusercontent.com/path#fragment",
+        "https://release-assets.githubusercontent.com/path\nheader",
+        "https://release-assets.githubusercontent.com/path\\tail",
+        "https://release-assets.githubusercontent.com/non-ascii-\N{LATIN SMALL LETTER E WITH ACUTE}",
+    ):
+        with pytest.raises(release.ReleaseError, match="unsafe GitHub release-asset URL"):
+            release._validate_github_asset_url(unsafe_url, label="GitHub release-asset URL")
+
+    assert release._decode_bounded_base64("YQ==", label="canonical", max_bytes=1) == b"a"
+    with pytest.raises(release.ReleaseError, match="not canonical base64"):
+        release._decode_bounded_base64("YR==", label="noncanonical", max_bytes=1)
 
 
 @pytest.mark.parametrize(

@@ -15,7 +15,6 @@ concurrency:
 jobs:
   build:
     name: Build and test unprivileged artifacts
-    if: github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' && github.triggering_actor == 'Cranot' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -40,6 +39,9 @@ jobs:
 
       - name: Prove the builder is unprivileged
         run: python scripts/release_artifacts.py assert-runner
+
+      - name: Fail closed on repository, owner, annotated-tag, version, or source drift
+        run: python scripts/release_artifacts.py source
 
       - name: Audit every exact build, smoke, and tooling lock row without resolution
         run: python scripts/release_artifacts.py audit-locks

@@ -1483,10 +1483,24 @@ def _invoke_build(source_root: Path, output: Path, epoch: int) -> None:
 
 
 def _normalize_build(raw: Path, normalized: Path, source: dict[str, Any]) -> tuple[Path, Path]:
-    normalized.mkdir(parents=True, exist_ok=False)
+    _validated_real_directory(raw, label="backend output")
     expected = {_expected_wheel_name(source["version"]), _expected_sdist_name(source["version"])}
-    actual = {path.name for path in raw.iterdir() if path.is_file()}
+    entries = list(raw.iterdir())
+    for path in entries:
+        try:
+            state = os.lstat(path)
+        except OSError as exc:
+            raise ReleaseError(f"backend output cannot be inspected: {path}: {exc}") from exc
+        _require(
+            stat.S_ISREG(state.st_mode)
+            and not stat.S_ISLNK(state.st_mode)
+            and not _is_reparse_point(state)
+            and state.st_nlink == 1,
+            f"backend output must contain only singly-linked regular artifacts: {path.name}",
+        )
+    actual = {path.name for path in entries}
     _require(actual == expected, f"backend artifact set mismatch: expected {sorted(expected)}, got {sorted(actual)}")
+    normalized.mkdir(parents=True, exist_ok=False)
     wheel = normalized / _expected_wheel_name(source["version"])
     sdist = normalized / _expected_sdist_name(source["version"])
     normalize_wheel(raw / wheel.name, wheel, source)
@@ -1588,6 +1602,7 @@ def _validate_entry_points(data: bytes) -> None:
     except UnicodeDecodeError as exc:
         raise ReleaseError("wheel entry_points.txt is not UTF-8") from exc
     section = ""
+    sections: set[str] = set()
     found: dict[str, str] = {}
     for line in lines:
         stripped = line.strip()
@@ -1595,6 +1610,9 @@ def _validate_entry_points(data: bytes) -> None:
             continue
         if stripped.startswith("[") and stripped.endswith("]"):
             section = stripped[1:-1]
+            _require(section == "console_scripts", f"unexpected wheel entry-point section: {section}")
+            _require(section not in sections, f"duplicate wheel entry-point section: {section}")
+            sections.add(section)
             continue
         _require(section == "console_scripts" and "=" in stripped, "unexpected wheel entry-point section")
         name, target = (part.strip() for part in stripped.split("=", 1))
@@ -2220,7 +2238,12 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _validate_registry_url(url: Any, *, label: str = "registry URL") -> urllib.parse.ParseResult:
-    _require(isinstance(url, str), f"unsafe {label}: {url!r}")
+    _require(
+        isinstance(url, str)
+        and url.isascii()
+        and not any(character.isspace() or ord(character) < 0x20 or character == "\\" for character in url),
+        f"unsafe {label}: {url!r}",
+    )
     try:
         parsed = urllib.parse.urlparse(url)
         port = parsed.port
@@ -2299,6 +2322,7 @@ def _decode_bounded_base64(value: Any, *, label: str, max_bytes: int) -> bytes:
     except (ValueError, binascii.Error) as exc:
         raise ReleaseError(f"{label} is not canonical base64") from exc
     _require(0 < len(decoded) <= max_bytes, f"{label} exceeds the decoded size limit")
+    _require(base64.b64encode(decoded).decode("ascii") == value, f"{label} is not canonical base64")
     return decoded
 
 
@@ -2540,18 +2564,34 @@ def _immutable_releases_token(environ: dict[str, str] | None = None) -> str:
     )
 
 
+def _validate_github_asset_url(url: Any, *, label: str) -> urllib.parse.ParseResult:
+    _require(
+        isinstance(url, str)
+        and url.isascii()
+        and not any(character.isspace() or ord(character) < 0x20 or character == "\\" for character in url),
+        f"unsafe {label}: {url!r}",
+    )
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ReleaseError(f"unsafe {label}: {url!r}: {exc}") from exc
+    _require(
+        parsed.scheme == "https"
+        and parsed.hostname
+        in {"api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+        and port in {None, 443}
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment,
+        f"unsafe {label}: {url!r}",
+    )
+    return parsed
+
+
 class _GitHubAssetRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
-        parsed = urllib.parse.urlparse(newurl)
-        _require(
-            parsed.scheme == "https"
-            and parsed.hostname
-            in {"api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
-            and parsed.port in {None, 443}
-            and parsed.username is None
-            and parsed.password is None,
-            "unsafe GitHub release-asset redirect",
-        )
+        parsed = _validate_github_asset_url(newurl, label="GitHub release-asset redirect")
         redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
         if redirected is not None and parsed.hostname != "api.github.com":
             redirected.headers.pop("Authorization", None)
@@ -2622,16 +2662,7 @@ def _fetch_github_release_asset(asset_id: int, *, token: str, max_bytes: int) ->
     )
     opener = urllib.request.build_opener(_GitHubAssetRedirect())
     with opener.open(request, timeout=30) as response:
-        final = urllib.parse.urlparse(response.geturl())
-        _require(
-            final.scheme == "https"
-            and final.hostname
-            in {"api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
-            and final.port in {None, 443}
-            and final.username is None
-            and final.password is None,
-            "unsafe final GitHub release-asset URL",
-        )
+        _validate_github_asset_url(response.geturl(), label="final GitHub release-asset URL")
         _require(response.getcode() == 200, f"GitHub release asset returned HTTP {response.getcode()}")
         data = response.read(max_bytes + 1)
     _require(len(data) <= max_bytes, f"GitHub release asset exceeds {max_bytes} bytes")
@@ -2915,7 +2946,6 @@ def _remote_github_release_state(
     # object's SHA and its direct commit target are both part of the manifest.
     source = {**expected_source, "version": manifest["version"], "tag": manifest["tag"]}
     _validate_remote_annotated_tag(source, reader)
-    _validate_release_guard_environment(reader)
     release_guard_token: str | None = None
     if fetch_json is None:
         release_guard_token = _immutable_releases_token(env)
@@ -2927,6 +2957,7 @@ def _remote_github_release_state(
     else:
         release_reader = reader
     _validate_release_guard_identity(release_reader)
+    _validate_release_guard_environment(release_reader)
     _validate_release_guard_secret_scope(release_reader)
     immutable_settings = release_reader(f"/repos/{REPOSITORY}/immutable-releases", True)
     _require(isinstance(immutable_settings, dict), "GitHub immutable releases are not enabled")
@@ -3308,6 +3339,7 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         "attestations: write",
         "skip-existing: false",
         "attestations: true",
+        "python scripts/release_artifacts.py source",
         "python scripts/release_artifacts.py audit-locks",
         "verify --bundle release-bundle --dist pypi-dist --github-source",
         "--github-source --wait-seconds 120 --github-output",
@@ -3343,6 +3375,20 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             problems.append(f"release.yml missing hardened release fragment: {fragment}")
     if "workflow_dispatch:" in release or "inputs:" in release:
         problems.append("release.yml may not accept user-controlled release inputs")
+    build_match = re.search(r"(?ms)^  build:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+    if not build_match:
+        problems.append("release build job missing")
+    else:
+        build_job = build_match.group(1)
+        if re.search(r"(?m)^    if:", build_job):
+            problems.append("release build job may not silently skip an unauthorized tag event")
+        source_guard = build_job.find("python scripts/release_artifacts.py source")
+        lock_audit = build_job.find("python scripts/release_artifacts.py audit-locks")
+        tool_install = build_job.find("python -m pip install")
+        if source_guard < 0 or not (source_guard < lock_audit < tool_install):
+            problems.append("release build must validate source before dependency audit and tool installation")
+        if build_job.count("python scripts/release_artifacts.py source") != 1:
+            problems.append("release build must run exactly one early source guard")
     if release.find("python scripts/release_artifacts.py audit-locks") > release.find("python -m pip install"):
         problems.append("release.yml must audit locked graphs before installing release tooling")
     secret_names = set(re.findall(r"secrets\.([A-Z0-9_]+)", release))
@@ -3623,18 +3669,23 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "build":
             context = source_context_from_github(ROOT)
-            manifest = build_release(ROOT, args.bundle.resolve(), args.dist.resolve(), context)
+            manifest = build_release(
+                ROOT,
+                Path(os.path.abspath(args.bundle)),
+                Path(os.path.abspath(args.dist)),
+                context,
+            )
             print(f"release build: deterministic {manifest['tag']} at {manifest['source']['sha']}")
         elif args.command == "verify":
             expected_source = source_context_from_github(ROOT, allow_untracked=True) if args.github_source else None
             manifest = verify_bundle(
-                args.bundle.resolve(),
-                dist=args.dist.resolve() if args.dist else None,
+                Path(os.path.abspath(args.bundle)),
+                dist=Path(os.path.abspath(args.dist)) if args.dist else None,
                 expected_source=expected_source,
             )
             print(f"release bundle: verified {manifest['tag']} at {manifest['source']['sha']}")
         elif args.command == "twine-check":
-            twine_check(args.bundle.resolve())
+            twine_check(Path(os.path.abspath(args.bundle)))
             print("twine check: PASS")
         elif args.command == "audit-locks":
             audited = audit_locked_requirements(ROOT)
@@ -3643,8 +3694,8 @@ def main(argv: list[str] | None = None) -> int:
             _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
             expected_source = source_context_from_github(ROOT, allow_untracked=True) if args.github_source else None
             state = pypi_state(
-                args.bundle.resolve(),
-                args.dist.resolve(),
+                Path(os.path.abspath(args.bundle)),
+                Path(os.path.abspath(args.dist)),
                 require_exact=args.require_exact,
                 wait_seconds=args.wait_seconds,
                 expected_source=expected_source,
@@ -3667,7 +3718,7 @@ def main(argv: list[str] | None = None) -> int:
             context = source_context_from_github(ROOT, allow_untracked=True)
             details: dict[str, int | str] = {}
             state = github_release_state(
-                args.bundle.resolve(),
+                Path(os.path.abspath(args.bundle)),
                 expected_source=context,
                 require_exact=args.require_exact,
                 require_draft_exact=args.require_draft_exact,
@@ -3678,7 +3729,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.github_output:
                 _write_github_release_output(state, details=details)
         elif args.command == "install-smoke":
-            install_smoke(args.bundle.resolve(), args.mode, args.temp_root.resolve())
+            install_smoke(
+                Path(os.path.abspath(args.bundle)),
+                args.mode,
+                Path(os.path.abspath(args.temp_root)),
+            )
             print(f"install smoke ({args.mode}): PASS")
         elif args.command == "audit-workflows":
             problems = audit_repository(ROOT)

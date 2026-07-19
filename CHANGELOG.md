@@ -25,6 +25,7 @@
 - Replaces runner-managed GitHub CLI use with official v2.96.0 release bytes pinned by independently checked archive and executable SHA-256 values, a one-hop byte/time-bounded credential-free downloader, exclusive runner-temp installation, a minimal fixed command environment, and hash/version/path revalidation before every affected command.
 - Makes exact PyPI and immutable GitHub post-verification a terminal fail-closed job after every successful build and release preflight, so an unexpected skipped write step cannot turn a missing registry publication or still-draft release into a green workflow.
 - Rejects non-finite or over-nested JSON, preflights ZIP central-directory counts before allocation, streams TAR entry bounds, validates archive member sizes, and restricts PyPI URLs and redirects to HTTPS default-port registry identities without userinfo or fragments.
+- Fails unauthorized, wrong-repository, wrong-version, lightweight-tag, and source-drift tag events in an early build guard; preserves link identity at CLI path boundaries; rejects non-regular or extra backend outputs, unexpected wheel entry-point sections, non-canonical attestation base64, and unsafe registry or GitHub asset URL spellings.
 
 ## 0.1.0 - 2026-07-03
 
