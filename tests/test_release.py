@@ -46,7 +46,7 @@ def _metadata() -> bytes:
         "License-Expression: Apache-2.0\n"
         "License-File: LICENSE\n"
         "Provides-Extra: dev\n"
-        "Requires-Dist: roam-code>=13.10.0\n"
+        "Requires-Dist: roam-code<14,>=13.10.0\n"
         "Requires-Dist: click>=8.0\n"
         'Requires-Dist: pytest==9.1.1; extra == "dev"\n'
         'Requires-Dist: PyYAML==6.0.3; extra == "dev"\n'
@@ -701,6 +701,176 @@ def test_build_environment_is_closed_against_python_pip_and_setuptools_injection
     assert "HTTPS_PROXY" not in smoke_environment
     assert "REQUESTS_CA_BUNDLE" not in smoke_environment
     assert smoke_environment["PIP_INDEX_URL"] == "https://pypi.org/simple"
+
+
+def test_runtime_dependency_contract_is_closed_to_the_tested_roam_major():
+    project = release._read_pyproject(ROOT)["project"]
+    assert project["dependencies"] == ["roam-code<14,>=13.10.0", "click>=8.0"]
+    assert release.RUNTIME_REQUIRES == project["dependencies"]
+
+    docs = {name: (ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")}
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert prepush_check._floor_drift(pyproject, docs) == []
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    [
+        ("roam-code>=13.10.0", "inclusive floor and one exclusive ceiling"),
+        ("roam-code<15,>=13.10.0", "compatibility interval drifted"),
+        ("roam-code<14,>=13.9.0", "compatibility interval drifted"),
+    ],
+)
+def test_compatibility_gate_rejects_open_or_drifted_roam_intervals(replacement: str, expected: str):
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    mutated = pyproject.replace("roam-code<14,>=13.10.0", replacement)
+    docs = {name: (ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")}
+
+    assert any(expected in problem for problem in prepush_check._floor_drift(mutated, docs))
+
+
+def test_resolver_protocol_smoke_runs_real_hook_contract_and_bound_verify(tmp_path: Path, monkeypatch):
+    scripts = tmp_path / "venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    compile_executable = scripts / ("compile.exe" if os.name == "nt" else "compile")
+    calls: list[tuple[list[str], Path, dict[str, str], int]] = []
+
+    def run(argv, *, cwd, env=None, timeout=300, **_kwargs):
+        calls.append((argv, cwd, env, timeout))
+        if argv[1:] == ["doctor"]:
+            return "toolchain : ok\nindex     : ok\nclaude    : wired (project)\nVERDICT: ready\n"
+        if "verify" in argv:
+            return "VERDICT: PASS (score 100/100) -- 0 issues in 1 changed file\n"
+        return ""
+
+    monkeypatch.setattr(release, "_run", run)
+    git_executable = str(tmp_path / ("git.exe" if os.name == "nt" else "git"))
+    monkeypatch.setattr(release.shutil, "which", lambda *_args, **_kwargs: git_executable)
+    original_environment = {
+        "CLAUDE_CONFIG_DIR": "user-claude-config",
+        "GIT_DIR": "user-git-dir",
+        "PATH": "trusted-system-path",
+        "PYTHONSAFEPATH": "1",
+        "ROAM_DB": "user-roam.db",
+    }
+
+    release._run_required_roam_protocol_smoke(compile_executable, tmp_path, original_environment)
+
+    project = tmp_path / "roam-protocol-project"
+    assert (project / "protocol_smoke.py").read_text(encoding="utf-8") == (
+        "def protocol_smoke(value: int) -> int:\n    return value + 1\n"
+    )
+    assert [call[0] for call in calls] == [
+        [git_executable, "-c", "init.defaultBranch=main", "init", "--quiet"],
+        [git_executable, "add", "--", "protocol_smoke.py"],
+        [str(compile_executable), "init"],
+        [str(compile_executable), "wire", "claude"],
+        [str(compile_executable), "doctor"],
+        [str(compile_executable), "verify", "--threshold", "0", "--", "protocol_smoke.py"],
+    ]
+    assert all(call[1] == project for call in calls)
+    assert [call[3] for call in calls] == [60, 60, 180, 180, 60, 180]
+    assert all(call[2]["PATH"].split(os.pathsep, 1)[0] == str(scripts) for call in calls)
+    isolated_home = tmp_path / "isolated-runtime" / "home"
+    for _argv, _cwd, environment, _timeout in calls:
+        assert environment["HOME"] == str(isolated_home)
+        assert environment["USERPROFILE"] == str(isolated_home)
+        assert environment["CLAUDE_CONFIG_DIR"] == str(isolated_home / ".claude")
+        assert Path(environment["XDG_CONFIG_HOME"]).is_relative_to(tmp_path)
+        assert Path(environment["APPDATA"]).is_relative_to(tmp_path)
+        assert Path(environment["TEMP"]).is_relative_to(tmp_path)
+        assert "GIT_DIR" not in environment
+        assert "ROAM_DB" not in environment
+    assert original_environment == {
+        "CLAUDE_CONFIG_DIR": "user-claude-config",
+        "GIT_DIR": "user-git-dir",
+        "PATH": "trusted-system-path",
+        "PYTHONSAFEPATH": "1",
+        "ROAM_DB": "user-roam.db",
+    }
+
+
+def test_resolver_protocol_smoke_rejects_roam_hooks_that_compile_reports_unwired(tmp_path: Path, monkeypatch):
+    scripts = tmp_path / "venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    compile_executable = scripts / ("compile.exe" if os.name == "nt" else "compile")
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        if argv[1:] == ["doctor"]:
+            return (
+                "toolchain : ok\n"
+                "index     : ok\n"
+                "claude    : not wired (run `compile wire claude`)\n"
+                "VERDICT: install ok — finish setup above\n"
+            )
+        return ""
+
+    monkeypatch.setattr(release, "_run", run)
+    git_executable = str(tmp_path / ("git.exe" if os.name == "nt" else "git"))
+    monkeypatch.setattr(release.shutil, "which", lambda *_args, **_kwargs: git_executable)
+
+    with pytest.raises(release.ReleaseError, match=release.REQUIRED_CLAUDE_HOOK_READINESS):
+        release._run_required_roam_protocol_smoke(compile_executable, tmp_path, {"PATH": "trusted"})
+
+    assert calls == [
+        [git_executable, "-c", "init.defaultBranch=main", "init", "--quiet"],
+        [git_executable, "add", "--", "protocol_smoke.py"],
+        [str(compile_executable), "init"],
+        [str(compile_executable), "wire", "claude"],
+        [str(compile_executable), "doctor"],
+    ]
+
+
+def test_resolver_protocol_smoke_rejects_non_protocol_output(tmp_path: Path, monkeypatch):
+    scripts = tmp_path / "venv" / ("Scripts" if os.name == "nt" else "bin")
+    scripts.mkdir(parents=True)
+    compile_executable = scripts / ("compile.exe" if os.name == "nt" else "compile")
+    git_executable = str(tmp_path / ("git.exe" if os.name == "nt" else "git"))
+    monkeypatch.setattr(release.shutil, "which", lambda *_args, **_kwargs: git_executable)
+
+    def run(argv, **_kwargs):
+        if argv[1:] == ["doctor"]:
+            return "claude    : wired (project)\nVERDICT: ready\n"
+        return "Usage: compile verify\n" if "verify" in argv else ""
+
+    monkeypatch.setattr(release, "_run", run)
+
+    with pytest.raises(release.ReleaseError, match=release.REQUIRED_ROAM_VERIFY_PROTOCOL):
+        release._run_required_roam_protocol_smoke(compile_executable, tmp_path, {"PATH": "trusted"})
+
+
+def test_install_smoke_requires_protocol_transaction_only_for_resolved_dependencies(tmp_path: Path, monkeypatch):
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def create(self, directory):
+            scripts = Path(directory) / ("Scripts" if os.name == "nt" else "bin")
+            scripts.mkdir(parents=True)
+
+    def run(argv, **_kwargs):
+        return "Usage: compile\n" if argv[-1] == "--help" else ""
+
+    protocol_calls = []
+    monkeypatch.setattr(release.venv, "EnvBuilder", Builder)
+    monkeypatch.setattr(release, "_run", run)
+    monkeypatch.setattr(
+        release,
+        "_run_required_roam_protocol_smoke",
+        lambda executable, root, environment: protocol_calls.append((executable, root, environment)),
+    )
+
+    release._run_install_smoke(tmp_path / "compile.whl", VERSION, "package-only", tmp_path)
+    assert protocol_calls == []
+
+    release._run_install_smoke(tmp_path / "compile.whl", VERSION, "resolve", tmp_path)
+    assert len(protocol_calls) == 1
+    executable, smoke_root, environment = protocol_calls[0]
+    assert executable.name == ("compile.exe" if os.name == "nt" else "compile")
+    assert smoke_root.parent == tmp_path
+    assert environment["PIP_INDEX_URL"] == "https://pypi.org/simple"
 
 
 def test_normalized_archives_reject_trailing_bytes_and_noncanonical_encoding(tmp_path: Path):

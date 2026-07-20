@@ -1,9 +1,9 @@
 # Changelog
 
-## 0.2.0 - 2026-07-18
+## 0.2.0 - 2026-07-19
 
 - Binds `compile verify` to one canonical Roam JSON transaction with a fresh nonce, sorted target scope, exact file-byte digest, and closed Verify receipt-v3 validation; duplicate, trailing, skipped, incomplete, contradictory, or oversized evidence fails closed.
-- Verifies concrete workspace-external `roam` and Claude executables selected by PATH and requires roam-code 13.10.0 or newer.
+- Verifies concrete workspace-external `roam` and Claude executables selected by PATH and declares the tested roam-code compatibility interval `>=13.10.0,<14`.
 - Makes `compile claude` re-prove readiness immediately before launch by structurally validating both hook events, exact commands/files, current hook protocol markers, and the exact Roam producer's canonical-body attestation; degraded launch requires `--allow-unwired` and is disclosed.
 - Keeps Roam-owned hook bodies immutable from the Compile layer, rejects symlinked or escaped `.claude`/`.roam` trees, and uses bounded compare-and-swap writes for settings, guidance, and launch markers so repository links cannot redirect mutations.
 - Resolves every Roam/Git maintenance subprocess to a concrete workspace-external executable and strips interpreter/Git redirection variables before launch.
@@ -16,7 +16,7 @@
 - Rejects legacy lifecycle inputs before PEP 517 can execute, removes the source checkout from the build tool's initial import path, and builds under a scrubbed environment with package-index access disabled.
 - Reads manifests, SBOMs, archives, transported distributions, and control-plane outputs through bounded no-follow single-link checks; requires canonical archive bytes and identical package, license, and core-metadata payloads across wheel and sdist.
 - Makes `scripts/check.py` bind pytest to this checkout and fail closed when Git cannot provide the exact tracked inventory, so a clean locked environment cannot accidentally test an older installed wheel or skip privacy/package scans.
-- Rebinds transported artifacts to the annotated tag and source SHA before and after publication, makes reruns idempotent only when every remote PyPI distribution is byte-identical and has its expected registry-hosted PEP 740 publish attestation, disables `skip-existing` at the write boundary, and keeps release blocked until clean dependency resolution can install `roam-code>=13.10.0`.
+- Rebinds transported artifacts to the annotated tag and source SHA before and after publication, makes reruns idempotent only when every remote PyPI distribution is byte-identical and has its expected registry-hosted PEP 740 publish attestation, disables `skip-existing` at the write boundary, and keeps release blocked until clean dependency resolution installs `roam-code>=13.10.0,<14` and completes a real receipt-v3 Verify transaction.
 - Adds a pre-PyPI GitHub Release transaction that binds the annotated tag object and exact Actions artifact ID/digest, stages a closed four-asset draft from a source-free `contents: write` job, and byte/API/build-attestation-verifies it before PyPI can publish.
 - Safely resumes an exact hidden draft after interruption, rejects partial or mismatched drafts, duplicate same-tag releases, mutable published releases, API-view disagreement, and missing, duplicate, extra, or substituted assets; exact immutable reruns skip finalization.
 - Uses a repository-scoped owner token with `Administration: read`, `Contents: read`, `Environments: read`, and metadata-only `Secrets: read` in verifier jobs, proving its `/user` identity, requiring the `release-guard` environment secret, and rejecting a same-name repository secret fallback without exposing values; every consumer is gated by `release-guard` and verifies reviewer `Cranot`, `prevent_self_review=false`, and exact tag policy `55007746` / `v*` / `tag` through the read-only API.

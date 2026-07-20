@@ -21,15 +21,24 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
+import shlex
+import signal
 import stat
 import subprocess
+import sys
+import tempfile
+import threading
 import time
-from collections.abc import Mapping
+from bisect import bisect_left
+from collections import Counter, deque
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO, Iterator
 
 import click
 
@@ -42,14 +51,29 @@ EXIT_TIMEOUT = 124
 EXIT_VERIFY_GATE = 5
 BASELINE_TIMEOUT = 1200
 MIN_ROAM_VERSION = "13.10.0"
+MAX_ROAM_MAJOR_EXCLUSIVE = 14
+ROAM_VERSION_REQUIREMENT = f">={MIN_ROAM_VERSION},<{MAX_ROAM_MAJOR_EXCLUSIVE}"
+ROAM_PACKAGE_REQUIREMENT = f"roam-code{ROAM_VERSION_REQUIREMENT}"
 MAX_VERIFY_JSON_BYTES = 2 * 1024 * 1024
+MAX_VERIFY_STDERR_BYTES = 64 * 1024
+MAX_ROAM_VERSION_BYTES = 8 * 1024
+MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
+MAX_STRICT_JSON_DEPTH = 128
+_VERIFY_CAPTURE_CHUNK_BYTES = 64 * 1024
+_VERIFY_TERMINATION_GRACE_SECONDS = 1.0
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
 MAX_VERIFY_FILE_BYTES = 64 * 1024 * 1024
 MAX_VERIFY_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_VERIFY_TARGETS = 4096
 MAX_VERIFY_ARG_CHARS = 128 * 1024
+MAX_VERIFY_DIRECTORIES = 20_000
+MAX_VERIFY_DIRECTORY_ENTRIES = 200_000
+MAX_VERIFY_TRAVERSAL_SECONDS = 10.0
 MAX_CLAUDE_SETTINGS_BYTES = 1024 * 1024
 MAX_CLAUDE_HOOK_BYTES = 512 * 1024
 MAX_CLAUDE_GUIDANCE_BYTES = 4 * 1024 * 1024
+_ATOMIC_WRITE_LOCK_MAGIC = b"compile-code-owner-lock-v1\n"
+_ATOMIC_WRITE_LOCK_TIMEOUT_SECONDS = 10.0
 MIN_CLAUDE_HOOK_VERSION = 10
 VERIFY_ENVELOPE_SCHEMA = "roam-envelope-v1"
 VERIFY_ENVELOPE_SCHEMA_VERSION = "1.1.0"
@@ -268,24 +292,31 @@ def _parse_version_value(raw: str) -> tuple[tuple[int, int, int], bool] | None:
     match = _VERSION_VALUE.fullmatch(raw.strip())
     if not match:
         return None
-    release = (
-        int(match.group(1)),
-        int(match.group(2)),
-        int(match.group(3)),
-    )
+    try:
+        release = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
+    except (OverflowError, ValueError):
+        return None
     suffix = match.group("suffix").lower()
     prerelease = bool(re.match(r"^(?:a|b|rc|\.?dev)", suffix))
     return release, prerelease
 
 
 def _version_meets_minimum(raw: str, minimum: str = MIN_ROAM_VERSION) -> bool:
-    """Compare roam versions without requiring ``packaging`` at runtime."""
+    """Enforce the closed Roam compatibility interval without ``packaging``."""
     parsed = _parse_version_value(raw)
     floor = _parse_version_value(minimum)
     if parsed is None or floor is None:
         return False
     release, prerelease = parsed
     floor_release, floor_prerelease = floor
+    if release[0] >= MAX_ROAM_MAJOR_EXCLUSIVE:
+        return False
+    if prerelease and not floor_prerelease:
+        return False
     if release != floor_release:
         return release > floor_release
     if prerelease != floor_prerelease:
@@ -318,14 +349,11 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
     if executable is None:
         return info
     try:
-        proc = subprocess.run(
+        proc = _run_bounded_capture(
             [executable, "--version"],
             timeout=timeout,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            stdout_limit=MAX_ROAM_VERSION_BYTES,
+            stderr_limit=MAX_ROAM_VERSION_BYTES,
             env=_trusted_tool_env(),
         )
     except FileNotFoundError:
@@ -341,13 +369,15 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
         info.update(state="interrupted", detail="version check interrupted")
         return info
     if proc.returncode != 0:
-        diagnostic = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[0][:200]
+        diagnostic_raw = proc.stderr or proc.stdout or b""
+        diagnostic = (diagnostic_raw.decode("utf-8", errors="replace").strip().splitlines() or [""])[0][:200]
         detail = f"version check exited {proc.returncode}"
         if diagnostic:
             detail += f": {diagnostic}"
         info.update(state="version_failed", detail=detail)
         return info
-    version = _extract_roam_version("\n".join((proc.stdout or "", proc.stderr or "")))
+    combined = b"\n".join((proc.stdout or b"", proc.stderr or b"")).decode("utf-8", errors="replace")
+    version = _extract_roam_version(combined)
     if version is None:
         info.update(state="malformed_version", detail="`roam --version` returned no parseable version")
         return info
@@ -361,7 +391,7 @@ def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
     executable = info.get("path")
     version = info.get("version")
     metadata_version = info.get("metadata_version")
-    fix = f'python -m pip install --upgrade "roam-code>={MIN_ROAM_VERSION}"'
+    fix = f'python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
     if state == "missing":
         return EXIT_TOOLCHAIN, f"VERDICT: toolchain missing — `roam` is not on PATH. Fix: {fix}"
     if state == "timeout":
@@ -384,7 +414,7 @@ def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
         return (
             EXIT_TOOLCHAIN,
             f"VERDICT: toolchain version mismatch — PATH roam at `{executable}` reports {version}; "
-            f"compile-code requires >={MIN_ROAM_VERSION}.{metadata_note} Fix: {fix}",
+            f"compile-code requires {ROAM_VERSION_REQUIREMENT}.{metadata_note} Fix: {fix}",
         )
     return None
 
@@ -470,33 +500,293 @@ def _delegate(
         return 130
 
 
+class _WindowsKillJob:
+    """A Windows job whose last handle closes every contained descendant."""
+
+    _KILL_ON_JOB_CLOSE = 0x00002000
+    _EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BasicLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class _ExtendedLimitInformation(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", _BasicLimitInformation),
+                ("IoInfo", _IoCounters),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = _ExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = self._KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(
+            handle,
+            self._EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            kernel32.CloseHandle(handle)
+            raise error
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = kernel32
+        self._handle = handle
+
+    def assign_and_resume(self, process: subprocess.Popen) -> None:
+        """Attach a suspended process before any of its code can create children."""
+        process_handle = self._wintypes.HANDLE(int(process._handle))
+        if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+        ntdll = self._ctypes.WinDLL("ntdll")
+        ntdll.NtResumeProcess.argtypes = [self._wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = self._wintypes.LONG
+        if ntdll.NtResumeProcess(process_handle) != 0:
+            raise OSError("unable to resume contained subprocess")
+
+    def terminate(self) -> None:
+        if self._handle:
+            self._kernel32.TerminateJobObject(self._handle, 1)
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _start_bounded_capture_process(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None,
+    cwd: str | None,
+) -> tuple[subprocess.Popen, _WindowsKillJob | None]:
+    """Start one subprocess inside a tree-wide termination boundary."""
+    job: _WindowsKillJob | None = None
+    popen_kwargs: dict[str, object] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "bufsize": 0,
+        "env": env,
+        "cwd": cwd,
+    }
+    if os.name == "nt":
+        job = _WindowsKillJob()
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) | _WINDOWS_CREATE_SUSPENDED
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(argv, **popen_kwargs)
+    except BaseException:
+        if job is not None:
+            job.close()
+        raise
+    if job is not None:
+        try:
+            job.assign_and_resume(process)
+        except BaseException:
+            job.terminate()
+            job.close()
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=_VERIFY_TERMINATION_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+            raise
+    return process, job
+
+
+def _run_bounded_capture(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdout_limit: int,
+    stderr_limit: int,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a contained process while concurrently draining two bounded pipes."""
+    if timeout <= 0 or stdout_limit < 0 or stderr_limit < 0:
+        raise ValueError("invalid bounded-capture limit")
+    process, job = _start_bounded_capture_process(argv, env=env, cwd=cwd)
+    if process.stdout is None or process.stderr is None:  # pragma: no cover - guaranteed by PIPE
+        _stop_bounded_capture(process, [], threading.Event(), job)
+        raise OSError("failed to create bounded capture pipes")
+
+    stdout = bytearray()
+    stderr = bytearray()
+    reader_errors: list[OSError] = []
+    stop_readers = threading.Event()
+    readers = [
+        threading.Thread(
+            target=_drain_bounded_pipe,
+            args=(process.stdout, stdout, stdout_limit, reader_errors, stop_readers),
+            daemon=True,
+            name="compile-boundary-stdout",
+        ),
+        threading.Thread(
+            target=_drain_bounded_pipe,
+            args=(process.stderr, stderr, stderr_limit, reader_errors, stop_readers),
+            daemon=True,
+            name="compile-boundary-stderr",
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+
+    deadline = time.monotonic() + timeout
+    try:
+        returncode = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        _stop_bounded_capture(process, readers, stop_readers, job)
+        raise subprocess.TimeoutExpired(argv, timeout) from None
+    except BaseException:
+        _stop_bounded_capture(process, readers, stop_readers, job)
+        raise
+
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
+    if any(reader.is_alive() for reader in readers):
+        _stop_bounded_capture(process, readers, stop_readers, job)
+        raise subprocess.TimeoutExpired(argv, timeout)
+    if reader_errors:
+        _stop_bounded_capture(process, readers, stop_readers, job)
+        raise reader_errors[0]
+    if job is not None:
+        job.close()
+    return subprocess.CompletedProcess(argv, returncode, bytes(stdout), bytes(stderr))
+
+
 def _roam_capture(
     *args: str,
     timeout: int = 600,
     executable: str = "roam",
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run the roam toolchain CLI capturing stdout (``_roam`` streams it).
-
-    Kept as a separate indirection so tests stub it the way they stub
-    ``_roam``. Only ``verify`` needs captured output so it can validate one
-    canonical JSON transaction before rendering any producer-controlled data;
-    the other commands keep streaming via ``_delegate``.
-
-    Decoding is pinned to UTF-8 with replacement so undecodable toolchain
-    bytes can never raise mid-capture (Windows would otherwise decode roam's
-    UTF-8 output as the legacy code page — or crash on it).
-    """
-    return subprocess.run(
-        [executable, *args],
+    """Run Roam through the bounded Verify subprocess boundary."""
+    argv = [executable, *args]
+    proc = _run_bounded_capture(
+        argv,
         timeout=timeout,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        stdout_limit=MAX_VERIFY_JSON_BYTES,
+        stderr_limit=MAX_VERIFY_STDERR_BYTES,
         env=env,
     )
+    return subprocess.CompletedProcess(
+        proc.args,
+        proc.returncode,
+        proc.stdout.decode("utf-8", errors="replace"),
+        proc.stderr.decode("utf-8", errors="replace"),
+    )
+
+
+def _drain_bounded_pipe(
+    pipe: BinaryIO,
+    destination: bytearray,
+    max_bytes: int,
+    errors: list[OSError],
+    stop: threading.Event,
+) -> None:
+    """Drain *pipe* to EOF while retaining at most ``max_bytes + 1`` bytes."""
+    retention_limit = max_bytes + 1
+    try:
+        while not stop.is_set():
+            chunk = pipe.read(_VERIFY_CAPTURE_CHUNK_BYTES)
+            if not chunk or stop.is_set():
+                return
+            remaining = retention_limit - len(destination)
+            if remaining > 0:
+                destination.extend(chunk[:remaining])
+    except (OSError, ValueError):
+        if not stop.is_set():
+            errors.append(OSError("verifier capture pipe failed"))
+    finally:
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            if not stop.is_set():
+                errors.append(OSError("verifier capture pipe close failed"))
+
+
+def _stop_bounded_capture(
+    process: subprocess.Popen,
+    readers: list[threading.Thread],
+    stop: threading.Event,
+    job: _WindowsKillJob | None,
+) -> None:
+    """Kill a whole process tree and abandon stuck pipe readers after a strict grace."""
+    stop.set()
+    if job is not None:
+        job.terminate()
+        job.close()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (AttributeError, OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except OSError:
+                pass
+    deadline = time.monotonic() + _VERIFY_TERMINATION_GRACE_SECONDS
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for reader in readers:
+        reader.join(max(0.0, deadline - time.monotonic()))
 
 
 def _delegate_capturing(
@@ -641,6 +931,7 @@ def _strict_json_document(raw: str, *, max_bytes: int) -> object:
     """Parse exactly one finite JSON document and reject duplicate object keys."""
     if not isinstance(raw, str) or "\ufffd" in raw or len(raw.encode("utf-8")) > max_bytes:
         raise ValueError("invalid_json_bytes")
+    _enforce_json_nesting_limit(raw)
 
     def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -653,10 +944,45 @@ def _strict_json_document(raw: str, *, max_bytes: int) -> object:
     def reject_constant(_value: str) -> object:
         raise ValueError("non_finite_json_number")
 
+    def parse_finite_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError("non_finite_json_number")
+        return parsed
+
     try:
-        return json.loads(raw, object_pairs_hook=reject_duplicates, parse_constant=reject_constant)
-    except (TypeError, json.JSONDecodeError, UnicodeError) as exc:
+        return json.loads(
+            raw,
+            object_pairs_hook=reject_duplicates,
+            parse_constant=reject_constant,
+            parse_float=parse_finite_float,
+        )
+    except (TypeError, json.JSONDecodeError, UnicodeError, RecursionError) as exc:
         raise ValueError("invalid_json_document") from exc
+
+
+def _enforce_json_nesting_limit(raw: str) -> None:
+    """Reject pathological JSON depth without interpreting brackets in strings."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == "\\":
+                escaped = True
+            elif value == '"':
+                in_string = False
+            continue
+        if value == '"':
+            in_string = True
+        elif value in "[{":
+            depth += 1
+            if depth > MAX_STRICT_JSON_DEPTH:
+                raise ValueError("json_nesting_limit")
+        elif value in "]}":
+            depth -= 1
 
 
 def _read_bounded_utf8_regular_file(path: Path, *, max_bytes: int) -> str:
@@ -715,6 +1041,169 @@ def _read_bounded_utf8_regular_file(path: Path, *, max_bytes: int) -> str:
         raise ValueError("non_utf8_file") from exc
 
 
+def _is_link_or_reparse(info: os.stat_result) -> bool:
+    """Recognize POSIX links and Windows junction/reparse-point entries."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & reparse_flag)
+
+
+def _same_path_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    """Compare object identity without treating ordinary metadata churn as replacement."""
+    return (
+        bool(left.st_dev or left.st_ino)
+        and bool(right.st_dev or right.st_ino)
+        and stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode)
+        and left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and getattr(left, "st_reparse_tag", 0) == getattr(right, "st_reparse_tag", 0)
+    )
+
+
+def _atomic_write_lock_path(path: Path) -> Path:
+    """Return a user-private, out-of-worktree lock path for one target."""
+    user_key = hashlib.sha256(str(Path.home()).encode("utf-8", errors="strict")).hexdigest()[:16]
+    lock_root = Path(tempfile.gettempdir()) / f"compile-code-locks-{user_key}"
+    try:
+        lock_root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    root_state = lock_root.lstat()
+    if _is_link_or_reparse(root_state) or not stat.S_ISDIR(root_state.st_mode):
+        raise ValueError("unsafe_write_lock_root")
+    if os.name != "nt":
+        if stat.S_IMODE(root_state.st_mode) & 0o077:
+            raise ValueError("unsafe_write_lock_root")
+        if hasattr(os, "geteuid") and root_state.st_uid != os.geteuid():
+            raise ValueError("unsafe_write_lock_root")
+    canonical_parent = path.parent.resolve(strict=True)
+    target_key = os.path.normcase(str(canonical_parent / path.name))
+    digest = hashlib.sha256(target_key.encode("utf-8", errors="strict")).hexdigest()
+    return lock_root / f"{digest}.lock"
+
+
+def _initialize_atomic_write_lock(lock_path: Path) -> None:
+    """Publish one fully initialized private lock file without overwriting one."""
+    temporary = lock_path.parent / f".{lock_path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
+        state = os.fstat(descriptor)
+        if not stat.S_ISREG(state.st_mode) or state.st_nlink != 1:
+            raise ValueError("unsafe_write_lock")
+        offset = 0
+        while offset < len(_ATOMIC_WRITE_LOCK_MAGIC):
+            written = os.write(descriptor, _ATOMIC_WRITE_LOCK_MAGIC[offset:])
+            if written <= 0:
+                raise OSError("short lock write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary, lock_path)
+        except FileExistsError:
+            pass
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_lock_is_safe(lock_path: Path, descriptor: int, opened: os.stat_result) -> bool:
+    try:
+        path_state = lock_path.lstat()
+        if (
+            _is_link_or_reparse(path_state)
+            or not stat.S_ISREG(path_state.st_mode)
+            or path_state.st_nlink != 1
+            or not _same_verification_file_state(path_state, opened, cross_handle=True)
+        ):
+            return False
+        if os.name != "nt":
+            if stat.S_IMODE(opened.st_mode) & 0o077:
+                return False
+            if hasattr(os, "geteuid") and opened.st_uid != os.geteuid():
+                return False
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        content = os.read(descriptor, len(_ATOMIC_WRITE_LOCK_MAGIC) + 1)
+        return content == _ATOMIC_WRITE_LOCK_MAGIC
+    except OSError:
+        return False
+
+
+def _acquire_atomic_write_lock(descriptor: int) -> None:
+    deadline = time.monotonic() + _ATOMIC_WRITE_LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, len(_ATOMIC_WRITE_LOCK_MAGIC))
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("atomic_write_lock_timeout") from exc
+            time.sleep(0.01)
+
+
+def _release_atomic_write_lock(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, len(_ATOMIC_WRITE_LOCK_MAGIC))
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _owner_only_atomic_write_lock(path: Path) -> Iterator[Callable[[], bool]]:
+    """Serialize target writers through a persistent private, identity-bound lock."""
+    lock_path = _atomic_write_lock_path(path)
+    _initialize_atomic_write_lock(lock_path)
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(lock_path, flags)
+    acquired = False
+    try:
+        opened = os.fstat(descriptor)
+        if not _atomic_write_lock_is_safe(lock_path, descriptor, opened):
+            raise ValueError("unsafe_write_lock")
+        _acquire_atomic_write_lock(descriptor)
+        acquired = True
+        locked = os.fstat(descriptor)
+        if not _atomic_write_lock_is_safe(lock_path, descriptor, locked) or not _same_path_identity(opened, locked):
+            raise ValueError("unsafe_write_lock")
+
+        def still_owned() -> bool:
+            try:
+                current = os.fstat(descriptor)
+            except OSError:
+                return False
+            return _same_path_identity(locked, current) and _atomic_write_lock_is_safe(lock_path, descriptor, current)
+
+        yield still_owned
+    finally:
+        if acquired:
+            try:
+                _release_atomic_write_lock(descriptor)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+
 def _atomic_write_utf8(
     path: Path,
     text: str,
@@ -722,56 +1211,69 @@ def _atomic_write_utf8(
     max_bytes: int,
     expected_previous: str | None = None,
 ) -> bool:
-    """Atomically write UTF-8 without following a repository-controlled link.
-
-    ``expected_previous`` turns the operation into a compare-and-swap: the
-    exact regular file read by the caller must still be present immediately
-    before replacement. A final-component symlink is never opened for write;
-    ``os.replace`` replaces the directory entry itself.
-    """
+    """Perform one lock-serialized UTF-8 compare-and-swap."""
     payload = text.encode("utf-8")
     if len(payload) > max_bytes:
         return False
-    try:
-        parent_info = path.parent.lstat()
-        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
-            return False
-        if expected_previous is not None:
-            current = _read_bounded_utf8_regular_file(path, max_bytes=max_bytes)
-            if current != expected_previous:
-                return False
-            mode = stat.S_IMODE(path.lstat().st_mode)
-        else:
-            try:
-                path.lstat()
-            except FileNotFoundError:
-                mode = 0o600
-            else:
-                return False
-    except (OSError, ValueError):
-        return False
-
     temporary = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
     descriptor = -1
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(temporary, flags, mode or 0o600)
-        offset = 0
-        while offset < len(payload):
-            written = os.write(descriptor, payload[offset:])
-            if written <= 0:
-                raise OSError("short write")
-            offset += written
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        if expected_previous is not None:
-            current = _read_bounded_utf8_regular_file(path, max_bytes=max_bytes)
-            if current != expected_previous:
+        with _owner_only_atomic_write_lock(path) as lock_is_owned:
+            parent_state = path.parent.lstat()
+            if _is_link_or_reparse(parent_state) or not stat.S_ISDIR(parent_state.st_mode):
                 return False
-        os.replace(temporary, path)
-        return True
-    except (OSError, ValueError):
+            target_state: os.stat_result | None = None
+            if expected_previous is not None:
+                current = _read_bounded_utf8_regular_file(path, max_bytes=max_bytes)
+                target_state = path.lstat()
+                if current != expected_previous or _is_link_or_reparse(target_state):
+                    return False
+                mode = stat.S_IMODE(target_state.st_mode)
+            else:
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    mode = 0o600
+                else:
+                    return False
+
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            descriptor = os.open(temporary, flags, mode or 0o600)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("short write")
+                offset += written
+            os.fsync(descriptor)
+            temporary_state = os.fstat(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+
+            current_parent = path.parent.lstat()
+            if not lock_is_owned() or not _same_path_identity(parent_state, current_parent):
+                return False
+            if expected_previous is None:
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    return False
+            else:
+                current = _read_bounded_utf8_regular_file(path, max_bytes=max_bytes)
+                current_state = path.lstat()
+                if (
+                    current != expected_previous
+                    or target_state is None
+                    or not _same_path_identity(target_state, current_state)
+                    or not lock_is_owned()
+                ):
+                    return False
+                os.replace(temporary, path)
+            committed_state = path.lstat()
+            if not _same_path_identity(temporary_state, committed_state):
+                return False
+            return True
+    except (OSError, TimeoutError, UnicodeError, ValueError):
         return False
     finally:
         if descriptor >= 0:
@@ -808,21 +1310,20 @@ def _hook_body_is_current(path: Path, filename: str) -> bool:
 
 
 def _hook_command_matches(command: object, expected_path: Path) -> bool:
-    """Accept only Roam's literal ``python3 <absolute-hook-path>`` command."""
-    if not isinstance(command, str) or not command.startswith("python3 "):
-        return False
-    raw_path = command[len("python3 ") :]
-    if not raw_path or raw_path != raw_path.strip() or any(char in raw_path for char in "\r\n\0;&|<>`$"):
-        return False
-    candidate = Path(raw_path)
-    if not candidate.is_absolute():
+    """Accept only the exact two-argument command emitted by Roam 13.10."""
+    if not isinstance(command, str) or not sys.executable or not Path(sys.executable).is_absolute():
         return False
     try:
-        return os.path.normcase(str(candidate.resolve(strict=True))) == os.path.normcase(
-            str(expected_path.resolve(strict=True))
-        )
+        hook_path = expected_path.resolve(strict=True)
+        interpreter = Path(sys.executable)
+        interpreter_info = interpreter.stat()
+        if not stat.S_ISREG(interpreter_info.st_mode):
+            return False
     except (OSError, RuntimeError, ValueError):
         return False
+    argv = [sys.executable, str(hook_path)]
+    expected = subprocess.list2cmdline(argv) if os.name == "nt" else " ".join(shlex.quote(part) for part in argv)
+    return command == expected
 
 
 def _read_claude_settings(settings_path: Path) -> tuple[dict[str, object] | None, str | None]:
@@ -1001,17 +1502,17 @@ def _attest_claude_hooks(executable: str, expected_version: str, *, user_level: 
         argv.append("--user")
     env = _trusted_tool_env(overrides={"ROAM_DEFAULT_JSON_BUDGET": "0", "ROAM_AGENT_CONTRACT_BLOCK": "1"})
     try:
-        proc = subprocess.run(
+        proc = _run_bounded_capture(
             argv,
             timeout=15,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            stdout_limit=MAX_VERIFY_JSON_BYTES,
+            stderr_limit=MAX_VERIFY_STDERR_BYTES,
             env=env,
         )
-        envelope = _strict_json_document(proc.stdout or "", max_bytes=MAX_VERIFY_JSON_BYTES)
+        envelope = _strict_json_document(
+            (proc.stdout or b"").decode("utf-8", errors="replace"),
+            max_bytes=MAX_VERIFY_JSON_BYTES,
+        )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired, ValueError):
         return False
     if proc.returncode != 0 or not isinstance(envelope, dict):
@@ -1725,6 +2226,28 @@ _VERIFY_NO_CHANGES_SUMMARY_KEYS = frozenset(
 )
 
 
+def _scope_path_separators(value: str) -> str:
+    """Canonicalize filesystem separators only where backslash is not a filename byte."""
+    return value.replace("\\", "/") if os.name == "nt" else value
+
+
+def _require_utf8_scope_text(value: str) -> str:
+    """Reject surrogate-escaped filenames instead of silently substituting bytes."""
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("scope_path_undecodable") from exc
+    return value
+
+
+def _decode_verify_status_path(raw: bytes) -> str:
+    try:
+        value = os.fsdecode(raw)
+    except UnicodeError as exc:
+        raise ValueError("scope_path_undecodable") from exc
+    return _scope_path_separators(_require_utf8_scope_text(value))
+
+
 def _parse_changed_status_paths(raw: str) -> list[str]:
     """Parse NUL-delimited porcelain status for best-effort failure context.
 
@@ -1740,11 +2263,11 @@ def _parse_changed_status_paths(raw: str) -> list[str]:
         if len(record) < 4:
             continue
         status = record[:2]
-        path = record[3:].replace("\\", "/")
+        path = _scope_path_separators(_require_utf8_scope_text(record[3:]))
         if path:
             paths.append(path)
         if "R" in status or "C" in status:
-            source = records[index].replace("\\", "/") if index < len(records) else ""
+            source = _scope_path_separators(_require_utf8_scope_text(records[index])) if index < len(records) else ""
             index += 1
             if "R" in status and source:
                 paths.append(source)
@@ -1757,21 +2280,21 @@ def _changed_files() -> list[str]:
     if not executable:
         return []
     try:
-        proc = subprocess.run(
+        proc = _run_bounded_capture(
             [executable, "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=10,
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+            stderr_limit=MAX_VERIFY_STDERR_BYTES,
             env=_trusted_tool_env(git=True),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return []
-    if proc.returncode != 0:
+    if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
         return []
-    return _parse_changed_status_paths(proc.stdout or "")
+    try:
+        return _parse_verify_status_paths(proc.stdout or b"")
+    except ValueError:
+        return []
 
 
 def _oversized_target_set(targets: list[str], cap: int = 25) -> str | None:
@@ -1797,57 +2320,145 @@ def _verification_root() -> Path:
 
 
 def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
-    """Mirror Roam 13.10's bounded, symlink-safe directory expansion."""
-    directories = [path for path in targets if (root / path).is_dir() and not (root / path).is_symlink()]
-    if not directories:
-        return targets
-    expanded = [path for path in targets if path not in directories]
-    seen = set(expanded)
-    skip_dirs = {".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"}
-    cap = 20_000
-    for directory in directories:
-        before_count = len(expanded)
+    """Expand explicit directories deterministically under closed resource bounds."""
+    try:
+        canonical_root = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("verification_root_unavailable") from exc
+    directories: list[tuple[str, Path]] = []
+    expanded: list[str] = []
+    for relative in targets:
+        candidate = canonical_root / Path(relative)
         try:
-            for current, child_dirs, filenames in os.walk(root / directory, followlinks=False):
-                child_dirs[:] = sorted(
-                    name for name in child_dirs if name not in skip_dirs and not (Path(current) / name).is_symlink()
-                )
-                for filename in sorted(filenames):
-                    candidate = Path(current) / filename
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    relative = candidate.relative_to(root).as_posix()
-                    if relative not in seen:
-                        expanded.append(relative)
-                        seen.add(relative)
-                    if len(expanded) >= cap:
-                        break
-                if len(expanded) >= cap:
-                    break
-        except (OSError, ValueError):
-            pass
-        if len(expanded) == before_count or len(expanded) >= cap:
-            if directory not in seen:
-                expanded.append(directory)
-                seen.add(directory)
+            candidate_state = candidate.lstat()
+        except FileNotFoundError:
+            expanded.append(relative)
+            continue
+        except OSError as exc:
+            raise ValueError("verification_directory_unreadable") from exc
+        if stat.S_ISDIR(candidate_state.st_mode) and not _is_link_or_reparse(candidate_state):
+            directories.append((relative, candidate))
+        else:
+            expanded.append(relative)
+    if not directories:
+        return expanded
+    if len(expanded) > MAX_VERIFY_TARGETS:
+        raise ValueError("verification_target_limit")
+
+    seen = set(expanded)
+    seen_directories: set[str] = set()
+    skip_dirs = {".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"}
+    pending = deque(path for _relative, path in directories)
+    directory_count = 0
+    entry_count = 0
+    deadline = time.monotonic() + MAX_VERIFY_TRAVERSAL_SECONDS
+    while pending:
+        if time.monotonic() > deadline:
+            raise ValueError("verification_directory_timeout")
+        current = pending.popleft()
+        current_key = os.path.normcase(str(current))
+        if current_key in seen_directories:
+            continue
+        seen_directories.add(current_key)
+        directory_count += 1
+        if directory_count > MAX_VERIFY_DIRECTORIES:
+            raise ValueError("verification_directory_limit")
+        before = _validated_verify_directory_state(current, canonical_root)
+        names: list[str] = []
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > MAX_VERIFY_DIRECTORY_ENTRIES:
+                        raise ValueError("verification_directory_entry_limit")
+                    if time.monotonic() > deadline:
+                        raise ValueError("verification_directory_timeout")
+                    names.append(entry.name)
+        except ValueError:
+            raise
+        except OSError as exc:
+            raise ValueError("verification_directory_unreadable") from exc
+
+        child_directories: list[Path] = []
+        for name in sorted(names):
+            child = current / name
+            try:
+                child_state = child.lstat()
+            except OSError as exc:
+                raise ValueError("verification_directory_changed") from exc
+            if _is_link_or_reparse(child_state):
+                raise ValueError("verification_directory_unsafe")
+            if stat.S_ISDIR(child_state.st_mode):
+                if name not in skip_dirs:
+                    child_directories.append(child)
+                continue
+            if not stat.S_ISREG(child_state.st_mode):
+                raise ValueError("verification_directory_unsafe")
+            try:
+                relative = child.relative_to(canonical_root).as_posix()
+            except ValueError as exc:
+                raise ValueError("scope_path_outside_root") from exc
+            if relative not in seen:
+                if len(expanded) >= MAX_VERIFY_TARGETS:
+                    raise ValueError("verification_target_limit")
+                expanded.append(relative)
+                seen.add(relative)
+        after = _validated_verify_directory_state(current, canonical_root)
+        if not _same_verification_file_state(before, after):
+            raise ValueError("verification_directory_changed")
+        pending.extend(child_directories)
+    if not expanded:
+        raise ValueError("verification_directory_empty")
+    ordered_expanded = sorted(expanded)
+    for relative, _directory in directories:
+        prefix = f"{relative}/"
+        index = bisect_left(ordered_expanded, prefix)
+        if index >= len(ordered_expanded) or not ordered_expanded[index].startswith(prefix):
+            raise ValueError("verification_directory_empty")
     return expanded
 
 
+def _validated_verify_directory_state(directory: Path, root: Path) -> os.stat_result:
+    """Bind one traversed directory to a concrete non-reparse path under root."""
+    try:
+        state = directory.lstat()
+        resolved = directory.resolve(strict=True)
+        resolved_state = resolved.stat()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("verification_directory_unreadable") from exc
+    if (
+        _is_link_or_reparse(state)
+        or not stat.S_ISDIR(state.st_mode)
+        or not _path_is_within(resolved, root)
+        or os.path.normcase(str(resolved)) != os.path.normcase(str(directory.absolute()))
+        or not _same_path_identity(state, resolved_state)
+    ):
+        raise ValueError("verification_directory_unsafe")
+    return state
+
+
 def _parse_verify_status_paths(raw: bytes) -> list[str]:
+    if raw and not raw.endswith(b"\0"):
+        raise ValueError("changed_file_discovery_malformed")
     records = raw.split(b"\0")
     paths: list[str] = []
     index = 0
     while index < len(records):
-        record = os.fsdecode(records[index])
+        raw_record = records[index]
         index += 1
-        if len(record) < 4:
+        if not raw_record:
             continue
+        record = _decode_verify_status_path(raw_record)
+        if len(record) < 4:
+            raise ValueError("changed_file_discovery_malformed")
         status = record[:2]
-        path = record[3:].replace("\\", "/")
+        path = record[3:]
         if path:
             paths.append(path)
         if "R" in status or "C" in status:
-            source = os.fsdecode(records[index]).replace("\\", "/") if index < len(records) else ""
+            if index >= len(records) or not records[index]:
+                raise ValueError("changed_file_discovery_malformed")
+            source = _decode_verify_status_path(records[index])
             index += 1
             if "R" in status and source:
                 paths.append(source)
@@ -1861,17 +2472,17 @@ def _discover_verify_targets(root: Path) -> list[str]:
         raise ValueError("changed_file_discovery_failed")
     env = _trusted_tool_env(git=True)
     try:
-        proc = subprocess.run(
+        proc = _run_bounded_capture(
             [git_path, "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=str(root),
-            check=False,
-            capture_output=True,
             timeout=10,
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+            stderr_limit=MAX_VERIFY_STDERR_BYTES,
             env=env,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
         raise ValueError("changed_file_discovery_failed") from exc
-    if proc.returncode != 0:
+    if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
         raise ValueError("changed_file_discovery_failed")
     return _parse_verify_status_paths(proc.stdout or b"")
 
@@ -1879,10 +2490,12 @@ def _discover_verify_targets(root: Path) -> list[str]:
 def _verification_scope_paths(targets: list[str]) -> list[str]:
     normalized: set[str] = set()
     for path in targets:
-        value = str(path).strip().replace("\\", "/")
+        if not isinstance(path, str):
+            raise ValueError("scope_path_not_text")
+        value = _scope_path_separators(_require_utf8_scope_text(path))
         if not value:
-            continue
-        if any(ord(character) < 32 for character in value):
+            raise ValueError("scope_path_empty")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
             raise ValueError("scope_path_control_character")
         parsed = PurePosixPath(value)
         if (
@@ -1908,6 +2521,51 @@ def _same_verification_file_state(left: os.stat_result, right: os.stat_result, *
     return all(getattr(left, field) == getattr(right, field) for field in fields)
 
 
+def _verification_parent_snapshot(root: Path, parent: Path) -> tuple[str, tuple[tuple[str, os.stat_result], ...]]:
+    """Capture every concrete parent component so junction swaps become visible."""
+    try:
+        relative = parent.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("scope_path_outside_root") from exc
+    states: list[tuple[str, os.stat_result]] = []
+    current = root
+    for component in (None, *relative.parts):
+        if component is not None:
+            current = current / component
+        try:
+            state = current.lstat()
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            raise ValueError("scope_file_unreadable") from exc
+        if _is_link_or_reparse(state) or not stat.S_ISDIR(state.st_mode):
+            raise ValueError("scope_parent_unsafe")
+        states.append((os.path.normcase(str(current)), state))
+    try:
+        resolved = parent.resolve(strict=True)
+    except FileNotFoundError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("scope_file_unreadable") from exc
+    if not _path_is_within(resolved, root) or os.path.normcase(str(resolved)) != os.path.normcase(
+        str(parent.absolute())
+    ):
+        raise ValueError("scope_path_outside_root")
+    return os.path.normcase(str(resolved)), tuple(states)
+
+
+def _same_verification_parent_snapshot(
+    left: tuple[str, tuple[tuple[str, os.stat_result], ...]],
+    right: tuple[str, tuple[tuple[str, os.stat_result], ...]],
+) -> bool:
+    if left[0] != right[0] or len(left[1]) != len(right[1]):
+        return False
+    return all(
+        left_path == right_path and _same_path_identity(left_state, right_state)
+        for (left_path, left_state), (right_path, right_state) in zip(left[1], right[1], strict=True)
+    )
+
+
 def _verification_content_sha256(root: Path, targets: list[str]) -> str:
     """Hash exact target bytes with the same manifest contract as receipt v3."""
     try:
@@ -1923,14 +2581,10 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
         except ValueError as exc:
             raise ValueError("scope_path_outside_root") from exc
         try:
-            canonical_parent = candidate.parent.resolve(strict=True)
+            parent_before = _verification_parent_snapshot(canonical_root, candidate.parent)
         except FileNotFoundError:
             manifest.append([relative_path, "missing"])
             continue
-        except (OSError, RuntimeError) as exc:
-            raise ValueError("scope_file_unreadable") from exc
-        if not _path_is_within(canonical_parent, canonical_root):
-            raise ValueError("scope_path_outside_root")
         try:
             path_before = candidate.lstat()
         except FileNotFoundError:
@@ -1954,8 +2608,14 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
         bytes_read = 0
         try:
             opened_before = os.fstat(descriptor)
-            if not stat.S_ISREG(opened_before.st_mode) or not _same_verification_file_state(
-                path_before, opened_before, cross_handle=True
+            try:
+                parent_opened = _verification_parent_snapshot(canonical_root, candidate.parent)
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError("scope_file_changed_during_hash") from exc
+            if (
+                not _same_verification_parent_snapshot(parent_before, parent_opened)
+                or not stat.S_ISREG(opened_before.st_mode)
+                or not _same_verification_file_state(path_before, opened_before, cross_handle=True)
             ):
                 raise ValueError("scope_file_changed_during_hash")
             while True:
@@ -1971,8 +2631,13 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
                 path_after = candidate.lstat()
             except OSError as exc:
                 raise ValueError("scope_file_changed_during_hash") from exc
+            try:
+                parent_after = _verification_parent_snapshot(canonical_root, candidate.parent)
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError("scope_file_changed_during_hash") from exc
             if (
                 bytes_read != opened_before.st_size
+                or not _same_verification_parent_snapshot(parent_before, parent_after)
                 or not _same_verification_file_state(opened_before, opened_after)
                 or not _same_verification_file_state(path_before, path_after)
             ):
@@ -1989,8 +2654,9 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
 
 def _prepare_verify_request(files: tuple[str, ...]) -> tuple[Path, list[str], dict[str, object], dict[str, str]]:
     root = _verification_root()
-    raw_targets = [path.replace("\\", "/") for path in files] if files else _discover_verify_targets(root)
-    targets = _verification_scope_paths(_expand_verify_targets(raw_targets, root))
+    raw_targets = list(files) if files else _discover_verify_targets(root)
+    requested_targets = _verification_scope_paths(raw_targets)
+    targets = _verification_scope_paths(_expand_verify_targets(requested_targets, root))
     if len(targets) > MAX_VERIFY_TARGETS or sum(len(path) + 1 for path in targets) > MAX_VERIFY_ARG_CHARS:
         raise ValueError("verification_scope_too_large")
     nonce = secrets.token_hex(16)
@@ -2026,7 +2692,7 @@ def _plain_int(value: object, *, minimum: int = 0, maximum: int | None = None) -
     return value
 
 
-def _validate_finding(finding: object) -> dict:
+def _validate_finding(finding: object, *, expected_root: Path | None = None) -> dict:
     if not isinstance(finding, dict):
         raise ValueError("invalid_finding")
     severity = finding.get("severity")
@@ -2038,10 +2704,30 @@ def _validate_finding(finding: object) -> dict:
     for value, limit in ((category, 128), (file_path, 4096), (message, 4096)):
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
             raise ValueError("invalid_finding_text")
+    try:
+        if _verification_scope_paths([file_path]) != [file_path]:
+            raise ValueError("invalid_finding_path")
+        if expected_root is not None:
+            canonical_root = expected_root.resolve(strict=True)
+            resolved_finding = (canonical_root / Path(file_path)).resolve(strict=False)
+            if not _path_is_within(resolved_finding, canonical_root):
+                raise ValueError("invalid_finding_path")
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("invalid_finding_path") from exc
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("invalid_finding_path") from exc
     line = finding.get("line")
     if line is not None:
         _plain_int(line, minimum=1)
     return finding
+
+
+def _finding_fingerprint(finding: dict) -> str:
+    """Return one canonical, multiplicity-preserving evidence identity."""
+    try:
+        return json.dumps(finding, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("invalid_finding") from exc
 
 
 def _validate_verify_scope_summary(scope: object, *, expected_count: int, files_checked: int) -> None:
@@ -2084,7 +2770,8 @@ def _validate_verify_protocol(
     returncode: int,
     expected_receipt: dict[str, object],
     expected_roam_version: str,
-    expected_threshold: int,
+    expected_threshold: int | None,
+    expected_root: Path | None = None,
 ) -> dict:
     """Validate one complete, request-bound Roam Verify receipt-v3 transaction."""
     envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
@@ -2117,7 +2804,11 @@ def _validate_verify_protocol(
     files_checked = _plain_int(summary.get("files_checked"))
     violation_count = _plain_int(summary.get("violation_count"))
     expected_count = _plain_int(expected_receipt.get("target_file_count"))
-    if threshold != expected_threshold or len(violations) != violation_count or summary.get("truncated") is True:
+    if (
+        (expected_threshold is not None and threshold != expected_threshold)
+        or len(violations) != violation_count
+        or summary.get("truncated") is True
+    ):
         raise ValueError("summary_binding")
     if summary.get("verification_complete") is not True or summary.get("partial_success") is not False:
         raise ValueError("verification_incomplete")
@@ -2169,7 +2860,8 @@ def _validate_verify_protocol(
         or verification_category.get("violations") != []
     ):
         raise ValueError("verification_category")
-    evidence_findings = [_validate_finding(finding) for finding in violations]
+    top_level_findings = [_validate_finding(finding, expected_root=expected_root) for finding in violations]
+    category_findings: list[dict] = []
     for category_name, result in categories.items():
         if (
             not isinstance(category_name, str)
@@ -2200,7 +2892,14 @@ def _validate_verify_protocol(
             or ("capped" in result and result["capped"] is not False)
         ):
             raise ValueError("category_incomplete")
-        evidence_findings.extend(_validate_finding(finding) for finding in nested)
+        for finding in nested:
+            validated = _validate_finding(finding, expected_root=expected_root)
+            if validated.get("category") != category_name:
+                raise ValueError("category_finding_contradiction")
+            category_findings.append(validated)
+    if Counter(map(_finding_fingerprint, top_level_findings)) != Counter(map(_finding_fingerprint, category_findings)):
+        raise ValueError("finding_multiset_contradiction")
+    evidence_findings = top_level_findings
     has_fail = any(finding.get("severity") == "FAIL" for finding in evidence_findings)
 
     checks_run = summary.get("checks_run")
@@ -2210,6 +2909,7 @@ def _validate_verify_protocol(
         summary.get("state") != "verified"
         or summary.get("targets_checked") != expected_count
         or summary.get("quality_band") != quality_band
+        or (verdict in {"PASS", "WARN"} and verdict != quality_band)
         or not isinstance(index_refresh, dict)
         or set(index_refresh) != {"state", "refreshed_file_count"}
         or index_refresh.get("state") not in {"current", "refreshed"}
@@ -2280,14 +2980,13 @@ def _render_verify_envelope(envelope: dict) -> str:
     return "\n".join(lines)
 
 
-def _failing_files(output: str) -> list[str]:
-    """Files named on ``FAIL: file:line`` lines, de-duplicated, order-preserving."""
+def _failing_files(envelope: dict) -> list[str]:
+    """Return exact validated FAIL paths without round-tripping through display text."""
     failing: list[str] = []
-    for line in output.splitlines():
-        match = _VERIFY_FAIL_LINE.match(line)
-        if not match:
+    for finding in envelope["violations"]:
+        if finding["severity"] != "FAIL":
             continue
-        failed_file = match.group(1).strip()
+        failed_file = finding["file"]
         if failed_file not in failing:
             failing.append(failed_file)
     return failing
@@ -2356,8 +3055,75 @@ def _format_verify_failure(**failure: object) -> str:
     )
 
 
+def _render_verify_command(
+    *,
+    new_only: bool,
+    diff_only: bool,
+    threshold: int | None,
+) -> str:
+    """Render one shell-neutral recovery command containing no path content."""
+    tokens = ["compile", "verify"]
+    if new_only:
+        tokens.append("--new-only")
+    if diff_only:
+        tokens.append("--diff-only")
+    if threshold is not None:
+        tokens.extend(["--threshold", str(threshold)])
+    return " ".join([*tokens, "--changed"])
+
+
+def _unsafe_scope_verdict(error: BaseException) -> str | None:
+    reason = str(error)
+    if reason == "scope_path_control_character":
+        return (
+            "VERDICT: verify refused — the scope contains a filename with an unsafe control character "
+            "(including a newline). Rename that file and rerun `compile verify --changed`."
+        )
+    if reason == "scope_path_undecodable":
+        return (
+            "VERDICT: verify refused — the scope contains a filename that is not representable as UTF-8. "
+            "Rename that file and rerun `compile verify --changed`."
+        )
+    if reason == "verification_directory_limit":
+        return (
+            f"VERDICT: verify refused — explicit-directory traversal exceeded the "
+            f"{MAX_VERIFY_DIRECTORIES}-directory safety limit. Pass a smaller explicit file scope."
+        )
+    if reason == "verification_directory_entry_limit":
+        return (
+            f"VERDICT: verify refused — explicit-directory traversal exceeded the "
+            f"{MAX_VERIFY_DIRECTORY_ENTRIES}-entry safety limit. Pass a smaller explicit file scope."
+        )
+    if reason == "verification_target_limit":
+        return (
+            f"VERDICT: verify refused — explicit-directory expansion exceeded the "
+            f"{MAX_VERIFY_TARGETS}-file safety limit. Pass a smaller explicit file scope."
+        )
+    if reason == "verification_directory_timeout":
+        return (
+            f"VERDICT: verify refused — explicit-directory traversal exceeded the "
+            f"{MAX_VERIFY_TRAVERSAL_SECONDS:g}-second safety limit. Pass explicit file paths."
+        )
+    if reason in {
+        "verification_directory_changed",
+        "verification_directory_empty",
+        "verification_directory_unreadable",
+        "verification_directory_unsafe",
+    }:
+        return (
+            "VERDICT: verify refused — an explicit directory was unreadable, unsafe, empty, or changed during "
+            "bounded traversal. Stabilize the directory or pass explicit file paths."
+        )
+    return None
+
+
 @cli.command("verify")
 @click.argument("files", nargs=-1)
+@click.option(
+    "--changed",
+    is_flag=True,
+    help="Verify the complete changed-file scope (also the default when no files are supplied).",
+)
 @click.option(
     "--new-only",
     is_flag=True,
@@ -2370,12 +3136,11 @@ def _format_verify_failure(**failure: object) -> str:
 )
 @click.option(
     "--threshold",
-    type=int,
-    default=70,
-    show_default=True,
-    help="Fail below this score (default 70, or .roam/verify.yaml; diff-only keeps its own score scale).",
+    type=click.IntRange(0, 100),
+    default=None,
+    help="Fail below this score (otherwise use .roam/verify.yaml or Roam's default).",
 )
-def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: int) -> None:
+def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bool, threshold: int | None) -> None:
     """Run scoped verify on changed files; on failure, explain the next local action.
 
     Delegates to `roam verify` (naming, imports, error handling, duplicates,
@@ -2385,6 +3150,8 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     is followed by a block naming the failing command, changed files, likely
     cause category, and the single local rerun to run next.
     """
+    if changed and files:
+        raise click.UsageError("--changed cannot be combined with explicit file arguments")
     roam_info = _inspect_roam()
     roam_problem = _roam_problem(roam_info)
     if roam_problem is not None:
@@ -2402,29 +3169,27 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
         click.echo(advisory)
     try:
         root, bound_targets, expected_receipt, verify_env = _prepare_verify_request(files)
-    except ValueError:
+    except (UnicodeError, ValueError) as exc:
         click.echo(
-            f"VERDICT: verifier protocol failure — the exact Verify scope could not be bound. "
-            f'Fix: python -m pip install --upgrade "roam-code>={MIN_ROAM_VERSION}"'
+            _unsafe_scope_verdict(exc)
+            or (
+                f"VERDICT: verifier protocol failure — the exact Verify scope could not be bound. "
+                f'Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
+            )
         )
         raise SystemExit(EXIT_TOOLCHAIN)
 
     argv = ["--json", "verify"]
-    command = ["compile", "verify"]
     if new_only:
         argv.append("--new-only")
-        command.append("--new-only")
     if diff_only:
         argv.append("--diff-only")
-        command.append("--diff-only")
-    argv.extend(["--threshold", str(threshold)])
-    if threshold != 70:
-        command.extend(["--threshold", str(threshold)])
+    if threshold is not None:
+        argv.extend(["--threshold", str(threshold)])
     if bound_targets:
         argv.extend(["--", *bound_targets])
     else:
         argv.append("--changed")
-    command.extend(targets or ["--changed"])
     rc, output = _delegate_capturing(*argv, executable=executable, env=verify_env)
     if output is None:
         raise SystemExit(rc)
@@ -2435,17 +3200,22 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
             expected_receipt=expected_receipt,
             expected_roam_version=str(roam_info["version"]),
             expected_threshold=threshold,
+            expected_root=root,
         )
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
-        post_raw_targets = [path.replace("\\", "/") for path in files] if files else _discover_verify_targets(root)
-        post_targets = _verification_scope_paths(_expand_verify_targets(post_raw_targets, root))
+        post_raw_targets = list(files) if files else _discover_verify_targets(root)
+        post_requested_targets = _verification_scope_paths(post_raw_targets)
+        post_targets = _verification_scope_paths(_expand_verify_targets(post_requested_targets, root))
         if post_targets != bound_targets:
             raise ValueError("post_verify_scope_changed")
-    except ValueError:
+    except (UnicodeError, ValueError) as exc:
         click.echo(
-            f"VERDICT: verifier protocol failure — `{executable}` did not return one complete, bound Verify "
-            f'receipt v3. Fix: python -m pip install --upgrade "roam-code>={MIN_ROAM_VERSION}"'
+            _unsafe_scope_verdict(exc)
+            or (
+                f"VERDICT: verifier protocol failure — `{executable}` did not return one complete, bound Verify "
+                f'receipt v3. Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
+            )
         )
         raise SystemExit(EXIT_TOOLCHAIN)
     rendered = _render_verify_envelope(envelope)
@@ -2456,20 +3226,22 @@ def _verify(files: tuple[str, ...], new_only: bool, diff_only: bool, threshold: 
     # exit 2 ("bad arguments"), which only the sentinel can distinguish from
     # this CLI's EXIT_TOOLCHAIN (also 2).
     if rc != 0:
-        failing = _failing_files(rendered)
+        failing = _failing_files(envelope)
         scoped = failing or targets or bound_targets
-        next_tokens = ["compile", "verify"]
-        if new_only:
-            next_tokens.append("--new-only")
-        if diff_only:
-            next_tokens.append("--diff-only")
-        next_tokens.extend(failing or targets or ["--changed"])
         click.echo(
             _format_verify_failure(
-                command=" ".join(command),
+                command=_render_verify_command(
+                    new_only=new_only,
+                    diff_only=diff_only,
+                    threshold=threshold,
+                ),
                 files=scoped,
                 cause=_classify_verify_failure(rendered, rc),
-                next_action=" ".join(next_tokens),
+                next_action=_render_verify_command(
+                    new_only=new_only,
+                    diff_only=diff_only,
+                    threshold=threshold,
+                ),
             )
         )
     raise SystemExit(rc)
@@ -2504,7 +3276,7 @@ def _doctor() -> None:
     toolchain_label = "ok" if toolchain_ok else "MISSING" if state == "missing" else "INCOMPATIBLE"
     click.echo(f"toolchain : {toolchain_label}")
     click.echo(f"roam path : {roam_info.get('path') or 'not found'}")
-    click.echo(f"roam version: {roam_info.get('version') or 'unknown'} (required >={MIN_ROAM_VERSION})")
+    click.echo(f"roam version: {roam_info.get('version') or 'unknown'} (required {ROAM_VERSION_REQUIREMENT})")
     click.echo(f"python metadata: roam-code {roam_info.get('metadata_version') or 'not installed'}")
     click.echo(f"index     : {'ok' if indexed else 'absent (run `compile init`)'}")
     click.echo(f"claude    : {wired_label}")

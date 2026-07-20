@@ -1,0 +1,73 @@
+{
+  "schema": "compile-code.release-tool-artifacts.v1",
+  "distribution": "zizmor",
+  "version": "1.27.0",
+  "lock_stanza_sha256": "12d59686b33400defcea1970cb2b8a876d88aba0c556e5c2b14762a60b4f7480",
+  "artifacts": [
+    {
+      "filename": "zizmor-1.27.0-py3-none-macosx_10_12_x86_64.whl",
+      "archive_sha256": "0de272b6c19910f5bc6965ac7d4566af26db31571e983e3b567298389d0c84c7",
+      "executable_sha256": "f400befd27ee0f726b63934a1b6cf9270dcccec14d548e69fa017e20b5937e3e",
+      "executable_size": 23406672
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-macosx_11_0_arm64.whl",
+      "archive_sha256": "cc94158472428e04298b879ef36cb94360b753ece38fa2303464dd7dae07bc68",
+      "executable_sha256": "3d629e03c31106540e63d519a94f9e8d8372bfae6691a598980a2423d51da2fe",
+      "executable_size": 21479024
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-manylinux_2_24_aarch64.whl",
+      "archive_sha256": "b70697ebe555a28fbd3deaa259936f059f64b9f8531020f5b1f3d99087d4f62a",
+      "executable_sha256": "b086d5a9a188b5d7a03163e6fef9f4c038b5c5b506eb14f3bce5ad39d51e780a",
+      "executable_size": 23952728
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-manylinux_2_28_armv7l.whl",
+      "archive_sha256": "0bba3eff43f919b04b9b6365b4ef17437649e11eafb73f603407873b65ad01dd",
+      "executable_sha256": "9040eccb969aa135f097fe918466d4bb3ab036bfb2619a3887aa93422381a8d4",
+      "executable_size": 21904472
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-manylinux_2_28_x86_64.whl",
+      "archive_sha256": "afb28123882d2b8248f1e480bf6cc6d1af102e0d3fbe22a40f7f795b1aa9d435",
+      "executable_sha256": "a83f0ab8afa106c4c973de6483c660aaad3cdd9bb2fc0776da0ff72f713ee08a",
+      "executable_size": 25817592
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-musllinux_1_2_aarch64.whl",
+      "archive_sha256": "e1042dd14fb4597a1e3007c7ef3f5a017305ca50cfacf43d603f3ae870c65eb1",
+      "executable_sha256": "d88e6c7572e800ab9a136e8dac6d2cbfdcc5eaba5091812d712da4f52db88ceb",
+      "executable_size": 23528920
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-musllinux_1_2_armv7l.whl",
+      "archive_sha256": "138e65d560e3875dbbbec50eae56a9e14707f8f4e006112174e4752155c01db9",
+      "executable_sha256": "83d387a80da690eed7faea56bbb43d41500e923d1a932a35ce96f80f2ba63b01",
+      "executable_size": 21971860
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-musllinux_1_2_x86_64.whl",
+      "archive_sha256": "90004342c3c5122d7e4e8e27ac6d3c462b878da0ea3d408ff45fa7d768139a76",
+      "executable_sha256": "067b5310c470b67cbe3bab610fbb86fb62f76000ead7fe5037abcb719861724c",
+      "executable_size": 25898736
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-win32.whl",
+      "archive_sha256": "fe8947f635c925b83ef83fcd66de5f89a012b22784bb86fcd7e2a1f4e7648c9d",
+      "executable_sha256": "3a86a6cde7ca7fbb096a9f7f29fce73bd35e4d22018595c71f16d24db24944c0",
+      "executable_size": 18616832
+    },
+    {
+      "filename": "zizmor-1.27.0-py3-none-win_amd64.whl",
+      "archive_sha256": "debc723721172c170d5922171a40eaebf5787a02ff3e69d30597dafdb66a21ba",
+      "executable_sha256": "93fdad7a072eecccfb328f97476074c0dca94bb077296a6033c3783bc218b6fa",
+      "executable_size": 23491584
+    },
+    {
+      "filename": "zizmor-1.27.0.tar.gz",
+      "archive_sha256": "ffaf8e1bb39447e643592d669761bfbc2aa636875db9079614f6a6c81cec60c8",
+      "source_only": true
+    }
+  ]
+}

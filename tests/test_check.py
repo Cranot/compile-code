@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -75,6 +78,218 @@ def test_gate_reports_a_missing_executable_without_traceback(monkeypatch, capsys
     output = capsys.readouterr().out
     assert "[check] required tool: FAIL" in output
     assert "required executable not found" in output
+
+
+def test_console_safe_escapes_characters_outside_the_active_encoding(monkeypatch):
+    class NarrowStdout:
+        encoding = "ascii"
+
+    monkeypatch.setattr(check.sys, "stdout", NarrowStdout())
+
+    assert check._console_safe("failure: \ufffd") == r"failure: \ufffd"
+
+
+class _RecordHash:
+    mode = "sha256"
+
+    def __init__(self, payload: bytes):
+        self.value = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode("ascii")
+
+
+class _Record:
+    def __init__(self, name: str, payload: bytes):
+        self.name = name
+        self.hash = _RecordHash(payload)
+        self.size = len(payload)
+
+
+class _Distribution:
+    version = check.ZIZMOR_VERSION
+
+    def __init__(self, path: pathlib.Path, record: _Record):
+        self.path = path
+        self.files = [record]
+
+    def locate_file(self, record: _Record) -> pathlib.Path:
+        return self.path
+
+
+def _install_fake_zizmor(monkeypatch, tmp_path, payload=b"reviewed-zizmor"):
+    executable_name = "zizmor.exe" if sys.platform == "win32" else "zizmor"
+    executable = tmp_path / executable_name
+    executable.write_bytes(payload)
+    record = _Record(executable_name, payload)
+    distribution = _Distribution(executable, record)
+    monkeypatch.setattr(check.importlib_metadata, "distribution", lambda name: distribution)
+    monkeypatch.setattr(check.sysconfig, "get_path", lambda name: os.fspath(tmp_path))
+    monkeypatch.setattr(check, "_zizmor_version", lambda path: f"zizmor {check.ZIZMOR_VERSION}")
+    trusted_identity = (hashlib.sha256(payload).hexdigest(), len(payload))
+    monkeypatch.setattr(check, "_trusted_zizmor_executables", lambda: frozenset({trusted_identity}))
+    return executable, record, distribution
+
+
+def test_zizmor_identity_binds_scripts_path_record_hash_size_and_version(monkeypatch, tmp_path):
+    executable, _, _ = _install_fake_zizmor(monkeypatch, tmp_path)
+
+    assert check._verified_zizmor_path() == executable
+
+
+def test_zizmor_identity_rejects_version_path_and_content_drift(monkeypatch, tmp_path):
+    executable, record, distribution = _install_fake_zizmor(monkeypatch, tmp_path)
+
+    distribution.version = "1.26.1"
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "version drift" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("a drifted zizmor distribution version was accepted")
+
+    distribution.version = check.ZIZMOR_VERSION
+    monkeypatch.setattr(check.sysconfig, "get_path", lambda name: os.fspath(tmp_path / "other"))
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "exactly one" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("a zizmor executable outside the interpreter scripts directory was accepted")
+
+    monkeypatch.setattr(check.sysconfig, "get_path", lambda name: os.fspath(tmp_path))
+    executable.write_bytes(b"tampered-zizmor")
+    record.size = len(b"tampered-zizmor")
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "SHA-256" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("a zizmor executable with a drifted digest was accepted")
+
+
+def test_zizmor_identity_rejects_hardlinks_and_malformed_record_size(monkeypatch, tmp_path):
+    executable, record, _ = _install_fake_zizmor(monkeypatch, tmp_path)
+    os.link(executable, tmp_path / "zizmor-hardlink")
+
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "hard link" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("a multiply linked zizmor executable was accepted")
+
+    (tmp_path / "zizmor-hardlink").unlink()
+    record.size = "not-an-integer"
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "size is malformed" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("a malformed zizmor RECORD size escaped the gate")
+
+
+def test_zizmor_identity_rejects_paired_executable_and_record_tampering(monkeypatch, tmp_path):
+    executable, record, _ = _install_fake_zizmor(monkeypatch, tmp_path)
+    tampered = b"paired-tampered-zizmor"
+    executable.write_bytes(tampered)
+    record.hash = _RecordHash(tampered)
+    record.size = len(tampered)
+
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "lock-derived artifact trust set" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("paired executable and mutable RECORD tampering escaped the gate")
+
+
+def test_zizmor_lock_extraction_keeps_exact_reviewed_hashes():
+    requirement = check._locked_zizmor_requirement()
+
+    assert requirement.startswith(f"zizmor=={check.ZIZMOR_VERSION} \\")
+    assert len(check.re.findall(r"--hash=sha256:[0-9a-f]{64}", requirement)) == check.ZIZMOR_LOCK_ARTIFACT_HASH_COUNT
+    assert hashlib.sha256(requirement.encode("utf-8")).hexdigest() == check.ZIZMOR_LOCK_STANZA_SHA256
+    assert check._lock_problems("zizmor", requirement) == []
+
+
+def test_zizmor_artifact_trust_manifest_covers_every_locked_artifact():
+    identities = check._trusted_zizmor_executables()
+
+    assert len(identities) == check.ZIZMOR_BINARY_WHEEL_COUNT
+    assert ("93fdad7a072eecccfb328f97476074c0dca94bb077296a6033c3783bc218b6fa", 23491584) in identities
+
+
+def test_zizmor_artifact_trust_manifest_rejects_semantic_tampering(monkeypatch, tmp_path):
+    tampered = tmp_path / "zizmor-artifact-trust.json"
+    payload = check.ZIZMOR_TRUST_MANIFEST.read_bytes().replace(b'"version": "1.27.0"', b'"version": "1.26.0"')
+    tampered.write_bytes(payload)
+    monkeypatch.setattr(check, "ZIZMOR_TRUST_MANIFEST", tampered)
+
+    try:
+        check._trusted_zizmor_executables()
+    except check.ToolIdentityError as exc:
+        assert "reviewed semantic digest" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("semantic trust-manifest tampering escaped the gate")
+
+
+def test_explicit_zizmor_bootstrap_uses_hashes_wheels_and_no_dependencies(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(title, command, *, env=None):
+        captured["title"] = title
+        captured["command"] = command
+        captured["environment"] = env
+        requirement = pathlib.Path(command[-1]).read_text(encoding="utf-8")
+        assert requirement == check._locked_zizmor_requirement()
+        return True
+
+    executable = tmp_path / ("zizmor.exe" if sys.platform == "win32" else "zizmor")
+    monkeypatch.setattr(check, "run", fake_run)
+    monkeypatch.setattr(check, "_verified_zizmor_path", lambda: executable)
+
+    assert check.bootstrap_zizmor()
+    assert captured["command"][:5] == [sys.executable, "-m", "pip", "--isolated", "install"]
+    for argument in (
+        "--no-cache-dir",
+        "--no-compile",
+        "--no-deps",
+        "--require-hashes",
+        "--only-binary=:all:",
+        "--force-reinstall",
+    ):
+        assert argument in captured["command"]
+    assert captured["environment"]["PIP_CONFIG_FILE"] == os.devnull
+
+
+def test_missing_zizmor_fails_both_mandatory_audits(monkeypatch, capsys):
+    def missing():
+        raise check.ToolIdentityError("missing")
+
+    monkeypatch.setattr(check, "_verified_zizmor_path", missing)
+
+    assert check.zizmor_gates() == [False, False, False]
+    output = capsys.readouterr().out
+    assert "zizmor identity: FAIL" in output
+    assert "zizmor auditor medium+ (ignores disabled): FAIL" in output
+    assert "zizmor --pedantic: FAIL" in output
+    assert check.ZIZMOR_BOOTSTRAP_ARGUMENT in output
+
+
+def test_zizmor_resolution_never_falls_back_to_path(monkeypatch, tmp_path):
+    fake = tmp_path / ("zizmor.exe" if sys.platform == "win32" else "zizmor")
+    fake.write_bytes(b"path-zizmor")
+    monkeypatch.setenv("PATH", os.fspath(tmp_path))
+
+    def missing(name):
+        raise check.importlib_metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(check.importlib_metadata, "distribution", missing)
+
+    try:
+        check._verified_zizmor_path()
+    except check.ToolIdentityError as exc:
+        assert "is not installed" in str(exc)
+    else:  # pragma: no cover - fail with a focused message
+        raise AssertionError("an unreviewed PATH zizmor was accepted")
 
 
 def test_source_test_environment_binds_pytest_to_this_checkout(monkeypatch):

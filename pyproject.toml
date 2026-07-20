@@ -25,8 +25,8 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
-    # >=13.10.0: complete-evidence Verify + default-on mode enforcement contract.
-    "roam-code>=13.10.0",
+    # >=13.10.0,<14: tested receipt-v3 Verify + default-on mode-enforcement contract.
+    "roam-code<14,>=13.10.0",
     "click>=8.0",
 ]
 

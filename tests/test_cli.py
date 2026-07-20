@@ -8,9 +8,16 @@ subprocess work, so they run anywhere.
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -291,18 +298,25 @@ class TestSurface:
         res = runner.invoke(mod.cli, ["baseline", "--help"])
         assert "Snapshot accepted debt" in res.output
 
-    def test_verify_help_includes_new_only_and_diff_only(self, runner):
+    def test_verify_help_includes_scope_and_filter_options(self, runner):
         res = runner.invoke(mod.cli, ["verify", "--help"])
+        assert "--changed" in res.output
         assert "--new-only" in res.output
         assert "--diff-only" in res.output
 
 
 class TestDependencyFloor:
-    def test_runtime_metadata_and_docs_share_the_13_9_floor(self):
+    def test_runtime_and_package_metadata_share_the_closed_compatibility_interval(self):
         assert mod.MIN_ROAM_VERSION == "13.10.0"
+        assert mod.MAX_ROAM_MAJOR_EXCLUSIVE == 14
+        assert mod.ROAM_VERSION_REQUIREMENT == ">=13.10.0,<14"
+        assert mod.ROAM_PACKAGE_REQUIREMENT == "roam-code>=13.10.0,<14"
         floor = mod.MIN_ROAM_VERSION
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        assert f'"roam-code>={floor}"' in pyproject
+        assert f'"roam-code<14,>={floor}"' in pyproject
+        package_spec = re.search(r'"roam-code([^"\r\n]+)"', pyproject)
+        assert package_spec is not None
+        assert set(package_spec.group(1).split(",")) == set(mod.ROAM_VERSION_REQUIREMENT.split(","))
         for name in ("README.md", "AGENTS.md"):
             contents = (ROOT / name).read_text(encoding="utf-8")
             assert re.search(rf"roam-code[^\n]{{0,80}}>=\s*{re.escape(floor)}", contents)
@@ -317,11 +331,19 @@ class TestRoamVersionEnforcement:
             ("13.10.0", True),
             ("13.10.0.post1", True),
             ("13.10.0dev1", False),
+            ("13.99.0", True),
+            ("13.99.0rc1", False),
+            ("14.0.0rc1", False),
+            ("14.0.0", False),
+            ("99.0.0", False),
             ("not-a-version", False),
         ],
     )
     def test_minimum_comparison(self, raw, compatible):
         assert mod._version_meets_minimum(raw) is compatible
+
+    def test_pathological_numeric_version_is_rejected_without_integer_failure(self):
+        assert mod._version_meets_minimum("9" * 5000 + ".0.0") is False
 
     def test_inspection_runs_the_exact_path_and_keeps_metadata_separate(self, monkeypatch):
         chosen = r"C:\Tools\roam.exe"
@@ -330,8 +352,8 @@ class TestRoamVersionEnforcement:
 
         class _P:
             returncode = 0
-            stdout = "roam.EXE, version 13.10.2\n"
-            stderr = ""
+            stdout = b"roam.EXE, version 13.10.2\n"
+            stderr = b""
 
         def fake_run(argv, **kwargs):
             captured["argv"] = argv
@@ -340,7 +362,7 @@ class TestRoamVersionEnforcement:
 
         monkeypatch.setattr(mod, "_resolve_roam_executable", lambda: chosen)
         monkeypatch.setattr(mod, "_python_roam_metadata_version", lambda: "99.0.0")
-        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(mod, "_run_bounded_capture", fake_run)
 
         info = mod._inspect_roam()
 
@@ -350,6 +372,8 @@ class TestRoamVersionEnforcement:
         assert info["metadata_version"] == "99.0.0"
         assert "PYTHONPATH" not in captured["kwargs"]["env"]
         assert captured["kwargs"]["env"]["PYTHONSAFEPATH"] == "1"
+        assert captured["kwargs"]["stdout_limit"] == mod.MAX_ROAM_VERSION_BYTES
+        assert captured["kwargs"]["stderr_limit"] == mod.MAX_ROAM_VERSION_BYTES
 
     @pytest.mark.parametrize(
         "output",
@@ -402,6 +426,22 @@ class TestRoamVersionEnforcement:
         assert "reports 13.9.9" in res.output
         assert "Python metadata reports roam-code 13.10.4" in res.output
 
+    def test_verify_blocks_unsupported_future_major_before_receipt_execution(self, runner, monkeypatch):
+        path = r"C:\future-bin\roam.exe"
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(path=path, executable_version="14.0.0", metadata_version="14.0.0"),
+        )
+        monkeypatch.setattr(mod, "_roam_capture", lambda *args, **kwargs: pytest.fail("Verify must not run"))
+
+        result = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "toolchain version mismatch" in result.output
+        assert "requires >=13.10.0,<14" in result.output
+        assert 'pip install --upgrade "roam-code>=13.10.0,<14"' in result.output
+
     def test_doctor_reports_path_version_and_metadata_separately(self, runner, monkeypatch, tmp_path):
         path = r"C:\old-bin\roam.exe"
         monkeypatch.chdir(tmp_path)
@@ -417,7 +457,7 @@ class TestRoamVersionEnforcement:
         assert res.exit_code == mod.EXIT_TOOLCHAIN
         assert "toolchain : INCOMPATIBLE" in res.output
         assert f"roam path : {path}" in res.output
-        assert "roam version: 13.9.9 (required >=13.10.0)" in res.output
+        assert "roam version: 13.9.9 (required >=13.10.0,<14)" in res.output
         assert "python metadata: roam-code 13.10.4" in res.output
 
 
@@ -752,6 +792,52 @@ class TestFailurePaths:
         assert "VERDICT: empty task" in res.output
 
 
+class TestBoundedVerifyCapture:
+    def test_every_verify_subprocess_boundary_uses_the_bounded_runner(self):
+        boundaries = (
+            mod._inspect_roam,
+            mod._attest_claude_hooks,
+            mod._discover_verify_targets,
+            mod._roam_capture,
+        )
+        for boundary in boundaries:
+            source = inspect.getsource(boundary)
+            assert "_run_bounded_capture(" in source
+            assert "subprocess.run(" not in source
+
+    def test_drains_noisy_stdout_and_stderr_concurrently_with_bounded_retention(self, monkeypatch):
+        monkeypatch.setattr(mod, "MAX_VERIFY_JSON_BYTES", 4096)
+        monkeypatch.setattr(mod, "MAX_VERIFY_STDERR_BYTES", 2048)
+        monkeypatch.setattr(mod, "_VERIFY_CAPTURE_CHUNK_BYTES", 512)
+        script = (
+            "import os\nchunk = b'x' * 4096\nfor _ in range(256):\n    os.write(1, chunk)\n    os.write(2, chunk)\n"
+        )
+
+        proc = mod._roam_capture("-c", script, timeout=15, executable=sys.executable, env=mod.os.environ.copy())
+
+        assert proc.returncode == 0
+        assert len(proc.stdout.encode("utf-8")) == mod.MAX_VERIFY_JSON_BYTES + 1
+        assert len(proc.stderr.encode("utf-8")) == mod.MAX_VERIFY_STDERR_BYTES + 1
+        with pytest.raises(ValueError, match="invalid_json_bytes"):
+            mod._strict_json_document(proc.stdout, max_bytes=mod.MAX_VERIFY_JSON_BYTES)
+
+    def test_timeout_kills_real_grandchild_that_retains_both_pipes(self):
+        script = (
+            "import subprocess, sys\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(10)'],\n"
+            "    stdout=sys.stdout, stderr=sys.stderr,\n"
+            ")\n"
+        )
+        started = mod.time.monotonic()
+
+        with pytest.raises(mod.subprocess.TimeoutExpired):
+            mod._roam_capture("-c", script, timeout=0.25, executable=sys.executable, env=mod.os.environ.copy())
+
+        assert mod.time.monotonic() - started < 2
+        assert not any(thread.name.startswith("compile-boundary-") for thread in mod.threading.enumerate())
+
+
 @pytest.mark.usefixtures("compatible_roam")
 class TestVerifyToolchainFailureIsNotAVerifyFailure:
     """`compile verify` must not stack its failure block on a toolchain that
@@ -810,6 +896,21 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
         assert res.exit_code == mod.EXIT_TOOLCHAIN
         assert "kernel exploded" not in res.output + res.stderr
         assert res.output.count("VERDICT:") == 1
+
+    def test_deeply_nested_json_is_a_protocol_verdict_not_a_traceback(self, runner, monkeypatch):
+        class _P:
+            returncode = 0
+            stdout = "[" * 2000 + "0" + "]" * 2000
+            stderr = ""
+
+        monkeypatch.setattr(mod, "_roam_capture", lambda *args, **kwargs: _P())
+
+        res = runner.invoke(mod.cli, ["verify", "x.py"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "VERDICT: verifier protocol failure" in res.output
+        assert "Traceback" not in res.output + res.stderr
+        assert "RecursionError" not in res.output + res.stderr
 
 
 class TestLaunchAgentFailurePaths:
@@ -1062,9 +1163,10 @@ class TestVerifyFailureFormatting:
     def _stable_changed_scope(self, monkeypatch):
         monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: ["changed.py"])
 
-    def _capture(self, output, rc):
+    def _capture(self, output, rc, *, effective_threshold=70, findings=None):
         """Stub _roam_capture to return a CompletedProcess-shaped object."""
         captured = {}
+        provided_findings = findings
 
         class _P:
             def __init__(self, args, stdout):
@@ -1081,8 +1183,11 @@ class TestVerifyFailureFormatting:
             match = re.match(r"VERDICT:\s+(PASS|WARN|FAIL)\s+\(score\s+(\d+)/100\)", output)
             if match and output.count("VERDICT:") == 1:
                 verdict, score_raw = match.groups()
-                threshold_index = list(args).index("--threshold") + 1
-                threshold = int(args[threshold_index])
+                if "--threshold" in args:
+                    threshold_index = list(args).index("--threshold") + 1
+                    threshold = int(args[threshold_index])
+                else:
+                    threshold = effective_threshold
                 receipt = {
                     "schema": mod.VERIFY_RECEIPT_SCHEMA,
                     "request_nonce": env["ROAM_VERIFY_REQUEST_NONCE"],
@@ -1094,9 +1199,9 @@ class TestVerifyFailureFormatting:
                     "scope_stable": True,
                     "request_match": True,
                 }
-                findings = []
-                if "src/bad.py:12" in output:
-                    findings = [
+                result_findings = list(provided_findings or [])
+                if provided_findings is None and "src/bad.py:12" in output:
+                    result_findings = [
                         {
                             "severity": "FAIL",
                             "category": "naming",
@@ -1117,9 +1222,9 @@ class TestVerifyFailureFormatting:
                     score=int(score_raw),
                     threshold=threshold,
                     receipt=receipt,
-                    violations=findings,
+                    violations=result_findings,
                 )
-                for finding in findings:
+                for finding in result_findings:
                     category = finding["category"]
                     envelope["categories"].setdefault(
                         category,
@@ -1134,7 +1239,15 @@ class TestVerifyFailureFormatting:
         return fake, captured
 
     def test_failing_files_dedupes_in_order(self):
-        assert mod._failing_files(self.FAIL_OUTPUT) == ["src/bad.py"]
+        envelope = {
+            "violations": [
+                {"severity": "WARN", "file": "warn.py"},
+                {"severity": "FAIL", "file": " leading.py"},
+                {"severity": "FAIL", "file": "src/bad.py"},
+                {"severity": "FAIL", "file": " leading.py"},
+            ]
+        }
+        assert mod._failing_files(envelope) == [" leading.py", "src/bad.py"]
 
     def test_status_parser_covers_staged_unstaged_untracked_rename_and_deletion(self):
         raw = "M  staged.py\0 M unstaged.py\0?? untracked.py\0R  renamed.py\0old.py\0D  deleted.py\0"
@@ -1196,9 +1309,8 @@ class TestVerifyFailureFormatting:
         assert "command : compile verify --changed" in res.output
         assert "files   : src/bad.py" in res.output
         assert "cause   : naming violation + syntax error" in res.output
-        assert "next    : compile verify src/bad.py" in res.output
-        assert captured["args"][:4] == ["--json", "verify", "--threshold", "70"]
-        assert captured["args"][4] == "--"
+        assert "next    : compile verify --changed" in res.output
+        assert captured["args"][:3] == ["--json", "verify", "--"]
         assert captured["executable"] == compatible_roam["path"]
 
     def test_verify_pass_streams_roam_output_without_block(self, runner, monkeypatch):
@@ -1269,7 +1381,112 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify", "--threshold", "90", "src/bad.py"])
         assert res.exit_code == 5
         assert captured["args"] == ["--json", "verify", "--threshold", "90", "--", "src/bad.py"]
-        assert "command : compile verify --threshold 90 src/bad.py" in res.output
+        assert "command : compile verify --threshold 90 --changed" in res.output
+        assert "next    : compile verify --threshold 90 --changed" in res.output
+
+    def test_verify_omits_threshold_so_repository_policy_governs(self, runner, monkeypatch):
+        fake, captured = self._capture(
+            "VERDICT: PASS (score 100/100) -- no issues\n",
+            0,
+            effective_threshold=83,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert res.exit_code == 0
+        assert captured["args"] == ["--json", "verify", "--", "src/cli.py"]
+        assert "VERDICT: PASS" in res.output
+
+    @pytest.mark.parametrize("threshold", ["-1", "101"])
+    def test_verify_rejects_threshold_outside_closed_score_range(self, threshold, runner, monkeypatch):
+        monkeypatch.setattr(mod, "_inspect_roam", lambda timeout=10: pytest.fail("must reject before delegation"))
+
+        res = runner.invoke(mod.cli, ["verify", "--threshold", threshold, "src/cli.py"])
+
+        assert res.exit_code == 2
+        assert "Invalid value for '--threshold'" in res.output
+
+    def test_recovery_command_is_content_free_and_shell_neutral(self):
+        command = mod._render_verify_command(
+            new_only=True,
+            diff_only=True,
+            threshold=90,
+        )
+
+        assert command == "compile verify --new-only --diff-only --threshold 90 --changed"
+        assert command.split(" ", 1)[0] == "compile"
+        assert not any(character in command for character in "'\";&|<>()`$\n\r")
+
+    def test_changed_recovery_mode_is_executable_and_rejects_mixed_scope(self, runner, monkeypatch):
+        fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        changed = runner.invoke(mod.cli, ["verify", "--threshold", "90", "--changed"])
+        mixed = runner.invoke(mod.cli, ["verify", "--changed", "src/a.py"])
+
+        assert changed.exit_code == 0
+        assert captured["args"][:4] == ["--json", "verify", "--threshold", "90"]
+        assert mixed.exit_code == 2
+        assert "cannot be combined" in mixed.output
+
+    def test_failure_commands_quote_adversarial_paths_and_preserve_threshold(self, runner, monkeypatch):
+        malicious_path = "src/a.py; Write-Output AUDIT_CANARY"
+        findings = [
+            {
+                "severity": "FAIL",
+                "category": "syntax",
+                "file": malicious_path,
+                "line": 1,
+                "message": "syntax error",
+            }
+        ]
+        fake, captured = self._capture(
+            "VERDICT: FAIL (score 60/100) -- one issue\n",
+            5,
+            findings=findings,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(
+            mod.cli,
+            ["verify", "--threshold", "90", "--", malicious_path, "src/a & b.py", "-leading.py"],
+        )
+
+        assert res.exit_code == 5
+        assert captured["args"] == [
+            "--json",
+            "verify",
+            "--threshold",
+            "90",
+            "--",
+            "-leading.py",
+            "src/a & b.py",
+            malicious_path,
+        ]
+        command_lines = [line for line in res.output.splitlines() if "command :" in line or "next    :" in line]
+        assert command_lines == [
+            "  command : compile verify --threshold 90 --changed",
+            "  next    : compile verify --threshold 90 --changed",
+        ]
+        assert all("AUDIT_CANARY" not in line and "&" not in line and ";" not in line for line in command_lines)
+
+    @pytest.mark.skipif(mod.os.name != "nt", reason="Windows shell regression")
+    def test_content_free_recovery_is_inert_in_cmd_and_powershell(self, tmp_path):
+        (tmp_path / "compile.cmd").write_text("@echo off\r\necho %*\r\n", encoding="utf-8")
+        env = mod.os.environ.copy()
+        env["PATH"] = str(tmp_path) + mod.os.pathsep + env.get("PATH", "")
+        command = mod._render_verify_command(new_only=False, diff_only=False, threshold=90)
+        invocations = [[env.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command]]
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        if powershell:
+            invocations.append([powershell, "-NoProfile", "-NonInteractive", "-Command", command])
+
+        for argv in invocations:
+            completed = subprocess.run(argv, env=env, check=False, capture_output=True, text=True, timeout=10)
+            assert completed.returncode == 0
+            assert "verify --threshold 90 --changed" in completed.stdout
+            assert "AUDIT_CANARY" not in completed.stdout + completed.stderr
 
     def test_verify_new_only_and_diff_only_pass_through(self, runner, monkeypatch):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -1281,21 +1498,18 @@ class TestVerifyFailureFormatting:
             "verify",
             "--new-only",
             "--diff-only",
-            "--threshold",
-            "70",
             "--",
             "src/bad.py",
         ]
-        assert "command : compile verify --new-only --diff-only src/bad.py" in res.output
-        assert "next    : compile verify --new-only --diff-only src/bad.py" in res.output
+        assert "command : compile verify --new-only --diff-only --changed" in res.output
+        assert "next    : compile verify --new-only --diff-only --changed" in res.output
 
     def test_verify_no_argument_binds_discovered_scope_before_delegation(self, runner, monkeypatch):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 0
-        assert captured["args"][:4] == ["--json", "verify", "--threshold", "70"]
-        assert captured["args"][4] in {"--", "--changed"}
+        assert captured["args"][:3] in (["--json", "verify", "--"], ["--json", "verify", "--changed"])
         assert captured["env"]["ROAM_VERIFY_SCOPE_COUNT"].isdigit()
 
     def test_no_argument_failure_uses_bound_scope_for_human_context(self, runner, monkeypatch):
@@ -1304,7 +1518,7 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify"])
 
         assert res.exit_code == 5
-        assert captured["args"][:4] == ["--json", "verify", "--threshold", "70"]
+        assert captured["args"][:3] == ["--json", "verify", "--"]
         assert "files   : " in res.output
         assert "next    : compile verify --changed" in res.output
 
@@ -1318,15 +1532,13 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == [
             "--json",
             "verify",
-            "--threshold",
-            "70",
             "--",
             "src/bad.py",
             "src/good.py",
         ]
-        assert "command : compile verify src/good.py src/bad.py" in res.output
+        assert "command : compile verify --changed" in res.output
         assert "files   : src/bad.py" in res.output
-        assert "next    : compile verify src/bad.py" in res.output
+        assert "next    : compile verify --changed" in res.output
 
     def test_oversized_advisory_does_not_change_delegation(self, runner, monkeypatch):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -1335,7 +1547,7 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify", *files])
         assert res.exit_code == 5
         assert "scope down" in res.output
-        assert captured["args"] == ["--json", "verify", "--threshold", "70", "--", *sorted(files)]
+        assert captured["args"] == ["--json", "verify", "--", *sorted(files)]
 
     def test_no_advisory_for_small_explicit_list(self, runner, monkeypatch):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
@@ -1412,13 +1624,21 @@ class TestCommandInventory:
 
 
 class TestVerifyReceiptV3Protocol:
-    def _validate(self, raw: str, *, rc: int = 0, expected: dict[str, object] | None = None):
+    def _validate(
+        self,
+        raw: str,
+        *,
+        rc: int = 0,
+        expected: dict[str, object] | None = None,
+        root: Path | None = None,
+    ):
         return mod._validate_verify_protocol(
             raw,
             returncode=rc,
             expected_receipt=expected or _bound_verify_receipt(),
             expected_roam_version=mod.MIN_ROAM_VERSION,
             expected_threshold=70,
+            expected_root=root,
         )
 
     def test_accepts_one_complete_bound_receipt(self):
@@ -1610,15 +1830,92 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError):
             self._validate(raw)
 
+    @pytest.mark.parametrize("raw", ["1e999", "-1e999", '{"value": 1e999}'])
+    def test_strict_json_rejects_exponent_overflow(self, raw):
+        with pytest.raises(ValueError, match="non_finite_json_number"):
+            mod._strict_json_document(raw, max_bytes=mod.MAX_VERIFY_JSON_BYTES)
+
     def test_rejects_oversized_output_before_parsing(self):
         raw = " " * (mod.MAX_VERIFY_JSON_BYTES + 1)
         with pytest.raises(ValueError):
             self._validate(raw)
 
+    def test_rejects_deeply_nested_under_size_output_without_recursion_error(self):
+        depth = 2000
+        raw = "[" * depth + "0" + "]" * depth
+        assert len(raw.encode("utf-8")) < mod.MAX_VERIFY_JSON_BYTES
+
+        with pytest.raises(ValueError, match="json_nesting_limit"):
+            self._validate(raw)
+
+    def test_nesting_guard_ignores_brackets_inside_json_strings(self):
+        raw = json.dumps({"value": "[{" * (mod.MAX_STRICT_JSON_DEPTH + 1)})
+
+        assert mod._strict_json_document(raw, max_bytes=mod.MAX_VERIFY_JSON_BYTES) == json.loads(raw)
+
+    def test_decoder_recursion_error_is_normalized_to_invalid_document(self, monkeypatch):
+        def recurse(*args, **kwargs):
+            raise RecursionError("adversarial decoder depth")
+
+        monkeypatch.setattr(mod.json, "loads", recurse)
+        with pytest.raises(ValueError, match="invalid_json_document"):
+            mod._strict_json_document("{}", max_bytes=mod.MAX_VERIFY_JSON_BYTES)
+
     def test_rejects_pass_with_fail_evidence(self):
         finding = {"severity": "FAIL", "category": "syntax", "file": "bad.py", "line": 1}
         with pytest.raises(ValueError):
             self._validate(json.dumps(_verify_envelope(violations=[finding])))
+
+    def test_rejects_top_level_and_category_finding_contradiction(self):
+        finding = {"severity": "WARN", "category": "n1", "file": "model.py", "line": 1}
+        envelope = _verify_envelope(violations=[finding])
+        envelope["summary"]["checks_run"].append("n1")
+        envelope["categories"]["n1"]["violations"][0]["file"] = "different.py"
+
+        with pytest.raises(ValueError, match="finding_multiset_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    def test_rejects_finding_multiplicity_contradiction(self):
+        finding = {"severity": "WARN", "category": "n1", "file": "model.py", "line": 1}
+        envelope = _verify_envelope(violations=[finding])
+        envelope["summary"]["checks_run"].append("n1")
+        envelope["violations"].append(dict(finding))
+        envelope["summary"]["violation_count"] = 2
+
+        with pytest.raises(ValueError, match="finding_multiset_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    @pytest.mark.parametrize("file_path", ["../../outside.py", "/outside.py", "C:/outside.py", "src/../outside.py"])
+    def test_rejects_non_root_contained_finding_paths(self, file_path):
+        finding = {"severity": "WARN", "category": "n1", "file": file_path, "line": 1}
+        envelope = _verify_envelope(violations=[finding])
+        envelope["summary"]["checks_run"].append("n1")
+
+        with pytest.raises(ValueError, match="invalid_finding_path"):
+            self._validate(json.dumps(envelope))
+
+    def test_rejects_finding_path_redirected_outside_the_bound_root(self, tmp_path):
+        root = tmp_path / "repo"
+        external = tmp_path / "external"
+        root.mkdir()
+        external.mkdir()
+        (external / "outside.py").write_text("outside\n", encoding="utf-8")
+        try:
+            (root / "redirect").symlink_to(external, target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"directory links unavailable: {exc}")
+        finding = {"severity": "WARN", "category": "n1", "file": "redirect/outside.py", "line": 1}
+        envelope = _verify_envelope(violations=[finding])
+        envelope["summary"]["checks_run"].append("n1")
+
+        with pytest.raises(ValueError, match="invalid_finding_path"):
+            self._validate(json.dumps(envelope), root=root)
+
+    def test_rejects_pass_verdict_with_warn_score_band(self):
+        envelope = _verify_envelope(verdict="PASS", score=70, threshold=70)
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
 
     def test_accepts_pass_with_selected_advisory_warn_evidence(self):
         finding = {"severity": "WARN", "category": "n1", "file": "model.py", "line": 1}
@@ -1679,9 +1976,146 @@ class TestVerifyReceiptV3Protocol:
         (tmp_path / "a.py").write_bytes(b"mutated\n")
         assert mod._verification_content_sha256(root, targets) != receipt["content_sha256"]
 
+    def test_request_snapshot_preserves_leading_space_and_hashes_that_exact_file(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / " leading.py").write_bytes(b"leading-space\n")
+        (tmp_path / "leading.py").write_bytes(b"different-file\n")
+
+        root, targets, receipt, _env = mod._prepare_verify_request((" leading.py",))
+
+        digest = mod.hashlib.sha256(b"leading-space\n").hexdigest()
+        payload = json.dumps([[" leading.py", f"sha256:{digest}"]], ensure_ascii=False, separators=(",", ":"))
+        assert root == tmp_path
+        assert targets == [" leading.py"]
+        assert receipt["content_sha256"] == mod.hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def test_parent_redirect_after_precheck_is_rejected_before_hashing(self, monkeypatch, tmp_path):
+        root = tmp_path / "repo"
+        source = root / "src"
+        external = tmp_path / "external"
+        source.mkdir(parents=True)
+        external.mkdir()
+        (source / "target.py").write_bytes(b"inside\n")
+        (external / "target.py").write_bytes(b"outside\n")
+        original_snapshot = mod._verification_parent_snapshot
+        raced = False
+
+        def swap_after_snapshot(bound_root, parent):
+            nonlocal raced
+            snapshot = original_snapshot(bound_root, parent)
+            if not raced and Path(parent) == source:
+                raced = True
+                source.rename(root / "src-original")
+                try:
+                    source.symlink_to(external, target_is_directory=True)
+                except OSError as exc:
+                    (root / "src-original").rename(source)
+                    pytest.skip(f"directory links unavailable: {exc}")
+            return snapshot
+
+        monkeypatch.setattr(mod, "_verification_parent_snapshot", swap_after_snapshot)
+
+        with pytest.raises(ValueError, match="scope_file_changed_during_hash"):
+            mod._verification_content_sha256(root, ["src/target.py"])
+
+    def test_post_open_parent_snapshot_mismatch_fails_on_every_platform(self, monkeypatch, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "target.py").write_bytes(b"inside\n")
+        original_snapshot = mod._verification_parent_snapshot
+        calls = 0
+
+        def drift_after_open(root, parent):
+            nonlocal calls
+            calls += 1
+            resolved, states = original_snapshot(root, parent)
+            return (resolved if calls == 1 else f"{resolved}-redirected", states)
+
+        monkeypatch.setattr(mod, "_verification_parent_snapshot", drift_after_open)
+
+        with pytest.raises(ValueError, match="scope_file_changed_during_hash"):
+            mod._verification_content_sha256(tmp_path, ["src/target.py"])
+        assert calls == 2
+
+    def test_windows_reparse_points_are_treated_as_links(self):
+        reparse = getattr(mod.stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if not reparse:
+            pytest.skip("platform exposes no reparse-point stat flag")
+        info = SimpleNamespace(st_mode=mod.stat.S_IFDIR, st_file_attributes=reparse)
+
+        assert mod._is_link_or_reparse(info) is True
+
+    def test_scope_normalization_preserves_legal_whitespace_and_posix_backslashes(self):
+        assert mod._verification_scope_paths([" trailing.py ", " leading.py"]) == [" leading.py", " trailing.py "]
+        literal_backslash = r"src\literal.py"
+        expected = "src/literal.py" if mod.os.name == "nt" else literal_backslash
+        assert mod._verification_scope_paths([literal_backslash]) == [expected]
+
+    def test_git_status_parser_preserves_leading_space_filename(self):
+        assert mod._parse_verify_status_paths(b"??  leading.py\0") == [" leading.py"]
+
+    @pytest.mark.skipif(mod.os.name == "nt", reason="POSIX surrogateescape regression")
+    def test_git_status_parser_explicitly_rejects_undecodable_filename_bytes(self):
+        with pytest.raises(ValueError, match="scope_path_undecodable"):
+            mod._parse_verify_status_paths(b"?? bad-\xff.py\0")
+
+    def test_changed_file_discovery_uses_bounded_binary_capture(self, monkeypatch, tmp_path):
+        captured = {}
+
+        class _P:
+            returncode = 0
+            stdout = b"??  leading.py\0"
+            stderr = b""
+
+        def fake_capture(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return _P()
+
+        monkeypatch.setattr(mod, "_resolve_trusted_executable", lambda *args, **kwargs: ("/trusted/git", None))
+        monkeypatch.setattr(mod, "_run_bounded_capture", fake_capture)
+
+        assert mod._discover_verify_targets(tmp_path) == [" leading.py"]
+        assert captured["kwargs"]["cwd"] == str(tmp_path)
+        assert captured["kwargs"]["stdout_limit"] == mod.MAX_VERIFY_GIT_STATUS_BYTES
+        assert captured["kwargs"]["stderr_limit"] == mod.MAX_VERIFY_STDERR_BYTES
+
     def test_scope_paths_reject_control_characters(self):
         with pytest.raises(ValueError):
             mod._verification_scope_paths(["safe.py", "bad\nname.py"])
+
+    @pytest.mark.parametrize("unsafe", ["../escape", "bad\nname.py", "bad\udcff.py"])
+    def test_prepare_rejects_unsafe_scope_before_any_filesystem_expansion(self, monkeypatch, tmp_path, unsafe):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(mod, "_expand_verify_targets", lambda *_args: pytest.fail("must validate first"))
+
+        with pytest.raises(ValueError):
+            mod._prepare_verify_request((unsafe,))
+
+    def test_verify_reports_unsafe_filename_without_substitution_or_traceback(
+        self, runner, monkeypatch, compatible_roam
+    ):
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (_ for _ in ()).throw(ValueError("scope_path_undecodable")),
+        )
+
+        result = runner.invoke(mod.cli, ["verify", "unsafe.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "not representable as UTF-8" in result.output
+        assert "Traceback" not in result.output
+
+    def test_verify_explicitly_rejects_newline_filename(self, runner, compatible_roam):
+        result = runner.invoke(mod.cli, ["verify", "bad\nname.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "unsafe control character" in result.output
+        assert "including a newline" in result.output
+        assert "Traceback" not in result.output
 
     @pytest.mark.parametrize(
         "path", ["../escape.py", "src/../escape.py", "./file.py", "/tmp/file.py", "C:/tmp/file.py"]
@@ -1725,6 +2159,264 @@ class TestVerifyReceiptV3Protocol:
         assert "verifier protocol failure" in result.output
 
 
+class TestAtomicWriteConcurrency:
+    def test_absent_target_is_never_overwritten_if_created_at_commit(self, monkeypatch, tmp_path):
+        target = tmp_path / "settings.json"
+        original_link = mod.os.link
+        injected = False
+
+        def create_competitor_before_link(source, destination, *args, **kwargs):
+            nonlocal injected
+            if Path(destination) == target and not injected:
+                injected = True
+                target.write_text("competitor", encoding="utf-8")
+            return original_link(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "link", create_competitor_before_link)
+
+        assert mod._atomic_write_utf8(target, "compile", max_bytes=1024, expected_previous=None) is False
+        assert target.read_text(encoding="utf-8") == "competitor"
+
+    def test_two_absent_target_writers_have_exactly_one_winner(self, monkeypatch, tmp_path):
+        target = tmp_path / "settings.json"
+        original_link = mod.os.link
+        commit_entered = threading.Event()
+        release_commit = threading.Event()
+        first_commit = True
+        results: dict[str, bool] = {}
+
+        def pause_first_commit(source, destination, *args, **kwargs):
+            nonlocal first_commit
+            if Path(destination) == target and first_commit:
+                first_commit = False
+                commit_entered.set()
+                assert release_commit.wait(5)
+            return original_link(source, destination, *args, **kwargs)
+
+        def write(label, value):
+            results[label] = mod._atomic_write_utf8(target, value, max_bytes=1024, expected_previous=None)
+
+        monkeypatch.setattr(mod.os, "link", pause_first_commit)
+        first = threading.Thread(target=write, args=("first", "first"), daemon=True)
+        second = threading.Thread(target=write, args=("second", "second"), daemon=True)
+        first.start()
+        assert commit_entered.wait(5)
+        second.start()
+        release_commit.set()
+        first.join(5)
+        second.join(5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert sorted(results.values()) == [False, True]
+        assert target.read_text(encoding="utf-8") in {"first", "second"}
+        assert not list(tmp_path.glob(".compile-code-*.lock"))
+
+    def test_existing_target_compare_and_swap_serializes_replacements(self, monkeypatch, tmp_path):
+        target = tmp_path / "settings.json"
+        target.write_text("old", encoding="utf-8")
+        original_replace = mod.os.replace
+        commit_entered = threading.Event()
+        release_commit = threading.Event()
+        first_commit = True
+        results: dict[str, bool] = {}
+
+        def pause_first_replace(source, destination, *args, **kwargs):
+            nonlocal first_commit
+            if Path(destination) == target and first_commit:
+                first_commit = False
+                commit_entered.set()
+                assert release_commit.wait(5)
+            return original_replace(source, destination, *args, **kwargs)
+
+        def write(label, value):
+            results[label] = mod._atomic_write_utf8(target, value, max_bytes=1024, expected_previous="old")
+
+        monkeypatch.setattr(mod.os, "replace", pause_first_replace)
+        first = threading.Thread(target=write, args=("first", "first"), daemon=True)
+        second = threading.Thread(target=write, args=("second", "second"), daemon=True)
+        first.start()
+        assert commit_entered.wait(5)
+        second.start()
+        release_commit.set()
+        first.join(5)
+        second.join(5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert sorted(results.values()) == [False, True]
+        assert target.read_text(encoding="utf-8") in {"first", "second"}
+
+    def test_same_content_replacement_inode_is_not_accepted(self, monkeypatch, tmp_path):
+        target = tmp_path / "settings.json"
+        competitor = tmp_path / "competitor.json"
+        target.write_text("old", encoding="utf-8")
+        original_open = mod.os.open
+        original_replace = mod.os.replace
+        injected = False
+
+        def replace_before_temporary_open(path, flags, *args, **kwargs):
+            nonlocal injected
+            candidate = Path(path)
+            if (
+                not injected
+                and candidate.parent == tmp_path
+                and candidate.name.startswith(".settings.json.")
+                and candidate.name.endswith(".tmp")
+            ):
+                injected = True
+                competitor.write_text("old", encoding="utf-8")
+                original_replace(competitor, target)
+            return original_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mod.os, "open", replace_before_temporary_open)
+
+        assert mod._atomic_write_utf8(target, "compile", max_bytes=1024, expected_previous="old") is False
+        assert target.read_text(encoding="utf-8") == "old"
+
+    def test_existing_target_compare_and_swap_is_cross_process(self, tmp_path):
+        target = tmp_path / "settings.json"
+        gate = tmp_path / "start"
+        target.write_text("old", encoding="utf-8")
+        program = (
+            "import sys,time\n"
+            "from pathlib import Path\n"
+            "from compile_code.cli import _atomic_write_utf8\n"
+            "target,gate,value = map(Path, sys.argv[1:])\n"
+            "deadline = time.monotonic() + 10\n"
+            "while not gate.exists():\n"
+            "    if time.monotonic() > deadline: raise SystemExit(3)\n"
+            "    time.sleep(0.01)\n"
+            "print(int(_atomic_write_utf8(target, str(value), max_bytes=1024, expected_previous='old')))\n"
+        )
+        env = mod.os.environ.copy()
+        env["PYTHONPATH"] = str(ROOT / "src")
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", program, str(target), str(gate), value],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for value in ("first", "second")
+        ]
+        gate.write_text("go", encoding="utf-8")
+        completed = [process.communicate(timeout=15) for process in processes]
+
+        assert [process.returncode for process in processes] == [0, 0], completed
+        assert sorted(stdout.strip() for stdout, _stderr in completed) == ["0", "1"]
+        assert target.read_text(encoding="utf-8") in {"first", "second"}
+
+
+class TestVerifyDirectoryTraversal:
+    def test_expansion_is_deterministic_without_os_walk(self, tmp_path):
+        source = tmp_path / "src"
+        (source / "a").mkdir(parents=True)
+        (source / "b").mkdir()
+        for relative in ("a.py", "z.py", "a/y.py", "b/x.py"):
+            (source / relative).write_text(relative, encoding="utf-8")
+
+        first = mod._expand_verify_targets(["src"], tmp_path)
+        second = mod._expand_verify_targets(["src"], tmp_path)
+
+        assert first == second == ["src/a.py", "src/z.py", "src/a/y.py", "src/b/x.py"]
+        assert "os.walk" not in inspect.getsource(mod._expand_verify_targets)
+
+    def test_directory_limit_fails_closed(self, monkeypatch, tmp_path):
+        (tmp_path / "src" / "nested").mkdir(parents=True)
+        (tmp_path / "src" / "nested" / "a.py").write_text("pass\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "MAX_VERIFY_DIRECTORIES", 1)
+
+        with pytest.raises(ValueError, match="verification_directory_limit"):
+            mod._expand_verify_targets(["src"], tmp_path)
+
+    def test_empty_directory_cannot_disappear_beside_a_valid_file(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        (tmp_path / "valid.py").write_text("pass\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="verification_directory_empty"):
+            mod._expand_verify_targets(["empty", "valid.py"], tmp_path)
+
+    def test_entry_limit_fails_closed_and_is_disclosed(self, monkeypatch, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "a.py").write_text("pass\n", encoding="utf-8")
+        (source / "b.py").write_text("pass\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "MAX_VERIFY_DIRECTORY_ENTRIES", 1)
+
+        with pytest.raises(ValueError, match="verification_directory_entry_limit") as error:
+            mod._expand_verify_targets(["src"], tmp_path)
+
+        verdict = mod._unsafe_scope_verdict(error.value)
+        assert verdict is not None
+        assert "1-entry safety limit" in verdict
+
+    def test_cli_discloses_directory_entry_limit(self, runner, monkeypatch, compatible_roam):
+        monkeypatch.setattr(mod, "MAX_VERIFY_DIRECTORY_ENTRIES", 7)
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (_ for _ in ()).throw(ValueError("verification_directory_entry_limit")),
+        )
+
+        result = runner.invoke(mod.cli, ["verify", "src"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "7-entry safety limit" in result.output
+
+    def test_partial_scandir_error_never_returns_partial_scope(self, monkeypatch, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "a.py").write_text("pass\n", encoding="utf-8")
+
+        class BrokenScan:
+            yielded = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self.yielded:
+                    self.yielded = True
+                    return SimpleNamespace(name="a.py")
+                raise OSError("directory read failed")
+
+        monkeypatch.setattr(mod.os, "scandir", lambda _path: BrokenScan())
+
+        with pytest.raises(ValueError, match="verification_directory_unreadable"):
+            mod._expand_verify_targets(["src"], tmp_path)
+
+    def test_link_entry_fails_closed_instead_of_disappearing_from_scope(self, tmp_path):
+        source = tmp_path / "src"
+        external = tmp_path / "external.py"
+        source.mkdir()
+        external.write_text("outside\n", encoding="utf-8")
+        try:
+            (source / "linked.py").symlink_to(external)
+        except OSError as exc:
+            pytest.skip(f"file links unavailable: {exc}")
+
+        with pytest.raises(ValueError, match="verification_directory_unsafe"):
+            mod._expand_verify_targets(["src"], tmp_path)
+
+    def test_traversal_deadline_fails_closed(self, monkeypatch, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "a.py").write_text("pass\n", encoding="utf-8")
+        ticks = iter([0.0, 0.0, mod.MAX_VERIFY_TRAVERSAL_SECONDS + 1.0])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(ticks))
+
+        with pytest.raises(ValueError, match="verification_directory_timeout"):
+            mod._expand_verify_targets(["src"], tmp_path)
+
+
 def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10) -> Path:
     claude_dir = root / ".claude"
     hook_dir = claude_dir / "hooks"
@@ -1751,13 +2443,19 @@ def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10) -> Path:
     )
     settings = {
         "hooks": {
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": f"python3 {ups}"}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": f"python3 {stop}"}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(ups)}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(stop)}]}],
         }
     }
     settings_path = claude_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     return settings_path
+
+
+def _roam_13_10_hook_command(path: Path) -> str:
+    """Mirror Roam 13.10's private producer without importing another checkout."""
+    argv = [sys.executable, str(path.resolve(strict=True))]
+    return subprocess.list2cmdline(argv) if mod.os.name == "nt" else " ".join(shlex.quote(part) for part in argv)
 
 
 class TestClaudeStructuralReadiness:
@@ -1789,6 +2487,17 @@ class TestClaudeStructuralReadiness:
         settings["hooks"]["Stop"][0]["hooks"][0]["command"] = "python3 /tmp/roam-verify-stop.py"
         settings_path.write_text(json.dumps(settings), encoding="utf-8")
         assert mod._wired_in(str(settings_path)) is False
+
+    def test_roam_13_10_producer_command_is_accepted_without_generalizing_interpreters(self, tmp_path):
+        hook = tmp_path / "hooks with spaces" / mod.HOOK_MARKER
+        hook.parent.mkdir()
+        hook.write_text("# hook\n", encoding="utf-8")
+        produced = _roam_13_10_hook_command(hook)
+
+        assert mod._hook_command_matches(produced, hook) is True
+        assert mod._hook_command_matches(f"python3 {hook}", hook) is False
+        assert mod._hook_command_matches(produced + " --extra", hook) is False
+        assert mod._hook_command_matches(produced.replace(sys.executable, str(hook), 1), hook) is False
 
     def test_rejects_missing_and_stale_hook_bodies(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -1929,18 +2638,21 @@ class TestClaudeStructuralReadiness:
 
         class _P:
             returncode = 0
-            stdout = json.dumps(envelope)
+            stdout = json.dumps(envelope).encode("utf-8")
+            stderr = b""
 
         def fake_run(argv, **kwargs):
             captured["argv"] = argv
             captured["kwargs"] = kwargs
             return _P()
 
-        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(mod, "_run_bounded_capture", fake_run)
 
         assert mod._attest_claude_hooks("/trusted/roam", mod.MIN_ROAM_VERSION, user_level=True) is True
         assert captured["argv"] == ["/trusted/roam", "--json", "hooks", "claude", "--user"]
         assert captured["kwargs"]["env"]["ROAM_DEFAULT_JSON_BUDGET"] == "0"
+        assert captured["kwargs"]["stdout_limit"] == mod.MAX_VERIFY_JSON_BYTES
+        assert captured["kwargs"]["stderr_limit"] == mod.MAX_VERIFY_STDERR_BYTES
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -1971,9 +2683,10 @@ class TestClaudeStructuralReadiness:
                     "version": mod.MIN_ROAM_VERSION,
                     "summary": summary,
                 }
-            )
+            ).encode("utf-8")
+            stderr = b""
 
-        monkeypatch.setattr(mod.subprocess, "run", lambda *args, **kwargs: _P())
+        monkeypatch.setattr(mod, "_run_bounded_capture", lambda *args, **kwargs: _P())
         assert mod._attest_claude_hooks("/trusted/roam", mod.MIN_ROAM_VERSION, user_level=False) is False
 
     def test_cached_index_and_head_marker_cannot_bypass_roam_reinspection(self, runner, monkeypatch, tmp_path):

@@ -110,7 +110,7 @@ LOCK_GRAPHS = (
 )
 OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 BUILD_REQUIRES = ["setuptools==83.0.0", "wheel==0.47.0"]
-RUNTIME_REQUIRES = ["roam-code>=13.10.0", "click>=8.0"]
+RUNTIME_REQUIRES = ["roam-code<14,>=13.10.0", "click>=8.0"]
 DEV_REQUIRES = ["pytest==9.1.1", "PyYAML==6.0.3", "ruff==0.15.22", "zizmor==1.27.0"]
 PROJECT_URLS = {
     "Homepage": "https://github.com/Cranot/compile-code",
@@ -123,6 +123,8 @@ CONSOLE_SCRIPTS = {
     "compile-code": "compile_code.cli:cli",
 }
 SMOKE_CLICK_VERSION = "8.4.2"
+REQUIRED_ROAM_VERIFY_PROTOCOL = "roam.verify.receipt.v3"
+REQUIRED_CLAUDE_HOOK_READINESS = "Roam-generated Claude hooks accepted by Compile doctor"
 VERSION_RE = re.compile(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -3192,6 +3194,154 @@ def _smoke_environment() -> dict[str, str]:
     return env
 
 
+def _isolated_smoke_runtime_environment(smoke_root: Path, environment: dict[str, str]) -> dict[str, str]:
+    """Bind user, config, cache, state, and temporary writes to one smoke root."""
+    runtime_root = smoke_root / "isolated-runtime"
+    home = runtime_root / "home"
+    directories = {
+        "home": home,
+        "config": runtime_root / "config",
+        "cache": runtime_root / "cache",
+        "data": runtime_root / "data",
+        "state": runtime_root / "state",
+        "runtime": runtime_root / "run",
+        # Rust's Windows known-folder implementation derives these beneath
+        # USERPROFILE and requires the directories to exist. Keeping that
+        # native layout makes parser caches isolated without breaking Roam.
+        "appdata": home / "AppData" / "Roaming" if os.name == "nt" else runtime_root / "appdata",
+        "local_appdata": home / "AppData" / "Local" if os.name == "nt" else runtime_root / "local-appdata",
+        "temp": runtime_root / "temp",
+    }
+    for label, directory in directories.items():
+        directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        _validated_real_directory(directory, label=f"smoke {label}")
+
+    isolated = environment.copy()
+    for name in tuple(isolated):
+        normalized = name.upper()
+        if normalized.startswith(("CLAUDE_", "CODEX_", "COMPILE_", "GIT_", "ROAM_", "XDG_")) or normalized in {
+            "CONDA_PREFIX",
+            "VIRTUAL_ENV",
+        }:
+            isolated.pop(name, None)
+    isolated.update(
+        {
+            "APPDATA": str(directories["appdata"]),
+            "CLAUDE_CONFIG_DIR": str(home / ".claude"),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "HOME": str(home),
+            "LOCALAPPDATA": str(directories["local_appdata"]),
+            "TEMP": str(directories["temp"]),
+            "TMP": str(directories["temp"]),
+            "TMPDIR": str(directories["temp"]),
+            "USERPROFILE": str(home),
+            "XDG_CACHE_HOME": str(directories["cache"]),
+            "XDG_CONFIG_HOME": str(directories["config"]),
+            "XDG_DATA_HOME": str(directories["data"]),
+            "XDG_RUNTIME_DIR": str(directories["runtime"]),
+            "XDG_STATE_HOME": str(directories["state"]),
+        }
+    )
+    isolated.pop("HOMEDRIVE", None)
+    isolated.pop("HOMEPATH", None)
+    if os.name == "nt":
+        home_drive, home_path = os.path.splitdrive(str(home))
+        _require(bool(home_drive and home_path), "isolated Windows smoke HOME is not absolute")
+        isolated["HOMEDRIVE"] = home_drive
+        isolated["HOMEPATH"] = home_path
+    return isolated
+
+
+def _run_required_roam_protocol_smoke(
+    compile_executable: Path,
+    smoke_root: Path,
+    environment: dict[str, str],
+) -> None:
+    """Exercise installed Roam hook production, readiness, and Verify protocol."""
+    project = smoke_root / "roam-protocol-project"
+    project.mkdir(mode=0o700)
+    source = project / "protocol_smoke.py"
+    source.write_text(
+        "def protocol_smoke(value: int) -> int:\n    return value + 1\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    runtime_environment = _isolated_smoke_runtime_environment(smoke_root, environment)
+    existing_path = runtime_environment.get("PATH", "")
+    runtime_environment["PATH"] = str(compile_executable.parent)
+    if existing_path:
+        runtime_environment["PATH"] += os.pathsep + existing_path
+
+    git_executable = shutil.which("git", path=runtime_environment["PATH"])
+    _require(
+        isinstance(git_executable, str) and Path(git_executable).is_absolute(),
+        "resolved smoke requires an absolute Git executable",
+    )
+    _run(
+        [git_executable, "-c", "init.defaultBranch=main", "init", "--quiet"],
+        cwd=project,
+        env=runtime_environment,
+        timeout=60,
+    )
+    _run(
+        [git_executable, "add", "--", source.name],
+        cwd=project,
+        env=runtime_environment,
+        timeout=60,
+    )
+    _run(
+        [str(compile_executable), "init"],
+        cwd=project,
+        env=runtime_environment,
+        timeout=180,
+    )
+    wire_output = _run(
+        [str(compile_executable), "wire", "claude"],
+        cwd=project,
+        env=runtime_environment,
+        timeout=180,
+    )
+    _require(
+        isinstance(wire_output, str) and "Traceback" not in wire_output,
+        "resolved roam-code did not produce Claude hooks cleanly",
+    )
+    doctor_output = _run(
+        [str(compile_executable), "doctor"],
+        cwd=project,
+        env=runtime_environment,
+        timeout=60,
+    )
+    normalized_doctor = doctor_output.replace("\r\n", "\n") if isinstance(doctor_output, str) else ""
+    _require(
+        re.search(r"(?m)^claude\s+:\s+wired \(project\)\s*$", normalized_doctor) is not None
+        and re.search(r"(?m)^VERDICT: ready\s*$", normalized_doctor) is not None
+        and "Traceback" not in normalized_doctor,
+        f"{REQUIRED_CLAUDE_HOOK_READINESS} failed",
+    )
+    output = _run(
+        [
+            str(compile_executable),
+            "verify",
+            "--threshold",
+            "0",
+            "--",
+            source.name,
+        ],
+        cwd=project,
+        env=runtime_environment,
+        timeout=180,
+    )
+    _require(
+        isinstance(output, str)
+        and re.match(r"\AVERDICT: (?:PASS|WARN) \(score \d+/100\)", output) is not None
+        and "Traceback" not in output,
+        f"resolved roam-code did not complete {REQUIRED_ROAM_VERIFY_PROTOCOL}",
+    )
+
+
 def _run_install_smoke(artifact: Path, version: str, mode: str, temp_root: Path) -> None:
     environment = _smoke_environment()
     with tempfile.TemporaryDirectory(prefix=f"smoke-{artifact.suffix.lstrip('.')}-", dir=temp_root) as temporary:
@@ -3261,6 +3411,9 @@ def _run_install_smoke(artifact: Path, version: str, mode: str, temp_root: Path)
                 isinstance(output, str) and "Usage:" in output and "Traceback" not in output,
                 f"help smoke failed: {name}",
             )
+        if mode == "resolve":
+            compile_executable = scripts / ("compile.exe" if os.name == "nt" else "compile")
+            _run_required_roam_protocol_smoke(compile_executable, Path(temporary), environment)
 
 
 def install_smoke(bundle: Path, mode: str, temp_root: Path) -> None:

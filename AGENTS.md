@@ -20,6 +20,20 @@ per clone:
 git config core.hooksPath .githooks
 ```
 
+Install the reviewed quality toolchain into the active virtual environment
+from the checked-in universal lock before the first local run:
+
+```bash
+python -m pip install --isolated --no-cache-dir --no-compile --require-hashes --only-binary=:all: -r release/tooling-requirements.lock
+```
+
+If only zizmor is absent or damaged, `python scripts/check.py
+--bootstrap-zizmor` extracts its exact `1.27.0` stanza from that same lock,
+installs no dependencies, and verifies the installed script location, wheel
+RECORD SHA-256/size, file identity, and reported version. The normal gate uses
+only that verified interpreter-local executable; it never falls back to PATH
+or treats either workflow audit as advisory.
+
 `.githooks/commit-msg` rejects attribution/assistant references in commit
 messages. Bypass any hook only deliberately (`git push --no-verify`) and
 say why in the commit body.

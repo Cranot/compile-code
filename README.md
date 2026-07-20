@@ -42,7 +42,8 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 
 Release `0.2.0` is deliberately dependency-gated. Install it only after
 `roam-code 13.10.0` is available on PyPI; the installer resolves that real
-dependency and fails instead of silently substituting an older kernel.
+dependency in the tested `>=13.10.0,<14` compatibility interval and fails
+instead of silently substituting an older or future-major kernel.
 
 ```bash
 python -m pip install "compile-code==0.2.0"                    # owner-gated PyPI release
@@ -53,8 +54,9 @@ compile claude          # index + wire + launch Claude Code, all-in-one
 ```
 
 The install resolves the `compile` CLI and its roam-code engine together. The
-version pin makes the command auditable and prevents a future release from
-changing an existing environment unexpectedly.
+closed compatibility interval makes the command auditable, admits compatible
+13.x fixes, and prevents an untested future major from entering the immutable
+0.2.0 release.
 
 That's it. From then on, every prompt you type gets compiled facts injected
 before the model sees it, and every edit gets a scoped verification after.
@@ -187,9 +189,9 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code pins `roam-code >= 13.10.0` and picks up every kernel release —
-so the published losses above are not static marketing: each one was
-attacked in a kernel release and re-measured. The trivial-prompt cell
+compile-code 0.2.0 supports `roam-code >= 13.10.0,<14` and picks up compatible
+13.x kernel releases — so the published losses above are not static marketing:
+each one was attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped
 to a −26% win; the cycles cell went from +56% to **−89%** ($0.65 → $0.07).
 The full version-keyed eval history, with raw cells and methodology, lives
@@ -302,9 +304,11 @@ planted hallucinations caught in both languages.
 `compile-code` and `cmpl` are aliases for `compile` if another tool owns
 that name on your system.
 
-With no explicit files, `compile verify` delegates the complete worktree scope
-to `roam verify --changed`, including staged, unstaged, untracked, renamed, and
-deleted paths.
+With no explicit files, `compile verify` discovers the complete worktree scope
+itself (staged, unstaged, untracked, renamed, and deleted paths), canonicalizes
+that set, and passes explicit root-bound targets to `roam verify`. Only when
+discovery yields no bound targets does it use `roam verify --changed` as the
+path-free recovery fallback.
 
 ## Beyond Claude Code — Codex, MCP, and CI
 
@@ -331,10 +335,10 @@ index present, hooks wired (at either level). Every failure surfaces as a
 one-line `VERDICT:` with the fix — never a traceback. Exit codes: `0` ok,
 `1` user-fixable state, `2` toolchain missing, `124` timeout.
 
-Doctor resolves the exact `roam` executable selected by PATH and requires
-`roam-code >= 13.10.0`. It reports that executable's path and version separately
-from Python package metadata, because a stale console-script shim can disagree
-with the installed distribution.
+The supported package interval is `roam-code >= 13.10.0,<14`. Doctor resolves
+the exact `roam` executable selected by PATH and reports that executable's path
+and version separately from Python package metadata, because a stale
+console-script shim can disagree with the installed distribution.
 
 Prompt compilation remains fail-open so an unavailable optimizer never blocks
 work. Post-edit verification is fail-closed for edited turns: malformed,
@@ -470,13 +474,33 @@ and GitHub preflight even when an intermediate publication job failed or was
 skipped, so a missing PyPI publication or missing/still-draft GitHub release cannot
 produce a green workflow.
 
-Maintainer sequence: publish `roam-code>=13.10.0`, run
+Maintainer sequence: publish a compatible `roam-code>=13.10.0,<14` release, run
 `python scripts/check.py`, verify the protected `pypi` environment and Trusted
 Publisher, immutable releases, and the protected `release-guard` environment
 with its read-only owner token;
 create the annotated version tag, push that tag, and approve the environment
 deployment. Do not create the tag while the dependency-resolving wheel and
 sdist smokes are blocked.
+
+For a clean local release checkout, create and activate a virtual environment,
+then install the reviewed quality tools from the checked-in hash lock before
+running the gate:
+
+```bash
+python -m pip install --isolated --no-cache-dir --no-compile --require-hashes --only-binary=:all: -r release/tooling-requirements.lock
+python scripts/check.py
+```
+
+If the environment already has every other tool, `python scripts/check.py
+--bootstrap-zizmor` installs only the exact hash-locked `zizmor==1.27.0` wheel.
+The gate resolves zizmor from the active interpreter's configured scripts
+directory and verifies its executable against a semantic-digest-pinned trust
+manifest derived from every exact lock-listed wheel. It independently checks
+the installed wheel RECORD SHA-256 and size, single-link file identity, and
+exact reported version before and after both mandatory workflow audits. Paired
+executable plus mutable RECORD tampering therefore cannot satisfy the offline
+gate. It does not search PATH, accept another version, or downgrade either
+audit to an advisory check.
 
 ## How it relates to roam-code
 
