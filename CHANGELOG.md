@@ -4,6 +4,7 @@
 
 - Binds `compile verify` to one canonical Roam JSON transaction with a fresh nonce, sorted target scope, exact file-byte digest, and closed Verify receipt-v3 validation; duplicate, trailing, skipped, incomplete, contradictory, or oversized evidence fails closed.
 - Verifies concrete workspace-external `roam` and Claude executables selected by PATH and declares the tested roam-code compatibility interval `>=13.10.0,<14`.
+- Isolates release-gate tests from Git hook repository controls and fails closed if validation mutates the checkout state.
 - Makes `compile claude` re-prove readiness immediately before launch by structurally validating both hook events, exact commands/files, current hook protocol markers, and the exact Roam producer's canonical-body attestation; degraded launch requires `--allow-unwired` and is disclosed.
 - Keeps Roam-owned hook bodies immutable from the Compile layer, rejects symlinked or escaped `.claude`/`.roam` trees, and uses bounded compare-and-swap writes for settings, guidance, and launch markers so repository links cannot redirect mutations.
 - Resolves every Roam/Git maintenance subprocess to a concrete workspace-external executable and strips interpreter/Git redirection variables before launch.

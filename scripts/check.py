@@ -150,10 +150,66 @@ def _path_is_committed_artifact(rel: str) -> bool:
     return any(segment in ARTIFACT_SEGMENTS or segment.endswith(".egg-info") for segment in rel.split("/"))
 
 
-def run(title: str, cmd: list[str], *, env: dict[str, str] | None = None) -> bool:
+def _without_git_controls(environment: dict[str, str] | None = None) -> dict[str, str]:
+    """Copy an environment without repository-redirection controls exported by Git hooks."""
+    source = os.environ if environment is None else environment
+    return {key: value for key, value in source.items() if not key.upper().startswith("GIT_")}
+
+
+def _repository_state() -> bytes:
+    """Return a stable snapshot that binds HEAD, index, and tracked/untracked state."""
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--no-ahead-behind",
+                "--untracked-files=all",
+                "-z",
+            ],
+            cwd=ROOT,
+            env=_without_git_controls(),
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("git executable is unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("git status exceeded the 60s snapshot timeout") from exc
+    except OSError as exc:
+        raise RuntimeError(f"could not launch git status: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[-1_000:]
+        raise RuntimeError(f"git status failed ({proc.returncode}): {detail}")
+    return proc.stdout
+
+
+def run(
+    title: str,
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    protect_repository: bool = False,
+) -> bool:
+    repository_before: bytes | None = None
+    detail = ""
+    execution_error = ""
+    output_bounded = True
+    returncode: int | None = None
+    if protect_repository:
+        try:
+            repository_before = _repository_state()
+        except RuntimeError as exc:
+            print(f"[check] {title}: FAIL")
+            print(f"could not snapshot repository before the command: {exc}")
+            return False
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             proc = subprocess.run(cmd, cwd=ROOT, env=env, stdout=stdout, stderr=stderr, timeout=1200)
+            returncode = proc.returncode
             stdout_size = os.fstat(stdout.fileno()).st_size
             stderr_size = os.fstat(stderr.fileno()).st_size
             output_bounded = stdout_size <= MAX_CHECK_OUTPUT_BYTES and stderr_size <= MAX_CHECK_OUTPUT_BYTES
@@ -162,20 +218,28 @@ def run(title: str, cmd: list[str], *, env: dict[str, str] | None = None) -> boo
                 stderr.seek(max(0, stderr_size - 2_000))
                 detail = (stdout.read(2_000) + stderr.read(2_000)).decode("utf-8", "replace").strip()
     except FileNotFoundError:
-        print(f"[check] {title}: FAIL")
-        print(f"required executable not found: {cmd[0]}")
-        return False
+        execution_error = f"required executable not found: {cmd[0]}"
     except OSError as exc:
-        print(f"[check] {title}: FAIL")
-        print(f"could not launch {cmd[0]}: {exc}")
-        return False
+        execution_error = f"could not launch {cmd[0]}: {exc}"
     except subprocess.TimeoutExpired:
-        print(f"[check] {title}: FAIL")
-        print(f"command exceeded the 1200s gate timeout: {' '.join(cmd)}")
-        return False
-    ok = proc.returncode == 0 and output_bounded
+        execution_error = f"command exceeded the 1200s gate timeout: {' '.join(cmd)}"
+    repository_unchanged = True
+    repository_error = ""
+    if repository_before is not None:
+        try:
+            repository_unchanged = _repository_state() == repository_before
+        except RuntimeError as exc:
+            repository_unchanged = False
+            repository_error = f"could not snapshot repository after the command: {exc}"
+    ok = returncode == 0 and not execution_error and output_bounded and repository_unchanged
     print(f"[check] {title}: {'PASS' if ok else 'FAIL'}")
     if not ok:
+        if execution_error:
+            print(execution_error)
+        if repository_error:
+            print(repository_error)
+        elif not repository_unchanged:
+            print("command changed repository HEAD, index, or worktree state")
         if not output_bounded:
             print(f"command output exceeded the {MAX_CHECK_OUTPUT_BYTES}-byte per-stream limit")
         if detail:
@@ -556,7 +620,10 @@ def zizmor_gates() -> list[bool]:
 
 def _source_test_environment() -> dict[str, str]:
     """Bind pytest to this checkout instead of any previously installed wheel."""
-    environment = os.environ.copy()
+    # Git hooks export repository-local GIT_* controls. Passing those into a
+    # test that creates a nested repository can redirect its commits into this
+    # checkout, despite the subprocess using a different cwd.
+    environment = _without_git_controls()
     environment.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -935,7 +1002,12 @@ def main(argv: list[str] | None = None) -> int:
         run("ruff check", [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"]),
         run("ruff format --check", [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"]),
         *zizmor_gates(),
-        run("pytest", [sys.executable, "-m", "pytest", "tests/", "-q"], env=_source_test_environment()),
+        run(
+            "pytest",
+            [sys.executable, "-m", "pytest", "tests/", "-q"],
+            env=_source_test_environment(),
+            protect_repository=True,
+        ),
         leak_scan(),
         artifact_scan(),
         readme_sanity(),

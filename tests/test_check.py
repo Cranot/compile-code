@@ -294,6 +294,10 @@ def test_zizmor_resolution_never_falls_back_to_path(monkeypatch, tmp_path):
 
 def test_source_test_environment_binds_pytest_to_this_checkout(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", "stale-installed-package")
+    monkeypatch.setenv("GIT_DIR", "outer-repository/.git")
+    monkeypatch.setenv("GIT_INDEX_FILE", "outer-repository/index")
+    monkeypatch.setenv("GIT_WORK_TREE", "outer-repository")
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
 
     environment = check._source_test_environment()
 
@@ -301,6 +305,105 @@ def test_source_test_environment_binds_pytest_to_this_checkout(monkeypatch):
     assert environment["PYTHONNOUSERSITE"] == "1"
     assert environment["PYTHONSAFEPATH"] == "1"
     assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "GIT_DIR" not in environment
+    assert "GIT_INDEX_FILE" not in environment
+    assert "GIT_WORK_TREE" not in environment
+    assert environment["GITHUB_ACTIONS"] == "true"
+
+
+def test_source_test_environment_keeps_nested_git_commits_out_of_outer_repository(monkeypatch, tmp_path):
+    outer = tmp_path / "outer"
+    inner = tmp_path / "inner"
+    outer.mkdir()
+    inner.mkdir()
+    identity = ["-c", "user.name=Release Test", "-c", "user.email=release@example.invalid"]
+    subprocess.run(["git", "init", "-q"], cwd=outer, check=True)
+    (outer / "outer.txt").write_text("outer", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=outer, check=True)
+    subprocess.run(["git", *identity, "commit", "-qm", "outer source"], cwd=outer, check=True)
+    outer_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=outer, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    monkeypatch.setenv("GIT_DIR", str(outer / ".git"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(outer / ".git" / "index"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(outer))
+    environment = check._source_test_environment()
+
+    subprocess.run(["git", "init", "-q"], cwd=inner, env=environment, check=True)
+    (inner / "inner.txt").write_text("inner", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=inner, env=environment, check=True)
+    subprocess.run(["git", *identity, "commit", "-qm", "inner source"], cwd=inner, env=environment, check=True)
+
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=outer, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        == outer_head
+    )
+    assert subprocess.run(
+        ["git", "show", "--format=", "--name-only", "HEAD"],
+        cwd=inner,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines() == ["inner.txt"]
+
+
+def test_protected_command_fails_when_repository_state_changes(monkeypatch, capsys):
+    states = iter((b"before", b"after"))
+    monkeypatch.setattr(check, "_repository_state", lambda: next(states))
+    monkeypatch.setattr(check.subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0))
+
+    assert check.run("mutating command", ["tool"], protect_repository=True) is False
+    assert "command changed repository HEAD, index, or worktree state" in capsys.readouterr().out
+
+
+def test_protected_command_checks_repository_after_launch_failure(monkeypatch, capsys):
+    states = iter((b"before", b"after"))
+    monkeypatch.setattr(check, "_repository_state", lambda: next(states))
+    monkeypatch.setattr(check.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()))
+
+    assert check.run("missing mutator", ["tool"], protect_repository=True) is False
+    output = capsys.readouterr().out
+    assert "required executable not found" in output
+    assert "command changed repository HEAD, index, or worktree state" in output
+
+
+def test_repository_snapshot_ignores_inherited_git_redirection(monkeypatch):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["command"] = args[0]
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 0, stdout=b"state", stderr=b"")
+
+    monkeypatch.setenv("GIT_DIR", "redirected/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "redirected")
+    monkeypatch.setattr(check.subprocess, "run", fake_run)
+
+    assert check._repository_state() == b"state"
+    assert "--no-ahead-behind" in captured["command"]
+    assert "GIT_DIR" not in captured["environment"]
+    assert "GIT_WORK_TREE" not in captured["environment"]
+
+
+def test_repository_snapshot_normalizes_launch_and_timeout_errors(monkeypatch):
+    for failure, message in (
+        (FileNotFoundError(), "git executable is unavailable"),
+        (OSError("blocked"), "could not launch git status"),
+        (subprocess.TimeoutExpired(["git"], 60), "snapshot timeout"),
+    ):
+        monkeypatch.setattr(
+            check.subprocess, "run", lambda *args, failure=failure, **kwargs: (_ for _ in ()).throw(failure)
+        )
+        try:
+            check._repository_state()
+        except RuntimeError as exc:
+            assert message in str(exc)
+        else:  # pragma: no cover - fail with a focused message
+            raise AssertionError("repository snapshot exception escaped normalization")
 
 
 def test_git_inventory_failure_blocks_leak_and_artifact_scans(monkeypatch, capsys):
