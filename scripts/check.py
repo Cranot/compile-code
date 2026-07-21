@@ -903,8 +903,8 @@ def release_sanity() -> bool:
 
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     release_dates = re.findall(r"(?m)^## 0\.2\.0 - (\d{4}-\d{2}-\d{2})$", changelog)
-    if release_dates != ["2026-07-19"]:
-        problems.append(f"CHANGELOG.md: expected one 0.2.0 release heading dated 2026-07-19, got {release_dates}")
+    if release_dates != ["2026-07-21"]:
+        problems.append(f"CHANGELOG.md: expected one 0.2.0 release heading dated 2026-07-21, got {release_dates}")
     print(f"[check] release sanity: {'PASS' if not problems else 'FAIL'}")
     for problem in problems:
         print("  -", problem)
