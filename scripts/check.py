@@ -48,6 +48,7 @@ RETIRED_CLAIMS = [
     (r"10/10[\s\S]{0,40}?both\s+arms", "10/10 both-arms phrasing without the parity caveat", ("parity", "n=10")),
     (r"[−-]86%\s+turns", "retired -86% Opus turns claim (corrected: -33% overall)", ("corrected",)),
     (r"pip\s+install\s+compile-code(?![\w-])", "unpinned bare pip install compile-code", ("pypi", "uninstall")),
+    (r"nothing\s+leaves\s+(?:your|the)\s+machine", "retired unqualified no-egress claim", ()),
 ]
 RELEASE_LOCKS = (
     "release/tooling-requirements.lock",

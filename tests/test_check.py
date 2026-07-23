@@ -68,6 +68,19 @@ def test_release_and_install_contracts_are_present():
     assert check.release_sanity()
 
 
+def test_unqualified_no_egress_claim_is_retired():
+    assert check._retired_claim_hits("README.md", "nothing leaves your machine") == [
+        "README.md:1: retired unqualified no-egress claim"
+    ]
+    assert (
+        check._retired_claim_hits(
+            "README.md",
+            "compiler operations are local; external agents keep their provider boundary",
+        )
+        == []
+    )
+
+
 def test_gate_reports_a_missing_executable_without_traceback(monkeypatch, capsys):
     def missing(*args, **kwargs):
         raise FileNotFoundError("missing")

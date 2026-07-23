@@ -27,6 +27,7 @@
 - Makes exact PyPI and immutable GitHub post-verification a terminal fail-closed job after every successful build and release preflight, so an unexpected skipped write step cannot turn a missing registry publication or still-draft release into a green workflow.
 - Rejects non-finite or over-nested JSON, preflights ZIP central-directory counts before allocation, streams TAR entry bounds, validates archive member sizes, and restricts PyPI URLs and redirects to HTTPS default-port registry identities without userinfo or fragments.
 - Fails unauthorized, wrong-repository, wrong-version, lightweight-tag, and source-drift tag events in an early build guard; preserves link identity at CLI path boundaries; rejects non-regular or extra backend outputs, unexpected wheel entry-point sections, non-canonical attestation base64, and unsafe registry or GitHub asset URL spellings.
+- Clarifies that Compile's compiler, verifier, and telemetry are local while any launched external agent retains its own provider and network boundary; a release guard blocks the retired unqualified no-egress claim.
 
 ## 0.1.0 - 2026-07-03
 

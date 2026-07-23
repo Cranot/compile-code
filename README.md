@@ -11,7 +11,7 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![GitHub stars](https://img.shields.io/github/stars/Cranot/compile-code?style=flat-square)](https://github.com/Cranot/compile-code/stargazers)
 
-<sub>Works with Claude Code · one command · zero config · 100% local — no API keys, nothing leaves your machine</sub>
+<sub>Works with Claude Code · one command · zero config · local compiler and verifier · zero model calls</sub>
 
 <sub>A thin CLI over the [roam-code](https://github.com/Cranot/roam-code) engine (installed automatically) · 23 intent procedures · 28 languages · zero model calls</sub>
 
@@ -326,7 +326,10 @@ just text, so any agent can consume it right now:
 - **Roadmap.** A one-command `compile wire codex` (MCP-first) is planned, so
   Codex gets the same before-the-first-token injection Claude has today.
 
-Every mode is 100% local — no API keys, nothing leaves your machine.
+Compile's indexing, prompt precomputation, verification, and local telemetry use
+no model API or Compile-managed cloud service. When you launch or feed an
+external coding agent, that agent's own client, provider, and privacy policy
+govern its network traffic; Compile does not make that traffic local.
 
 ## Troubleshooting
 
@@ -507,8 +510,9 @@ audit to an advisory check.
 The kernel (indexer, code graph, classifier, probes, verify) is the
 [roam-code](https://github.com/Cranot/roam-code) toolchain, installed
 automatically as a dependency. compile-code is the product surface for the
-compile loop — the same relationship as a compiler driver over its
-toolchain libraries. 100% local, no API keys, nothing leaves your machine.
+compile loop — the same relationship as a compiler driver over its toolchain
+libraries. Those compiler and verifier operations are local and make zero model
+calls; any agent you launch retains its own provider/network boundary.
 
 ## License
 
