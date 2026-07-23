@@ -49,6 +49,7 @@ RETIRED_CLAIMS = [
     (r"[−-]86%\s+turns", "retired -86% Opus turns claim (corrected: -33% overall)", ("corrected",)),
     (r"pip\s+install\s+compile-code(?![\w-])", "unpinned bare pip install compile-code", ("pypi", "uninstall")),
     (r"nothing\s+leaves\s+(?:your|the)\s+machine", "retired unqualified no-egress claim", ()),
+    (r"\b23\s+(?:canonical\s+)?intent\s+procedures\b", "retired Roam 13.10 intent-procedure count", ()),
 ]
 RELEASE_LOCKS = (
     "release/tooling-requirements.lock",
@@ -779,6 +780,8 @@ def readme_sanity() -> bool:
             problems.append(f"immutable GitHub Release guidance missing: {release_guard}")
     if text.count("# compile-code") < 1:
         problems.append("title missing")
+    if text.count("22 canonical intent procedures") != 2:
+        problems.append("Roam 13.10 canonical intent-procedure count must appear exactly twice")
     docs = {"README.md": text, "AGENTS.md": agents}
     problems += _floor_drift(pyproject, docs)
     for name, doc in docs.items():

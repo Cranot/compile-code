@@ -28,6 +28,9 @@
 - Rejects non-finite or over-nested JSON, preflights ZIP central-directory counts before allocation, streams TAR entry bounds, validates archive member sizes, and restricts PyPI URLs and redirects to HTTPS default-port registry identities without userinfo or fragments.
 - Fails unauthorized, wrong-repository, wrong-version, lightweight-tag, and source-drift tag events in an early build guard; preserves link identity at CLI path boundaries; rejects non-regular or extra backend outputs, unexpected wheel entry-point sections, non-canonical attestation base64, and unsafe registry or GitHub asset URL spellings.
 - Clarifies that Compile's compiler, verifier, and telemetry are local while any launched external agent retains its own provider and network boundary; a release guard blocks the retired unqualified no-egress claim.
+- Corrects the documented Roam 13.10 classifier inventory to 22 canonical intent procedures and pins that release-facing count in the README sanity gate.
+- Makes the all-in-one Claude launcher idempotently install the same curated mid-task Roam permissions and guidance as explicit wiring, preserving project versus user-global scope.
+- Clarifies compile fail-open versus Verify fail-closed behavior, persistent uninstall residue, local-STDIO Codex setup, last-published telemetry dates, and the exact supported agent surfaces; a regression test keeps the README's showcased source locations current.
 
 ## 0.1.0 - 2026-07-03
 

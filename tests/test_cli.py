@@ -186,6 +186,12 @@ class TestSurface:
         for name in mod.cli.commands.keys():
             assert name in output, f"registered command {name!r} missing from --help"
 
+    def test_claude_help_preserves_zero_learning_curve_wording(self, runner):
+        result = runner.invoke(mod.cli, ["claude", "--help"])
+        assert result.exit_code == 0
+        assert "zero-learning-curve" in result.output
+        assert "zero- learning-curve" not in result.output
+
     def test_init_delegates(self, runner, roam_calls):
         res = self._delegates(runner, roam_calls, ["init"], ["init"])
         assert res.exit_code == 0
@@ -320,6 +326,27 @@ class TestDependencyFloor:
         for name in ("README.md", "AGENTS.md"):
             contents = (ROOT / name).read_text(encoding="utf-8")
             assert re.search(rf"roam-code[^\n]{{0,80}}>=\s*{re.escape(floor)}", contents)
+
+    @pytest.mark.parametrize(
+        ("function_name", "call_source"),
+        [
+            ("_ensure_indexed_for_launch", "if _require_index():"),
+            ("_doctor", "indexed = _require_index()"),
+        ],
+    )
+    def test_readme_prefetched_locations_match_current_source(self, function_name, call_source):
+        source = (ROOT / "src" / "compile_code" / "cli.py").read_text(encoding="utf-8").splitlines()
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        definition_line = next(
+            index for index, line in enumerate(source, 1) if line.startswith(f"def {function_name}(")
+        )
+        call_line = next(
+            index
+            for index, line in enumerate(source[definition_line:], definition_line + 1)
+            if line.strip() == call_source
+        )
+        assert f"'location': 'src/compile_code/cli.py:{definition_line}'" in readme
+        assert f"'call_location': 'src/compile_code/cli.py:{call_line}'" in readme
 
 
 class TestRoamVersionEnforcement:
@@ -528,6 +555,28 @@ class TestRoamMidtaskWiring:
         assert "launch-time graph" in guidance
         assert "edits are invisible until the Stop hook" in guidance
 
+    def test_wire_no_verify_still_adds_curated_permissions_and_guidance(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+
+        class _P:
+            returncode = 0
+
+        def fake(*args, timeout=600):
+            assert list(args) == ["hooks", "claude", "--write", "--no-verify"]
+            _write_valid_claude_wiring(tmp_path, include_verify=False)
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam", fake)
+
+        result = runner.invoke(mod.cli, ["wire", "claude", "--no-verify"])
+
+        assert result.exit_code == 0
+        settings = json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
+        assert settings["permissions"]["allow"] == list(mod.ROAM_MIDTASK_ALLOW)
+        guidance = (tmp_path / "CLAUDE.md").read_text()
+        assert mod.ROAM_GUIDANCE_BEGIN in guidance
+        assert mod.ROAM_GUIDANCE_END in guidance
+
     def test_wire_leaves_malformed_local_settings_and_guidance_untouched(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         self._stub_successful_hook_write(monkeypatch, tmp_path)
@@ -609,6 +658,19 @@ class TestClaudeLaunch:
         assert ["hooks", "claude", "--write"] in roam_calls
         assert launches and launches[0][0][0] == TRUSTED_CLAUDE_PATH
 
+    def test_all_in_one_launch_adds_project_midtask_access(self, runner, roam_calls, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        midtask_calls = []
+        monkeypatch.setattr(mod, "_wire_roam_midtask_access", lambda **kwargs: midtask_calls.append(kwargs))
+        launches = self._stub_launch(monkeypatch)
+
+        result = runner.invoke(mod.cli, ["claude"])
+
+        assert result.exit_code == 0
+        assert ["hooks", "claude", "--write"] in roam_calls
+        assert midtask_calls == [{"user_level": False}]
+        assert launches
+
     def test_skips_wiring_when_repo_is_already_wired(self, runner, roam_calls, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mod, "_require_index", lambda: True)
@@ -616,10 +678,33 @@ class TestClaudeLaunch:
         (tmp_path / ".roam").mkdir()
         (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
         _write_valid_claude_wiring(tmp_path)
+        midtask_calls = []
+        monkeypatch.setattr(mod, "_wire_roam_midtask_access", lambda **kwargs: midtask_calls.append(kwargs))
         launches = self._stub_launch(monkeypatch)
         res = runner.invoke(mod.cli, ["claude"])
         assert res.exit_code == 0
         assert roam_calls == []
+        assert midtask_calls == [{"user_level": False}]
+        assert launches and launches[0][0][0] == TRUSTED_CLAUDE_PATH
+
+    def test_existing_user_global_wiring_adds_user_midtask_access_without_rewrite(
+        self, runner, roam_calls, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_require_index", lambda: True)
+        monkeypatch.setattr(mod, "_launch_head", lambda: "abc123")
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / ".compile-code-launch-head").write_text("abc123\n")
+        monkeypatch.setattr(mod, "_claude_wiring_state", lambda: (True, "user"))
+        midtask_calls = []
+        monkeypatch.setattr(mod, "_wire_roam_midtask_access", lambda **kwargs: midtask_calls.append(kwargs))
+        launches = self._stub_launch(monkeypatch)
+
+        result = runner.invoke(mod.cli, ["claude"])
+
+        assert result.exit_code == 0
+        assert roam_calls == []
+        assert midtask_calls == [{"user_level": True}]
         assert launches and launches[0][0][0] == TRUSTED_CLAUDE_PATH
 
     def test_wires_when_repo_is_indexed_but_unwired(self, runner, roam_calls, monkeypatch, tmp_path):
@@ -2417,7 +2502,7 @@ class TestVerifyDirectoryTraversal:
             mod._expand_verify_targets(["src"], tmp_path)
 
 
-def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10) -> Path:
+def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10, include_verify: bool = True) -> Path:
     claude_dir = root / ".claude"
     hook_dir = claude_dir / "hooks"
     hook_dir.mkdir(parents=True, exist_ok=True)
@@ -2441,12 +2526,14 @@ def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10) -> Path:
         'FIELDS = ("scope_stable", "content_sha256_before", "content_sha256_after")\n',
         encoding="utf-8",
     )
-    settings = {
-        "hooks": {
-            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(ups)}]}],
-            "Stop": [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(stop)}]}],
-        }
+    hooks = {
+        "UserPromptSubmit": [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(ups)}]}],
     }
+    if include_verify:
+        hooks["Stop"] = [{"hooks": [{"type": "command", "command": _roam_13_10_hook_command(stop)}]}]
+    else:
+        stop.unlink()
+    settings = {"hooks": hooks}
     settings_path = claude_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
     return settings_path

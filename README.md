@@ -13,7 +13,7 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 
 <sub>Works with Claude Code · one command · zero config · local compiler and verifier · zero model calls</sub>
 
-<sub>A thin CLI over the [roam-code](https://github.com/Cranot/roam-code) engine (installed automatically) · 23 intent procedures · 28 languages · zero model calls</sub>
+<sub>A thin CLI over the [roam-code](https://github.com/Cranot/roam-code) engine (installed automatically) · 22 canonical intent procedures in Roam 13.10 · 28 languages · zero model calls</sub>
 
 </div>
 
@@ -58,13 +58,16 @@ closed compatibility interval makes the command auditable, admits compatible
 13.x fixes, and prevents an untested future major from entering the immutable
 0.2.0 release.
 
-That's it. From then on, every prompt you type gets compiled facts injected
-before the model sees it, and every edit gets a scoped verification after.
+That's it. In the default fully wired mode, each prompt is compiled when the
+local optimizer succeeds; optimizer failures pass the original prompt through
+unchanged. Every edited turn then remains subject to scoped, fail-closed
+verification. The explicit `--no-verify` and `--allow-unwired` modes relax that
+guarantee as their names indicate.
 Prefer your native workflow? Wire once, then keep typing `claude` like always:
 
 ```bash
 compile init
-compile wire claude     # persistent; `compile unwire claude` to undo
+compile wire claude     # persistent; `compile unwire claude` removes the hooks
 ```
 
 Requirements: Python 3.10+, a git repository, and Claude Code for the wired
@@ -181,8 +184,8 @@ Replayed against **723 real prompts** captured from live agent sessions
   are not.)
 - Compile latency: **p50 0.45 s** cold on the replay harness, **p50 92 ms**
   in live sessions (warm cache). Zero model calls, fully local.
-- **Continuously re-checked (latest 2026-07-11, roam 13.7.1):** a daily dogfood
-  harness re-measures the envelope on the live codebases — most recent rolling
+- **Last published dogfood check: 2026-07-11 on roam 13.7.1.** The dogfood
+  harness re-measures the envelope on live codebases — that published rolling
   cold-compile median = **410 ms** (a separate live-traffic population, not
   the 0.45 s replay-harness figure above). The headline A/B table is the
   June-2026 controlled benchmark.
@@ -214,10 +217,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': 'claude',  'location': 'src/compile_code/cli.py:131', 'edge': 'call',
-       'call_line': 'if not _require_index():',  'call_location': 'src/compile_code/cli.py:145'}
-    - {'name': 'doctor',  'location': 'src/compile_code/cli.py:182', 'edge': 'call',
-       'call_line': 'indexed = _require_index()', 'call_location': 'src/compile_code/cli.py:190'}
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:875',
+       'edge': 'call', 'call_line': 'if _require_index():',
+       'call_location': 'src/compile_code/cli.py:884'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:3266', 'edge': 'call',
+       'call_line': 'indexed = _require_index()',
+       'call_location': 'src/compile_code/cli.py:3276'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
@@ -229,7 +234,7 @@ answer contract — no grep, no file reads, no tool-call round-trips.
 
 ## What gets injected
 
-The compiler classifies your prompt into one of 23 intent procedures
+The compiler classifies your prompt into one of 22 canonical intent procedures
 (deterministic regex + a local code graph — no model calls) and pre-executes
 the matching probes:
 
@@ -289,9 +294,9 @@ planted hallucinations caught in both languages.
 
 | Command | What it does |
 |---|---|
-| `compile claude [...]` | Index + prove wiring + launch Claude Code (args pass through; `--allow-unwired` explicitly accepts degraded mode) |
+| `compile claude [...]` | Index + prove wiring + launch Claude Code (remaining args pass through; use `--` when an agent arg collides with Compile options; `--allow-unwired` explicitly accepts degraded mode) |
 | `compile init` | Index the repo (incremental afterwards; `--force` rebuilds) |
-| `compile wire claude` | Persistent wiring; `--user` for all repos, `--no-verify` to skip the post-edit check |
+| `compile wire claude` | Persistent hooks plus curated Roam permissions/guidance; `--user` for all repos, `--no-verify` to skip the post-edit check |
 | `compile unwire claude` | Remove the hooks (`--user` for the user-global install) |
 | `compile run "task"` | Headless: print the compiled envelope (`--json` for scripts/CI) |
 | `compile verify [files...]` | Scoped review of the changed files (`--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
@@ -319,10 +324,11 @@ just text, so any agent can consume it right now:
 - **Any agent, headless.** `compile run "who calls handleSave?"` prints the
   envelope to stdout. Pipe it into Codex, paste it into a chat, or feed it to
   a CI step — no Claude required. `--json` gives a machine-readable envelope.
-- **Codex and other MCP clients.** The kernel ships an MCP server (`roam mcp`,
-  from the roam-code dependency). Point Codex — or any MCP-capable client — at
-  it and the same graph facts (callers, blast radius, history) are exposed as
-  live tools.
+- **Codex and other local-STDIO MCP clients.** The kernel ships an MCP server
+  (`roam mcp`, from the roam-code dependency). Configure Codex with
+  `codex mcp add roam-code -- roam mcp`, then confirm it with `codex mcp list`.
+  Other clients that support local STDIO MCP can launch the same command and
+  expose callers, blast radius, history, and related graph facts as live tools.
 - **Roadmap.** A one-command `compile wire codex` (MCP-first) is planned, so
   Codex gets the same before-the-first-token injection Claude has today.
 
@@ -346,8 +352,11 @@ console-script shim can disagree with the installed distribution.
 Prompt compilation remains fail-open so an unavailable optimizer never blocks
 work. Post-edit verification is fail-closed for edited turns: malformed,
 incomplete, or unavailable verifier evidence cannot be reported as a pass.
-Uninstall completely with `compile unwire claude && pip uninstall
-compile-code roam-code`.
+Remove the project hooks and Python packages with `compile unwire claude &&
+pip uninstall compile-code roam-code`. A user-global hook install requires
+`compile unwire claude --user`. Curated Claude allow entries and the marked
+Roam guidance section remain in place for safe reuse; remove those explicit
+entries manually if the repository should no longer expose Roam commands.
 
 ## Release integrity
 

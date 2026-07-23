@@ -3,8 +3,8 @@
 Pre-resolves repo facts (callers, history, blast radius, config sites)
 BEFORE your coding agent's first model token, and verifies the change
 after it edits. The kernel is provided by the `roam-code` dependency;
-this package is the product CLI: wire it into your agent once, then use
-your agent natively.
+this package is the product CLI: wire it into Claude Code, or feed
+headless ``compile run`` envelopes to other agents.
 """
 
 from __future__ import annotations

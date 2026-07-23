@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "compile-code"
 version = "0.2.0"
-description = "A compiler for AI coding tasks: pre-resolves repo facts before your agent's first token. Fewer turns, fewer tokens, same answers."
+description = "A compiler for AI coding tasks: pre-resolves repo facts before the agent's first token to reduce tool calls and token use."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -25,7 +25,8 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
-    # >=13.10.0,<14: tested receipt-v3 Verify + default-on mode-enforcement contract.
+    # >=13.10.0,<14: tested receipt-v3 Verify + MCP-default mode enforcement;
+    # CLI/hook enforcement remains explicit at the launcher boundary.
     "roam-code<14,>=13.10.0",
     "click>=8.0",
 ]

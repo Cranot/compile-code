@@ -923,7 +923,10 @@ def _exit_after_canonical_claude_hook_update(
         *_claude_hook_args_for_canonical_write_order(uninstall=uninstall, no_verify=no_verify, user_level=user_level)
     )
     if rc == 0 and not uninstall:
-        _wire_roam_midtask_access(user_level=user_level)
+        if no_verify:
+            _wire_roam_midtask_access(user_level=user_level, require_verify=False)
+        else:
+            _wire_roam_midtask_access(user_level=user_level)
     raise SystemExit(rc)
 
 
@@ -1338,8 +1341,10 @@ def _read_claude_settings(settings_path: Path) -> tuple[dict[str, object] | None
     return settings, None
 
 
-def _settings_mapping_wiring_state(settings: dict[str, object], settings_path: Path) -> tuple[bool, str]:
-    """Validate both canonical synchronous hook entries in one settings object."""
+def _settings_mapping_wiring_state(
+    settings: dict[str, object], settings_path: Path, *, require_verify: bool = True
+) -> tuple[bool, str]:
+    """Validate the required canonical synchronous hooks in one settings object."""
     if "disableAllHooks" in settings:
         disabled = settings["disableAllHooks"]
         if type(disabled) is not bool:
@@ -1350,6 +1355,8 @@ def _settings_mapping_wiring_state(settings: dict[str, object], settings_path: P
     if not isinstance(hooks, dict):
         return False, "hooks_shape"
     for event, filename in HOOK_EVENTS.items():
+        if event == "Stop" and not require_verify:
+            continue
         rules = hooks.get(event)
         if not isinstance(rules, list):
             return False, "hook_event_missing"
@@ -1419,7 +1426,7 @@ def _settings_tree_is_concrete(settings_path: Path, *, root: Path) -> bool:
     return settings_path.absolute().parent == claude_dir.absolute() and _claude_tree_is_concrete(root=root)
 
 
-def _wiring_state_for_paths(paths: tuple[Path, ...], *, root: Path) -> tuple[bool, str]:
+def _wiring_state_for_paths(paths: tuple[Path, ...], *, root: Path, require_verify: bool = True) -> tuple[bool, str]:
     last_reason = "settings_missing"
     for path in paths:
         if not path.exists():
@@ -1438,7 +1445,7 @@ def _wiring_state_for_paths(paths: tuple[Path, ...], *, root: Path) -> tuple[boo
         if "hooks" not in settings:
             last_reason = "hooks_absent"
             continue
-        return _settings_mapping_wiring_state(settings, path)
+        return _settings_mapping_wiring_state(settings, path, require_verify=require_verify)
     return False, last_reason
 
 
@@ -1626,14 +1633,14 @@ def _merge_roam_guidance(claude_path: str) -> None:
         return
 
 
-def _wire_roam_midtask_access(*, user_level: bool) -> None:
+def _wire_roam_midtask_access(*, user_level: bool, require_verify: bool = True) -> None:
     """Expose curated launch-graph queries after the delegated hook write."""
     root = Path(os.path.expanduser("~")) if user_level else Path.cwd()
     if not _claude_tree_is_concrete(root=root):
         return
     claude_dir = root / ".claude"
     settings_paths = (claude_dir / "settings.local.json", claude_dir / "settings.json")
-    if not _wiring_state_for_paths(settings_paths, root=root)[0]:
+    if not _wiring_state_for_paths(settings_paths, root=root, require_verify=require_verify)[0]:
         return
     if not _merge_roam_permissions(str(claude_dir / "settings.local.json")):
         return
@@ -1810,8 +1817,11 @@ def _wire(agent: str, no_verify: bool, user_level: bool) -> None:
 
     For claude: installs a UserPromptSubmit hook (compile the prompt,
     inject pre-resolved facts) and a Stop hook (scoped verify after
-    edits, quiet on pass). Both fail-open — a broken install can never
-    block your agent. Undo anytime with `compile unwire claude`.
+    edits, quiet on pass). It also best-effort merges curated Roam Bash
+    permissions and a marked Roam guidance section. Prompt compilation
+    fails open. After edits, verification fails closed when evidence is
+    unavailable, malformed, incomplete, or failed. Undo hooks with
+    `compile unwire claude`; permissions and guidance remain for reuse.
     """
     _exit_after_canonical_claude_hook_update(no_verify=no_verify, user_level=user_level)
 
@@ -1898,9 +1908,11 @@ def _launch_agent(argv: list[str], env: dict[str, str], *, use_exec: bool | None
 def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, allow_unwired: bool) -> None:
     """Launch Claude Code with the compile/verify loop active (all-in-one).
 
-    Ensures the repo is indexed, wires the hooks if absent, then execs
-    the real `claude` with any arguments passed through. The zero-
-    learning-curve path: type `compile claude` instead of `claude`,
+    Ensures the repo is indexed, wires the hooks and best-effort curated
+    Roam permissions/guidance if absent, then execs the real `claude` with
+    remaining arguments passed through. Use `--` when an agent argument
+    collides with Compile's own options. The zero-learning-curve path:
+    type `compile claude` instead of `claude`,
     everything else is your normal workflow.
     """
     claude_path, claude_reason = _resolve_trusted_executable("claude", reject_workspace=True)
@@ -1932,9 +1944,12 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
         # Idempotent wiring is part of this launcher's safety contract: claiming
         # the compile/Verify loop is active while launching without hooks is a
         # false success. Degraded launch remains available only by explicit opt-in.
-        wiring_ready, _wiring_reason = _claude_wiring_state()
+        wiring_ready, wiring_reason = _claude_wiring_state()
+        midtask_user_level = wiring_ready and wiring_reason == "user"
         if not wiring_ready:
             wire_rc = _delegate("hooks", "claude", "--write", executable=exact_roam, env=tool_env)
+        if wire_rc == 0:
+            _wire_roam_midtask_access(user_level=midtask_user_level)
 
     # Readiness is deliberately re-proven at the last boundary. A cached index,
     # HEAD marker, prior settings substring, or successful earlier write cannot

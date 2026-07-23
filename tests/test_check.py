@@ -81,6 +81,19 @@ def test_unqualified_no_egress_claim_is_retired():
     )
 
 
+def test_stale_intent_procedure_count_is_retired():
+    assert check._retired_claim_hits("README.md", "23 intent procedures") == [
+        "README.md:1: retired Roam 13.10 intent-procedure count"
+    ]
+    assert (
+        check._retired_claim_hits(
+            "README.md",
+            "22 canonical intent procedures in Roam 13.10",
+        )
+        == []
+    )
+
+
 def test_gate_reports_a_missing_executable_without_traceback(monkeypatch, capsys):
     def missing(*args, **kwargs):
         raise FileNotFoundError("missing")
