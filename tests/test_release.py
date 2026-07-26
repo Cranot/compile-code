@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -1699,6 +1700,64 @@ def test_locked_graph_parser_fails_closed_on_stale_unpinned_unhashed_or_roam_inp
     path.write_text(mutation(path.read_text(encoding="utf-8")), encoding="utf-8")
     with pytest.raises(release.ReleaseError, match=message):
         release.locked_requirement_queries(root)
+
+
+def _repo_with_release_workflow(tmp_path: Path, mutate) -> Path:
+    """Copy the pieces audit_repository() reads, with release.yml mutated."""
+    root = tmp_path / "repo"
+    shutil.copytree(ROOT / ".github", root / ".github")
+    shutil.copytree(ROOT / "release", root / "release")
+    wf = root / ".github" / "workflows" / "release.yml"
+    wf.write_text(mutate(wf.read_text(encoding="utf-8")), encoding="utf-8")
+    return root
+
+
+def _mutate_publish_job(workflow: str, edit) -> str:
+    """Apply `edit` to the publish job body only, leaving the rest untouched."""
+    return re.sub(
+        r"(?ms)(^  publish:\n.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)",
+        lambda m: edit(m.group(1)),
+        workflow,
+    )
+
+
+def test_publish_owner_gate_is_asserted_on_the_publish_job_not_the_whole_file(tmp_path: Path):
+    """Weakening the PRIVILEGED job must be caught, not masked by text elsewhere.
+
+    required_fragments searched the entire workflow string, so equivalent
+    wording in any other job satisfied the owner checks. Stripping all three
+    owner predicates from `publish`, or moving `environment: pypi` off it, both
+    left audit_repository() returning [] — the guard reported success while the
+    job that actually publishes had lost its gate.
+
+    These bindings decide WHO may publish, so they belong to that job
+    specifically. A guard that cannot fail is worse than no guard, because it
+    gets quoted as assurance.
+    """
+    assert release.audit_repository(ROOT) == [], "the checked-in workflow must itself be clean"
+
+    stripped = _repo_with_release_workflow(
+        tmp_path / "a",
+        lambda wf: _mutate_publish_job(
+            wf,
+            lambda job: (
+                job.replace("github.repository == 'Cranot/compile-code'", "true")
+                .replace("github.actor == 'Cranot'", "true")
+                .replace("github.triggering_actor == 'Cranot'", "true")
+            ),
+        ),
+    )
+    findings = release.audit_repository(stripped)
+    assert any("binding drift" in f for f in findings), f"owner predicates removed but not caught: {findings}"
+
+    moved = _repo_with_release_workflow(
+        tmp_path / "b",
+        lambda wf: _mutate_publish_job(
+            wf, lambda job: job.replace("environment:\n      name: pypi", "environment:\n      name: other")
+        ),
+    )
+    findings = release.audit_repository(moved)
+    assert any("binding drift" in f for f in findings), f"pypi environment moved but not caught: {findings}"
 
 
 def test_unrankable_remote_version_refuses_instead_of_being_ignored(tmp_path: Path):

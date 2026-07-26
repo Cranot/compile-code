@@ -3592,6 +3592,19 @@ def audit_repository(root: Path = ROOT) -> list[str]:
     else:
         publish_job = publish_match.group(1)
         for binding in (
+            # These five were previously asserted only against the WHOLE
+            # workflow text via required_fragments, so equivalent wording
+            # anywhere else satisfied them. Removing all three owner predicates
+            # from the publish job, or moving `environment: pypi` to prepublish,
+            # both left this audit returning [] — the guard reported success
+            # while the privileged job had lost its owner gate. They are the
+            # bindings that decide WHO may publish, so they must be asserted on
+            # the publish job specifically.
+            "github.repository == 'Cranot/compile-code'",
+            "github.actor == 'Cranot'",
+            "github.triggering_actor == 'Cranot'",
+            "environment:\n      name: pypi",
+            "permissions:\n      id-token: write",
             "github.ref == 'refs/tags/v0.2.0'",
             "needs.prepublish.outputs.publish_required == 'true'",
             "needs.github_release_preflight.outputs.source_sha == github.sha",
