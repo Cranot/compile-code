@@ -38,6 +38,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           pip-version: "26.1.2"
 
+      - name: Run secret scan
+        run: python scripts/secret_scan.py
+
       - name: Install hash-locked quality tools
         env:
           PIP_CONFIG_FILE: /dev/null

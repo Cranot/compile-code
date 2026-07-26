@@ -2,6 +2,7 @@
 
 ## 0.2.0 - 2026-07-23
 
+- Adds a standalone CI secret scan (`scripts/secret_scan.py`), ported from roam-code's pattern catalogue including its AI-provider keys (Anthropic, OpenAI, xAI, Groq, HuggingFace, Replicate) that the prior narrow `LEAK_PATTERNS` check missed.
 - Binds `compile verify` to one canonical Roam JSON transaction with a fresh nonce, sorted target scope, exact file-byte digest, and closed Verify receipt-v3 validation; duplicate, trailing, skipped, incomplete, contradictory, or oversized evidence fails closed.
 - Verifies concrete workspace-external `roam` and Claude executables selected by PATH and declares the tested roam-code compatibility interval `>=13.10.0,<14`.
 - Isolates release-gate tests from Git hook repository controls and fails closed if validation mutates the checkout state.
