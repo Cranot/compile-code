@@ -104,6 +104,69 @@ jobs:
           overwrite: false
           include-hidden-files: false
 
+  require_green_ci:
+    name: Require green CI for the resolved commit
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # List Actions workflow runs for the resolved release commit.
+      contents: read
+    steps:
+      # A tag proves WHAT is being shipped; it proves nothing about whether the
+      # code works. Without this job, nothing here consulted CI at all before
+      # publish — no pytest, no ruff, no workflow_run dependency, no check
+      # query — so a red commit tagged for release would sail straight
+      # through build/provenance/prepublish to the pypi environment gate.
+      #
+      # This runs alongside the rest of the build-fanout (needs: build), and
+      # its result is required by the publish job below, so a red or missing
+      # CI run for the resolved commit blocks publication before any OIDC
+      # token is requested.
+      - name: Require green CI for the resolved commit
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          # Workflow names, as they appear in the Actions UI. compile-code has
+          # no Secret Scan workflow (unlike roam-code) — requiring one here
+          # would block every release permanently.
+          REQUIRED_WORKFLOWS: 'CI'
+        run: |
+          set -euo pipefail
+
+          runs_json=$(gh api --paginate "repos/${REPO}/actions/runs?head_sha=${SHA}&per_page=100" \
+            --jq '[.workflow_runs[] | {name, status, conclusion, created_at, url}]' | jq -s 'add // []')
+
+          failed=0
+          while IFS= read -r wf; do
+            [[ -z "$wf" ]] && continue
+            # Latest run for this workflow against this exact commit.
+            latest=$(jq -c --arg n "$wf" '[.[] | select(.name == $n)] | sort_by(.created_at) | last // empty' <<<"$runs_json")
+            if [[ -z "$latest" || "$latest" == "null" ]]; then
+              echo "::error::No '$wf' run found for ${SHA}. Cannot prove this commit was tested; refusing to publish."
+              failed=1
+              continue
+            fi
+            status=$(jq -r '.status' <<<"$latest")
+            conclusion=$(jq -r '.conclusion // "none"' <<<"$latest")
+            if [[ "$status" != "completed" ]]; then
+              echo "::error::'$wf' for ${SHA} is still '$status'. Re-run this release once it completes."
+              failed=1
+            elif [[ "$conclusion" != "success" ]]; then
+              echo "::error::'$wf' for ${SHA} concluded '$conclusion'. Refusing to publish an untested commit. $(jq -r '.url' <<<"$latest")"
+              failed=1
+            else
+              echo "  ok: $wf concluded success for ${SHA}"
+            fi
+          done < <(tr ';' '\n' <<<"$REQUIRED_WORKFLOWS")
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::error::Release blocked: the resolved commit does not have green required checks."
+            exit 1
+          fi
+          echo "All required workflows are green for ${SHA}."
+
   provenance:
     name: Attest the closed artifact bundle
     needs: build
@@ -177,9 +240,10 @@ jobs:
 
   publish:
     name: Publish through the protected PyPI environment
-    needs: [build, prepublish, github_release_preflight, github_release_draft_verify]
+    needs: [build, require_green_ci, prepublish, github_release_preflight, github_release_draft_verify]
     if: >-
-      always() && needs.build.result == 'success' && needs.prepublish.result == 'success' &&
+      always() && needs.build.result == 'success' && needs.require_green_ci.result == 'success' &&
+      needs.prepublish.result == 'success' &&
       needs.github_release_preflight.result == 'success' &&
       github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
       github.triggering_actor == 'Cranot' && github.ref == 'refs/tags/v0.2.0' &&
