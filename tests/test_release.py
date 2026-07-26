@@ -1122,12 +1122,19 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         "github_release_preflight",
         "github_release_stage",
     ]
+    # `require_green_ci` gates publish on the resolved commit having a completed,
+    # successful CI run. It sits directly after `build` so no OIDC token is ever
+    # requested for a red commit. Asserted in both places deliberately: the needs
+    # list alone would let the job run and be skipped by `if`, which is a weaker
+    # guarantee than never scheduling it.
     assert jobs["publish"]["needs"] == [
         "build",
+        "require_green_ci",
         "prepublish",
         "github_release_preflight",
         "github_release_draft_verify",
     ]
+    assert "needs.require_green_ci.result == 'success'" in jobs["publish"]["if"]
     assert jobs["postpublish"]["needs"] == [
         "build",
         "prepublish",
