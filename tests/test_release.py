@@ -1701,6 +1701,40 @@ def test_locked_graph_parser_fails_closed_on_stale_unpinned_unhashed_or_roam_inp
         release.locked_requirement_queries(root)
 
 
+def test_unrankable_remote_version_refuses_instead_of_being_ignored(tmp_path: Path):
+    """A registry version we cannot rank must STOP the release, not be skipped.
+
+    The monotonicity guard filtered the comparison set with
+    `if VERSION_RE.fullmatch(version)`, so any remote version that was not
+    strict X.Y.Z was dropped before the max() — a published 1.0.0rc1 or
+    1.0.0.post1 simply was not considered, and publishing 0.2.0 sailed through.
+    The guard reported success while guarding nothing, which is worse than
+    having no guard, because it gets quoted as assurance.
+
+    Refusing is deliberate rather than implementing PEP 440 ordering: this
+    module is stdlib-only, and inability to PROVE monotonicity is not
+    permission to publish.
+    """
+
+    def _project_with(versions):
+        return {"info": {"name": release.PROJECT}, "releases": {v: [] for v in versions}}
+
+    bundle, dist = _bundle(tmp_path)
+
+    for unrankable in ("1.0.0rc1", "1.0.0.post1", "1.0.0.dev0"):
+        with pytest.raises(release.ReleaseError, match="cannot prove PyPI version monotonicity"):
+            release._remote_release_state(
+                bundle, dist, fetch_project=lambda versions=[unrankable]: _project_with(versions)
+            )
+
+    # Legitimate cases must still behave exactly as before.
+    assert release._remote_release_state(bundle, dist, fetch_project=lambda: _project_with(["0.1.0"])) == "missing", (
+        "a strictly lower published version must still allow the release"
+    )
+    with pytest.raises(release.ReleaseError, match="non-monotonic"):
+        release._remote_release_state(bundle, dist, fetch_project=lambda: _project_with(["1.0.0"]))
+
+
 def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
     bundle, dist = _bundle(tmp_path)
     assert release._remote_release_state(bundle, dist, fetch_project=lambda: None) == "missing"

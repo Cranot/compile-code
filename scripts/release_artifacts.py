@@ -2444,9 +2444,25 @@ def _remote_release_state(
     rows = releases.get(manifest["version"])
     if not rows:
         intended = tuple(int(part) for part in manifest["version"].split("."))
-        published = [
-            tuple(int(part) for part in version.split(".")) for version in releases if VERSION_RE.fullmatch(version)
-        ]
+        # Versions that are not strict X.Y.Z used to be filtered out of the
+        # comparison entirely, so a remote 1.0.0rc1 or 1.0.0.post1 was simply
+        # not considered and publishing 0.2.0 passed the monotonicity check —
+        # the guard reported success while guarding nothing.
+        #
+        # Refuse rather than implement PEP 440 ordering here. This module is
+        # deliberately stdlib-only, and a hand-rolled pre/post/dev/epoch
+        # comparator is exactly the kind of subtle code that would itself need
+        # a guard. Inability to PROVE monotonicity is not permission to
+        # publish; this project's own versions are strict X.Y.Z
+        # (_validate_version enforces it), so anything else on the registry is
+        # a surprise worth stopping for.
+        unrankable = sorted(v for v in releases if not VERSION_RE.fullmatch(v))
+        _require(
+            not unrankable,
+            "cannot prove PyPI version monotonicity: registry holds non-X.Y.Z "
+            f"version(s) {unrankable[:5]}; rank them deliberately before publishing",
+        )
+        published = [tuple(int(part) for part in version.split(".")) for version in releases]
         _require(not published or max(published) < intended, "refusing a non-monotonic PyPI version")
         return "missing"
     _require(isinstance(rows, list), "PyPI release inventory is malformed")
