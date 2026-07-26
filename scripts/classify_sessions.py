@@ -11,6 +11,32 @@ ledger files/directories, or name a Claude ledger root explicitly::
 The default report is aggregate-only. It never emits source paths, session
 identifiers, prompts, commands, or Read targets. A bounded diagnostic view of
 those sensitive values is available only with ``--include-sensitive-content``.
+
+Why session ledgers are the right ground truth
+----------------------------------------------
+The compile loop's whole pitch is that it pre-resolves repo facts *before* the
+agent's first token, so the agent answers instead of re-grepping. A session
+ledger is therefore direct evidence of whether that worked: a session where the
+agent re-derived something is one the compiler *should* have pre-resolved but
+did not — a compiler miss. Each ledger is bucketed by three retry-like
+signatures:
+
+  repeated_tool_use     the same Bash command or Read file_path ran >= 2x —
+                        the agent re-grepped or re-read instead of answering
+                        from a pre-compiled envelope.
+  repeated_prompt       the same user-prompt text was sent >= 2x in one session
+                        (a literal retry), or recurs as the primary prompt
+                        across >= 2 ledgers (an autopilot retry of the same
+                        backlog item).
+  verify_fail_aftermath a verify-shaped step (``check.py`` / ``roam verify`` /
+                        ``pytest`` / ``ruff``) exited nonzero AND the session
+                        kept working afterwards — the agent cleaned up a verify
+                        failure the loop surfaced.
+
+A session landing in any bucket is flagged as a compiler miss. Note the buckets
+are heuristics for a MISS, not proof of one: a legitimate re-read of a file that
+changed mid-session also trips repeated_tool_use. They are useful in aggregate,
+and should not be quoted as per-session verdicts.
 """
 
 from __future__ import annotations
