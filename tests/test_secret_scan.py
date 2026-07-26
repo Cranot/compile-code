@@ -57,7 +57,7 @@ PROVIDER_FAMILY_CASES = [
 @pytest.mark.parametrize(("secret", "expected"), PROVIDER_FAMILY_CASES)
 def test_provider_family_is_detected(secret: str, expected: str) -> None:
     """Each credential family is caught by its own named pattern."""
-    hits = _detect(f"API_KEY = '{secret}'")
+    hits = _detect(f"API_KEY = '{secret}'")  # f-string template, not a literal value  # secretsallow
     assert hits, f"{expected}: no pattern fired -- this credential would leak"
     assert expected in hits, f"{expected}: expected that pattern, got {sorted(hits)}"
 
