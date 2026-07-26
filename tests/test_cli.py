@@ -22,7 +22,9 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
+import compile_code
 import compile_code.cli as mod
+from scripts import release_artifacts as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -309,6 +311,40 @@ class TestSurface:
         assert "--changed" in res.output
         assert "--new-only" in res.output
         assert "--diff-only" in res.output
+
+
+class TestVersionReporting:
+    """A reported version that lies is worse than none: it silently
+    invalidates every bug report and deploy verification that quotes it.
+
+    ``compile --version`` resolves ``compile_code.__version__`` via
+    ``importlib.metadata`` rather than a hardcoded literal (see
+    ``compile_code/__init__.py``), so there is exactly one place a real
+    literal-vs-pyproject drift could reappear if someone "optimized" that
+    lookup away later. This guard pins the *outcome* (reported == declared),
+    not a snapshot of today's string, so it fails the moment the two sources
+    diverge for any reason — including a stale installed/editable dist whose
+    metadata was never refreshed after a pyproject.toml version bump.
+    """
+
+    def test_reported_version_matches_pyproject_declared_version(self, runner):
+        declared = release._project_version(ROOT)
+        result = runner.invoke(mod.cli, ["--version"])
+
+        assert result.exit_code == 0
+        assert compile_code.__version__ == declared, (
+            f"compile_code.__version__ ({compile_code.__version__!r}) has drifted from "
+            f"pyproject.toml's declared version ({declared!r}) — reinstall the editable "
+            "package (`pip install -e .`) so installed metadata matches the source tree."
+        )
+        assert result.output.strip() == f"cli, version {declared}"
+
+    def test_version_flag_is_eager_and_short_circuits_the_group(self, runner):
+        # --version must exit before the group body runs, so it never touches
+        # the toolchain even if invoked alongside other (invalid) arguments.
+        result = runner.invoke(mod.cli, ["--version", "not-a-real-subcommand"])
+        assert result.exit_code == 0
+        assert "version" in result.output
 
 
 class TestDependencyFloor:
