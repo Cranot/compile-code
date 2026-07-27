@@ -34,12 +34,21 @@ planted GitHub token, passed, and was declared working, while a real
 Anthropic OAuth token sailed through untouched. A self-test exercising a
 pattern already known to be covered proves nothing about coverage.
 
-NOTE ON TEST FIXTURES: this scanner does not exempt ``tests/`` (mirroring
-roam-code's ``scripts/secret_scan.py``, not its test-suppressing
+NOTE ON TEST FIXTURES: this scanner does not exempt ``tests/`` wholesale
+(mirroring roam-code's ``scripts/secret_scan.py``, not its test-suppressing
 ``cmd_secrets.scan_project``) -- it scans every tracked file's content.
 Planted test secrets must therefore be split across string-literal
 concatenations so the raw source text never contains a contiguous match
 (see tests/test_secret_scan.py); real secrets do not arrive pre-split.
+
+The ONE narrow exception is ``tests/test_secret_scan.py`` itself
+(``_OWN_TEST_CORPUS_FILES`` below): a secret scanner cannot be tested
+without planting secret-shaped strings, so that file matching its own
+patterns is a structural certainty, not a finding -- not a loophole a real
+leak could hide behind, since it is one named path, not a directory rule.
+Same idiom as roam-code's ``WHITELIST_FILES`` in
+``scripts/internal_language_patterns.py``, which exempts that pattern
+catalogue's own test file for the identical reason.
 """
 
 from __future__ import annotations
@@ -225,14 +234,57 @@ def _placeholder_candidate(match: "re.Match[str]") -> str:
     return quoted.group(1) if quoted else matched
 
 
+# An un-interpolated f-string/``str.format``/shell-style placeholder token
+# (``{name}``, ``${name}``, ``%(name)s``) is template SYNTAX, not data -- no
+# vendor pattern above can ever legitimately match one (every vendor shape
+# requires a fixed prefix or character set a bare placeholder can't produce),
+# so this is safe to treat as a placeholder for every pattern, not just the
+# generic ones. This is what makes ``f"API_KEY = '{secret}'"`` in
+# tests/test_secret_scan.py -- and in prose that quotes that exact line, e.g.
+# a commit message -- a template, not a literal value.
+_TEMPLATE_PLACEHOLDER_RE = re.compile(
+    r"\{[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*\}|%\([A-Za-z_][A-Za-z0-9_]*\)s"
+)
+
+# Patterns whose regex is keyed on a variable NAME ("secret", "token",
+# "password", ...) followed by "= '<anything 8+ chars>'" -- i.e. patterns that
+# say nothing about the VALUE's shape, unlike e.g. "AWS Access Key" where the
+# match *is* the credential. Only these get the identifier-vs-value check
+# below; vendor patterns must not, since some real credentials (AWS key IDs)
+# are themselves canonically all-uppercase-and-digits.
+_GENERIC_ASSIGNMENT_PATTERNS = frozenset({"Generic Secret Assignment", "Generic Password Assignment"})
+
+# A bare SCREAMING_SNAKE_CASE token, e.g. RELEASE_GUARD_READ_TOKEN.
+_SCREAMING_SNAKE_IDENTIFIER_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+
+
 def _is_explicit_placeholder(match: "re.Match[str]") -> bool:
-    value = _placeholder_candidate(match).strip().strip("<>{}[]()'\"")
+    raw = _placeholder_candidate(match).strip()
+    if _TEMPLATE_PLACEHOLDER_RE.fullmatch(raw):
+        return True
+    value = raw.strip("<>{}[]()'\"")
     lower = value.lower()
     if value in _EXACT_PLACEHOLDERS or lower in _EXACT_PLACEHOLDERS:
         return True
     if re.fullmatch(r"[xX]{6,}", value):
         return True
     return re.fullmatch(r"(?:your|insert|replace)[_-][a-z0-9_-]+", lower) is not None
+
+
+def _assignment_value_is_credential_shaped(pat: dict, match: "re.Match[str]") -> bool:
+    """Reject a "Generic *Assignment" hit whose quoted value is itself a bare
+    SCREAMING_SNAKE_CASE identifier -- the NAME of an env var, GitHub secret,
+    or constant being assigned (e.g. ``RELEASE_GUARD_SECRET = "RELEASE_GUARD_
+    READ_TOKEN"``), not an opaque credential value. Real credentials have
+    entropy and character-class diversity; an all-caps-underscore token has
+    neither. Scoped to the generic assignment patterns only: some vendor
+    patterns (AWS Access Key IDs) are themselves canonically all-uppercase
+    and must not be exempted by this rule.
+    """
+    if pat["name"] not in _GENERIC_ASSIGNMENT_PATTERNS:
+        return True
+    value = _placeholder_candidate(match)
+    return _SCREAMING_SNAKE_IDENTIFIER_RE.fullmatch(value) is None
 
 
 def _line_is_allowlisted(line: str) -> bool:
@@ -250,6 +302,8 @@ def scan_text(rel_path: str, text: str) -> list[dict]:
                 if _is_explicit_placeholder(match):
                     continue
                 if not _high_entropy_passes(pat, match):
+                    continue
+                if not _assignment_value_is_credential_shaped(pat, match):
                     continue
                 findings.append(
                     {
@@ -287,10 +341,30 @@ _SKIP_DIRS = frozenset(
 
 _BINARY_EXTENSIONS = frozenset(
     {
-        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
-        ".pdf", ".zip", ".tar", ".gz", ".whl", ".pyc", ".pyo",
-        ".so", ".dylib", ".dll", ".exe", ".woff", ".woff2", ".ttf",
-        ".eot", ".otf", ".lock",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".bmp",
+        ".webp",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".whl",
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".exe",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".otf",
+        ".lock",
     }
 )
 
@@ -298,6 +372,20 @@ _BINARY_EXTENSIONS = frozenset(
 def _in_skip_dir(rel_path: str) -> bool:
     parts = rel_path.split("/")
     return any(p in _SKIP_DIRS or p.endswith(".egg-info") for p in parts[:-1])
+
+
+# The scanner's OWN test fixture corpus: a path allowlist, not a directory
+# rule, so it can't quietly grow into "tests/ is exempt" (which would reopen
+# the coverage gap this scanner exists to close). Precedent: roam-code's
+# ``WHITELIST_FILES`` in scripts/internal_language_patterns.py exempts that
+# pattern catalogue's own test file the same way, for the same reason --
+# a scanner cannot be tested without secret-shaped strings, so its own test
+# file matching its own patterns is a structural certainty, not a finding.
+_OWN_TEST_CORPUS_FILES = frozenset({"tests/test_secret_scan.py"})
+
+
+def _is_own_test_corpus(rel_path: str) -> bool:
+    return rel_path.replace("\\", "/") in _OWN_TEST_CORPUS_FILES
 
 
 def _tracked_files(root: Path) -> list[str]:
@@ -317,7 +405,7 @@ def _tracked_files(root: Path) -> list[str]:
 def scan_repo(root: Path) -> list[dict]:
     findings: list[dict] = []
     for rel_path in _tracked_files(root):
-        if _in_skip_dir(rel_path):
+        if _in_skip_dir(rel_path) or _is_own_test_corpus(rel_path):
             continue
         suffix = Path(rel_path).suffix.lower()
         if suffix in _BINARY_EXTENSIONS:

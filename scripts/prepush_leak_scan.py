@@ -100,6 +100,8 @@ def _should_scan_path(path: str) -> bool:
         return False
     if secret_scan._in_skip_dir(path):
         return False
+    if secret_scan._is_own_test_corpus(path):
+        return False
     return Path(path).suffix.lower() not in secret_scan._BINARY_EXTENSIONS
 
 

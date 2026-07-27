@@ -103,3 +103,57 @@ def test_mask_secret_never_returns_the_full_value() -> None:
     assert secret not in masked
     assert masked != secret
     assert masked.startswith("sk-Z")
+
+
+# --- name-vs-value discrimination -------------------------------------------
+# These test cases can use plain contiguous literals (not string-concatenation
+# tricks) because this file is on the scanner's own OWN_TEST_CORPUS_FILES
+# allowlist -- see the module docstring's "NOTE ON TEST FIXTURES".
+
+
+def test_screaming_snake_identifier_value_is_not_flagged() -> None:
+    """A bare SCREAMING_SNAKE_CASE value is the NAME of a secret (an env var
+    or GitHub Actions secret to read at runtime), not a credential value --
+    real-world case: scripts/release_artifacts.py's RELEASE_GUARD_SECRET."""
+    assert not _detect('RELEASE_GUARD_SECRET = "RELEASE_GUARD_READ_TOKEN"')
+
+
+def test_screaming_snake_rule_does_not_swallow_a_real_looking_secret() -> None:
+    """The identifier-value discrimination must be narrow: a value with
+    mixed case and digits (i.e. actual entropy, not just an identifier
+    shape) still has to fire Generic Secret Assignment."""
+    hits = _detect('API_SECRET = "aB3xQ7zRt9LmZp2w"')
+    assert "Generic Secret Assignment" in hits
+
+
+def test_screaming_snake_rule_does_not_weaken_vendor_patterns() -> None:
+    """AWS Access Key IDs are themselves canonically all-uppercase-and-
+    digits -- the identifier-value discrimination is scoped to the generic
+    assignment patterns only and must not exempt a vendor-shaped credential
+    just because it happens to look like a constant name."""
+    hits = _detect("AWS_KEY = 'AKIA" + "Q" * 16 + "'")
+    assert "AWS Access Key" in hits
+
+
+def test_unresolved_template_placeholder_value_is_not_flagged() -> None:
+    """An un-interpolated f-string/format placeholder like '{secret}' is
+    template syntax, not a literal value -- real-world case: this file's own
+    f"API_KEY = '{secret}'" parametrized-test line, and prose (e.g. a commit
+    message) that quotes it verbatim."""
+    assert not _detect("API_KEY = '{secret}'")
+    assert not _detect("API_KEY = '${secret}'")
+    assert not _detect("API_KEY = '%(secret)s'")
+
+
+# --- scanner-own-test-corpus path exemption ---------------------------------
+
+
+def test_own_test_corpus_predicate_is_one_file_not_a_directory() -> None:
+    """A path allowlist, not a directory rule: only this exact file is
+    exempt, so the exemption cannot quietly grow into "tests/ is exempt"
+    (which would reopen the coverage gap this scanner exists to close)."""
+    assert secret_scan._is_own_test_corpus("tests/test_secret_scan.py")
+    assert secret_scan._is_own_test_corpus("tests\\test_secret_scan.py")
+    assert not secret_scan._is_own_test_corpus("tests/test_secret_scan_other.py")
+    assert not secret_scan._is_own_test_corpus("tests/test_prepush_leak_scan.py")
+    assert not secret_scan._is_own_test_corpus("scripts/secret_scan.py")

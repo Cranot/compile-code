@@ -160,6 +160,69 @@ def test_no_mode_and_no_upstream_fails_closed_instead_of_scanning_nothing(repo: 
     assert "no --range or --pre-push-updates" in result.stderr
 
 
+def test_own_test_corpus_file_is_exempt_across_its_whole_history(repo: Path) -> None:
+    """Reproduces compile-code's own real false-positive shape: a commit adds
+    tests/test_secret_scan.py's f-string template line un-annotated, and a
+    LATER commit adds a '# secretsallow' marker to the tip version. Because
+    the range scan reads every commit's own full blob, the marker at the tip
+    does not retroactively clean the earlier commit -- only the path
+    allowlist (scripts/secret_scan.py's _OWN_TEST_CORPUS_FILES) does that."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    _commit(
+        repo,
+        "tests/test_secret_scan.py",
+        "hits = _detect(f\"API_KEY = '{secret}'\")\n",
+        "add secret scan gate (unmarked f-string template)",
+    )
+    tip = _commit(
+        repo,
+        "tests/test_secret_scan.py",
+        "hits = _detect(f\"API_KEY = '{secret}'\")  # f-string template  # secretsallow\n",
+        "suppress the gate's own test-helper false positive",
+    )
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
+
+
+def test_own_test_corpus_exemption_is_one_file_not_a_directory(repo: Path) -> None:
+    """The allowlist must not silently widen into 'tests/ is exempt' -- a
+    DIFFERENT file under tests/ carrying a real credential-shaped secret must
+    still be caught."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    leak_secret = "AKIA" + "W" * 16
+    tip = _commit(
+        repo,
+        "tests/test_something_else.py",
+        f'AWS_KEY = "{leak_secret}"\n',
+        "accidentally commit a real-shaped secret in an unrelated test file",
+    )
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stderr}"
+    assert "tests/test_something_else.py" in result.stderr
+
+
+def test_secret_name_constant_is_not_flagged_across_history(repo: Path) -> None:
+    """Reproduces compile-code's other real false positive: a constant whose
+    value NAMES a secret (e.g. a GitHub Actions secret to read at runtime)
+    is not itself a credential value, in the commit that introduces it --
+    not just after a later commit adds a suppression marker."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit(
+        repo,
+        "scripts/release_artifacts.py",
+        'RELEASE_GUARD_SECRET = "RELEASE_GUARD_READ_TOKEN"\n',
+        "add release guard (secret NAME, not a value)",
+    )
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
+
+
 def test_secret_scan_catalogue_is_also_applied_to_pushed_history(repo: Path) -> None:
     """The broader scripts/secret_scan.py catalogue (not just check.py's four
     LEAK_PATTERNS) must also see historical blob content, e.g. an Anthropic
