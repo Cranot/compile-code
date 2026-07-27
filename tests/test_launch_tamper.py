@@ -14,7 +14,7 @@ version inspection, workspace rejection, hook-body parsing, and producer
 attestation all run for real against real files.
 
 Preregistered bar (fixed before the first run):
-    * REFUSE to launch in 100% of tamper cases (T1..T8 below).
+    * REFUSE to launch in 100% of tamper cases (T1..T9 below).
     * Launch normally in 100% of clean cases (C1, C2).
 
 ``test_T4_...`` used to be a pinned ``xfail(strict=True)``: ``_inspect_roam``
@@ -24,6 +24,14 @@ now also captures a sha256 digest of the executable's bytes -- read from
 outside the process, never from anything the binary says about itself -- and
 the re-proof compares it alongside path and version, so this case is now
 REFUSE like the rest.
+
+``test_T9_...`` is the same gap one binary over: `claude` was validated only
+by ``_resolve_trusted_executable``'s path-string recheck (see T8), never
+content-hashed, so an in-place content swap at the same path was invisible to
+it. The `_claude` command now captures a digest of the resolved `claude`
+executable and compares a fresh read against it immediately before handover,
+reusing ``_content_digest`` -- the same function and swap-check T4 exercises,
+not a second hashing path.
 """
 
 from __future__ import annotations
@@ -401,6 +409,36 @@ def test_T8_claude_path_swapped_mid_preparation_is_refused(boundary, monkeypatch
 
     assert not boundary.launched, "launched a claude that moved during readiness checks"
     assert result.exit_code != 0
+
+
+def test_T9_claude_content_mutated_in_place_is_refused(boundary, monkeypatch):
+    """T4's shape, one binary over: same path, same name, different bytes.
+
+    Nothing in this launcher ever runs ``claude`` before the exec decision --
+    unlike roam there is no self-reported version or attestation envelope to
+    distrust, only ``_resolve_trusted_executable``'s path-string recheck. A
+    same-path, same-name content swap was therefore invisible to that recheck
+    alone; the content digest, hashed from outside the executable and
+    compared against the value captured before preparation began, is not.
+    """
+    before = boundary.claude.read_bytes()
+
+    def tamper() -> None:
+        _write_shim(
+            boundary.tools,
+            "claude",
+            cmd_body="echo pwned\r\nexit /b 0\r\n",
+            py_body='print("pwned")\nraise SystemExit(0)\n',
+        )
+
+    _tamper_during_preparation(monkeypatch, tamper)
+
+    result = _invoke()
+
+    assert boundary.claude.read_bytes() != before, "tamper did not actually change the file"
+    assert not boundary.launched, "launched after the claude executable changed in place"
+    assert result.exit_code != 0
+    assert "Claude executable changed" in result.output
 
 
 # --------------------------------------------------------------------------

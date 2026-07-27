@@ -58,6 +58,13 @@ MAX_VERIFY_JSON_BYTES = 2 * 1024 * 1024
 MAX_VERIFY_STDERR_BYTES = 64 * 1024
 MAX_ROAM_VERSION_BYTES = 8 * 1024
 MAX_ROAM_EXECUTABLE_BYTES = 64 * 1024 * 1024
+# `claude` is a bundled single-file runtime (Node/Bun + embedded assets), not a
+# small pip console-script stub like roam's -- a real install was observed at
+# ~265 MiB. Reusing MAX_ROAM_EXECUTABLE_BYTES here would make _content_digest
+# refuse to hash it at all and turn every real launch into a false "content
+# could not be verified" refusal. Sized with real headroom above the observed
+# binary, not tightly to it.
+MAX_CLAUDE_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 MAX_STRICT_JSON_DEPTH = 128
 _VERIFY_CAPTURE_CHUNK_BYTES = 64 * 1024
@@ -1956,6 +1963,18 @@ def _launch_agent(argv: list[str], env: dict[str, str], *, use_exec: bool | None
     regardless of the platform they run on. The caller passes an absolute path
     re-resolved at the final readiness boundary; the binary can still vanish or
     become unlaunchable before exec, and that race ends in a verdict.
+
+    Residual window: both branches take *argv[0]* as a path string, not a held
+    file descriptor -- ``os.execv``/``subprocess.run`` reopen and reread the
+    file themselves. The content-digest rechecks the caller performs (roam and
+    claude both) narrow the tamper window to the last possible instant before
+    this call, but cannot close it: there is no portable way on Windows to
+    hand this function an already-verified handle instead of a path (no
+    ``fexecve`` equivalent), so a swap landing in the microseconds between the
+    last digest read and this function's own open-and-exec is not detected.
+    That gap is orders of magnitude smaller than the one the digest closes
+    (the whole multi-step preparation window) and is believed to be the
+    practical floor for a path-based launcher on this platform.
     """
     if use_exec is None:
         use_exec = os.name != "nt"
@@ -2006,6 +2025,30 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
             else "the selected `claude` executable is not a trusted regular file"
         )
         click.echo(f"VERDICT: {detail} — install Claude Code outside the repository and rerun")
+        ctx.exit(1)
+    # `claude` is never version-checked or self-attested the way roam is above --
+    # nothing here ever runs it before the exec decision. That leaves exactly
+    # the gap the roam T4 fix closed: `_resolve_trusted_executable`'s recheck
+    # below only compares resolved path *strings*, so a same-path, same-name
+    # in-place content swap between this line and exec would be invisible to
+    # it alone. Captured now, compared against a fresh read immediately before
+    # handover (see the final recheck below and `_launch_agent`'s docstring
+    # for the residual window that remains even with the digest in place).
+    #
+    # Cost is not roam-sized: roam's console-script stub is tens of KB, but a
+    # real `claude` install is a bundled single-file runtime -- observed at
+    # ~265 MiB -- and this function hashes it twice per launch (here and in
+    # the final recheck below). Measured on that real install: ~0.6-1.0s per
+    # hash, so up to ~1.2-2s of added latency per `compile claude` launch.
+    # That is real, user-visible cost, not the sub-millisecond figure the
+    # roam-side digest costs; it is paid once per launch, not per turn, and
+    # is judged worth it against a silent full-console-takeover substitution.
+    claude_digest = _content_digest(claude_path, max_bytes=MAX_CLAUDE_EXECUTABLE_BYTES)
+    if claude_digest is None:
+        click.echo(
+            "VERDICT: the selected `claude` executable content could not be verified for launch "
+            "— install Claude Code outside the repository and rerun"
+        )
         ctx.exit(1)
     initial_roam_info = _inspect_roam()
     initial_roam_problem = _roam_problem(initial_roam_info)
@@ -2083,7 +2126,15 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
         roam_changed = True
         readiness_failures.append("toolchain_changed")
     final_claude_path, _final_claude_reason = _resolve_trusted_executable("claude", reject_workspace=True)
-    if not final_claude_path or final_claude_path != claude_path:
+    final_claude_digest = (
+        _content_digest(final_claude_path, max_bytes=MAX_CLAUDE_EXECUTABLE_BYTES) if final_claude_path else None
+    )
+    if not final_claude_path or final_claude_path != claude_path or final_claude_digest != claude_digest:
+        # The digest is re-read here, as late as this function can manage --
+        # after every roam/hooks check above, immediately before the exec
+        # decision -- so a substitution that preserves path and name (the
+        # same shape the roam T4 fix closed, one binary over) shows up as a
+        # mismatch instead of matching on path string alone.
         click.echo(
             "VERDICT: Claude executable changed during readiness checks; agent not launched. Rerun `compile claude`."
         )

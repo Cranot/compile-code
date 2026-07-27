@@ -36,6 +36,31 @@ def runner():
     return CliRunner()
 
 
+def _stub_content_digest(monkeypatch, *claude_paths):
+    """Stub `_content_digest` for fixture-fiction claude paths only.
+
+    TRUSTED_CLAUDE_PATH (and lookalikes like ``f"{TRUSTED_CLAUDE_PATH}.replaced"``)
+    have no real file behind them, so the real `_content_digest` returns None
+    for them -- which the `_claude` command now treats as "unverifiable" and
+    refuses. Tests that stub the claude side need a non-None stand-in.
+
+    Every other path -- notably roam's own fixture-fiction path in `_roam_info`
+    -- must keep delegating to the real function, which also returns None
+    there. That None has to keep comparing equal to `_roam_info()`'s absent
+    "digest" key (also None): stubbing this globally to a single constant
+    breaks that pre-existing roam-side digest recheck instead.
+    """
+    original = mod._content_digest
+    fake_paths = set(claude_paths) or {TRUSTED_CLAUDE_PATH}
+
+    def fake(path, *, max_bytes=mod.MAX_ROAM_EXECUTABLE_BYTES):
+        if path in fake_paths:
+            return "sha256:teststub"
+        return original(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(mod, "_content_digest", fake)
+
+
 @pytest.fixture
 def roam_calls(monkeypatch):
     """Stub the toolchain; record argv per call."""
@@ -80,6 +105,7 @@ def roam_calls(monkeypatch):
         "_resolve_trusted_executable",
         lambda name, *, reject_workspace: (TRUSTED_CLAUDE_PATH, None) if name == "claude" else (None, "missing"),
     )
+    _stub_content_digest(monkeypatch)
     return calls
 
 
@@ -1227,6 +1253,7 @@ class TestFailurePathsLaunch:
             "_resolve_trusted_executable",
             lambda name, *, reject_workspace: (TRUSTED_CLAUDE_PATH, None),
         )
+        _stub_content_digest(monkeypatch)
 
     def test_claude_launch_blocks_on_wire_failure_by_default(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -2826,6 +2853,7 @@ class TestClaudeStructuralReadiness:
             "_resolve_trusted_executable",
             lambda name, *, reject_workspace: (TRUSTED_CLAUDE_PATH, None),
         )
+        _stub_content_digest(monkeypatch)
         inspections = []
         monkeypatch.setattr(
             mod,
@@ -2860,6 +2888,7 @@ class TestClaudeStructuralReadiness:
             "_resolve_trusted_executable",
             lambda name, *, reject_workspace: (TRUSTED_CLAUDE_PATH, None),
         )
+        _stub_content_digest(monkeypatch)
         monkeypatch.setattr(
             mod,
             "_inspect_roam",
@@ -2889,6 +2918,7 @@ class TestClaudeStructuralReadiness:
             "_resolve_trusted_executable",
             lambda name, *, reject_workspace: (TRUSTED_CLAUDE_PATH, None),
         )
+        _stub_content_digest(monkeypatch)
         inspections = iter(
             [
                 _roam_info(path="/trusted/roam-a"),
@@ -2923,6 +2953,7 @@ class TestClaudeStructuralReadiness:
             "_resolve_trusted_executable",
             lambda name, *, reject_workspace: (next(paths), None),
         )
+        _stub_content_digest(monkeypatch, TRUSTED_CLAUDE_PATH, f"{TRUSTED_CLAUDE_PATH}.replaced")
         monkeypatch.setattr(mod, "_inspect_roam", lambda timeout=10: _roam_info())
         monkeypatch.setattr(mod, "_attest_claude_hooks", lambda *args, **kwargs: True)
         launches = []
