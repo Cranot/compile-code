@@ -1,0 +1,6 @@
+# Cryptographic PEP 740 / Sigstore verifier for published PyPI attestations.
+# Installed only where release_artifacts.py's `pypi-state` command runs (the
+# build test lane plus the three network-verifier jobs); resolved and hashed
+# into attestation-requirements.lock with uv 0.11.15 in universal Python
+# 3.10+ mode, matching the other release lock graphs.
+pypi-attestations==0.0.29

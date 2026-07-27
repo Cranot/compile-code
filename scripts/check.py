@@ -55,6 +55,7 @@ RELEASE_LOCKS = (
     "release/tooling-requirements.lock",
     "release/build-requirements.lock",
     "release/smoke-requirements.lock",
+    "release/attestation-requirements.lock",
 )
 RELEASE_REQUIREMENT = re.compile(r"(?m)^([a-z0-9][a-z0-9._-]*)==([^\s;\\]+).*$")
 MAX_SCHEMA_BYTES = 1024 * 1024

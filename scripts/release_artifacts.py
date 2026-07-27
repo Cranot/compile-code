@@ -83,7 +83,7 @@ RELEASE_GUARD_ENVIRONMENT = "release-guard"
 RELEASE_GUARD_SECRET = "RELEASE_GUARD_READ_TOKEN"  # name of a GH secret, not a value  # secretsallow
 RELEASE_GUARD_POLICY_ID = 55_007_746
 RELEASE_GUARD_TAG_PATTERN = "v*"
-EXPECTED_LOCKED_VERSION_COUNT = 47
+EXPECTED_LOCKED_VERSION_COUNT = 67
 IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 PYPI_PUBLISH_ATTESTATION_TYPE = "https://docs.pypi.org/attestations/publish/v1"
 PYPI_INTEGRITY_MEDIA_TYPE = "application/vnd.pypi.integrity.v1+json"
@@ -104,6 +104,7 @@ RELEASE_ACTION_INVENTORY = {
     "pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b": 1,
 }
 LOCK_GRAPHS = (
+    ("attestation-requirements.in", "attestation-requirements.lock"),
     ("build-requirements.in", "build-requirements.lock"),
     ("smoke-requirements.in", "smoke-requirements.lock"),
     ("tooling-requirements.in", "tooling-requirements.lock"),
@@ -143,7 +144,6 @@ MAX_GITHUB_EXPRESSION_INTEGER = (1 << 53) - 1
 MAX_LOCK_SIZE = 1024 * 1024
 MAX_OSV_RESPONSE_SIZE = 8 * 1024 * 1024
 MAX_OSV_QUERIES = 1_000
-MAX_ATTESTATION_STATEMENT_SIZE = 64 * 1024
 MEDIA_TYPES = {
     "wheel": "application/zip",
     "sdist": "application/gzip",
@@ -2328,7 +2328,77 @@ def _decode_bounded_base64(value: Any, *, label: str, max_bytes: int) -> bytes:
     return decoded
 
 
-def _validate_pypi_publish_provenance(document: Any, *, filename: str, sha256: str) -> None:
+def _pypi_trusted_publisher_identity() -> Any:
+    """The Trusted Publisher identity every PyPI publish attestation must prove.
+
+    Handed to `pypi_attestations.Attestation.verify` as the verification
+    policy. `GitHubPublisher._as_policy()` checks the *certificate's own*
+    Fulcio claims -- its Build Config URI and Source Repository URI
+    extensions -- against this repository and workflow file. It does not
+    read any self-reported metadata, so a cryptographically valid
+    attestation issued to a different repository or workflow fails this
+    policy rather than being silently accepted.
+    """
+    from pypi_attestations import GitHubPublisher
+
+    return GitHubPublisher(repository=REPOSITORY, workflow="release.yml")
+
+
+def _verify_pypi_publish_attestation(attestation_value: Any, *, filename: str, sha256: str) -> str | None:
+    """Cryptographically verify one PEP 740 attestation; return its predicate type, or None.
+
+    None means "not a match for us" -- the attestation is malformed, or it
+    verifies for a different artifact or a different Trusted Publisher --
+    which is an expected, non-fatal outcome: a PyPI release can carry
+    attestations from more than one source, and only ours needs to be
+    present and valid. `_validate_pypi_publish_provenance` is what enforces
+    "at least one real match"; this function only answers "does this one
+    attestation verify as ours."
+
+    This performs real Sigstore verification, not a presence check.
+    `Attestation.verify` (from the `pypi-attestations` package, which wraps
+    `sigstore-python`) verifies, in order: the DSSE envelope signature
+    against the leaf certificate; the certificate chain to the production
+    Fulcio root; Rekor transparency-log inclusion; and, via the
+    `GitHubPublisher` policy above, that the certificate's own identity
+    claims name this exact repository and workflow. A tampered artifact
+    (wrong digest) or an attestation issued to a different repository fails
+    here and is not counted below.
+
+    An established verifier (`pypi-attestations` / `sigstore`) is used
+    deliberately instead of hand-rolling X.509 chain-building or
+    Merkle-inclusion-proof checking; see release/attestation-requirements.in.
+    """
+    try:
+        from pydantic import ValidationError
+        from pypi_attestations import Attestation, AttestationError, Distribution
+    except ImportError as exc:  # pragma: no cover - exercised only if the pin drifts
+        raise ReleaseError(
+            "pypi-attestations is required to verify PyPI publish attestations; install "
+            "release/attestation-requirements.lock before invoking the pypi-state command"
+        ) from exc
+
+    try:
+        attestation = Attestation.model_validate(attestation_value)
+    except ValidationError:
+        return None
+    try:
+        predicate_type, _predicate = attestation.verify(
+            _pypi_trusted_publisher_identity(),
+            Distribution(name=filename, digest=sha256),
+        )
+    except AttestationError:
+        return None
+    return predicate_type
+
+
+def _validate_pypi_publish_provenance(
+    document: Any,
+    *,
+    filename: str,
+    sha256: str,
+    verify_attestation: Callable[..., str | None] = _verify_pypi_publish_attestation,
+) -> None:
     provenance = _exact_keys(document, {"attestation_bundles", "version"}, f"PyPI provenance for {filename}")
     _require(type(provenance["version"]) is int and provenance["version"] == 1, "PyPI provenance version mismatch")
     bundles = provenance["attestation_bundles"]
@@ -2340,84 +2410,24 @@ def _validate_pypi_publish_provenance(document: Any, *, filename: str, sha256: s
             {"attestations", "publisher"},
             f"PyPI provenance bundle {bundle_index}",
         )
-        publisher = bundle["publisher"]
-        _require(isinstance(publisher, dict), f"PyPI provenance publisher {bundle_index} must be an object")
-        _require(
-            {"claims", "kind"} <= set(publisher),
-            f"PyPI provenance publisher {bundle_index} is missing required identity fields",
-        )
-        claims = publisher["claims"]
-        _require(claims is None or isinstance(claims, dict), "PyPI provenance publisher claims are malformed")
-        expected_publisher = (
-            publisher.get("kind") == "GitHub"
-            and publisher.get("repository") == REPOSITORY
-            and publisher.get("workflow") == "release.yml"
-            and publisher.get("environment") == "pypi"
-        )
+        _require(isinstance(bundle["publisher"], dict), f"PyPI provenance publisher {bundle_index} must be an object")
         attestations = bundle["attestations"]
         _require(
             isinstance(attestations, list) and 0 < len(attestations) <= 128,
             f"PyPI provenance attestation inventory is malformed: bundle {bundle_index}",
         )
-        if not expected_publisher:
-            continue
         for attestation_index, attestation_value in enumerate(attestations):
-            label = f"PyPI attestation {bundle_index}:{attestation_index} for {filename}"
-            _require(isinstance(attestation_value, dict), f"{label} must be an object")
             _require(
-                {"envelope", "verification_material", "version"} <= set(attestation_value),
-                f"{label} is missing required fields",
+                isinstance(attestation_value, dict),
+                f"PyPI attestation {bundle_index}:{attestation_index} for {filename} must be an object",
             )
-            _require(
-                type(attestation_value["version"]) is int and attestation_value["version"] == 1,
-                f"{label} version mismatch",
-            )
-            verification_material = attestation_value["verification_material"]
-            _require(isinstance(verification_material, dict), f"{label} verification material must be an object")
-            _require(
-                {"certificate", "transparency_entries"} <= set(verification_material),
-                f"{label} verification material is incomplete",
-            )
-            _decode_bounded_base64(
-                verification_material["certificate"],
-                label=f"{label} certificate",
-                max_bytes=64 * 1024,
-            )
-            transparency_entries = verification_material["transparency_entries"]
-            _require(
-                isinstance(transparency_entries, list)
-                and 0 < len(transparency_entries) <= 128
-                and all(isinstance(entry, dict) for entry in transparency_entries),
-                f"{label} transparency log evidence is missing",
-            )
-            envelope = attestation_value["envelope"]
-            _require(isinstance(envelope, dict), f"{label} envelope must be an object")
-            _require({"signature", "statement"} <= set(envelope), f"{label} envelope is incomplete")
-            _decode_bounded_base64(envelope["signature"], label=f"{label} signature", max_bytes=4 * 1024)
-            statement_bytes = _decode_bounded_base64(
-                envelope["statement"],
-                label=f"{label} statement",
-                max_bytes=MAX_ATTESTATION_STATEMENT_SIZE,
-            )
-            statement = _exact_keys(
-                _load_json_bytes(statement_bytes, f"{label} statement"),
-                {"_type", "predicate", "predicateType", "subject"},
-                f"{label} statement",
-            )
-            _require(statement["_type"] == IN_TOTO_STATEMENT_TYPE, f"{label} in-toto statement type mismatch")
-            subjects = statement["subject"]
-            _require(isinstance(subjects, list) and len(subjects) == 1, f"{label} must bind exactly one subject")
-            subject = _exact_keys(subjects[0], {"digest", "name"}, f"{label} subject")
-            _require(subject["name"] == filename, f"{label} subject filename mismatch")
-            digest = subject["digest"]
-            _require(isinstance(digest, dict), f"{label} subject digest must be an object")
-            _require(digest.get("sha256") == sha256, f"{label} subject SHA-256 mismatch")
-            if statement["predicateType"] == PYPI_PUBLISH_ATTESTATION_TYPE:
-                _require(statement["predicate"] in ({}, None), f"{label} publish predicate must be empty")
+            predicate_type = verify_attestation(attestation_value, filename=filename, sha256=sha256)
+            if predicate_type == PYPI_PUBLISH_ATTESTATION_TYPE:
                 matched_publish_attestations += 1
     _require(
         matched_publish_attestations >= 1,
-        f"PyPI provenance lacks the expected Cranot/compile-code release.yml pypi publish attestation: {filename}",
+        f"PyPI provenance lacks a Sigstore-verified Cranot/compile-code release.yml pypi publish attestation: "
+        f"{filename}",
     )
 
 
@@ -2429,6 +2439,7 @@ def _remote_release_state(
     fetch_project: Callable[[], dict[str, Any] | None] = _fetch_pypi_json,
     fetch_bytes: Callable[[str], bytes] | None = None,
     fetch_provenance: Callable[[str, str], dict[str, Any] | None] = _fetch_pypi_provenance,
+    verify_pypi_attestation: Callable[..., str | None] = _verify_pypi_publish_attestation,
 ) -> str:
     manifest = verify_bundle(bundle, dist=dist, expected_source=expected_source)
     project = fetch_project()
@@ -2507,6 +2518,7 @@ def _remote_release_state(
                 provenance,
                 filename=filename,
                 sha256=record["hashes"]["sha256"],
+                verify_attestation=verify_pypi_attestation,
             )
     return "attestation_pending" if attestation_pending else "exact"
 
@@ -3571,6 +3583,23 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         problems.append("release.yml must install the exact GitHub CLI in all three verifier jobs")
     if release.count("COMPILE_GITHUB_CLI: ${{ steps.github_cli.outputs.github_cli_path }}") != 3:
         problems.append("release.yml must pass only the controlled GitHub CLI path to all verifier commands")
+    if release.count("release/attestation-requirements.lock") != 4:
+        problems.append(
+            "release.yml must install the hash-locked Sigstore attestation verifier in all four "
+            "attestation-consuming jobs (build, prepublish, postpublish, github_release_postverify)"
+        )
+    for pypi_state_job in ("prepublish", "postpublish", "github_release_postverify"):
+        job_match = re.search(rf"(?ms)^  {pypi_state_job}:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", release)
+        if not job_match:
+            problems.append(f"pypi-state job missing: {pypi_state_job}")
+            continue
+        job_body = job_match.group(1)
+        lock_index = job_body.find("release/attestation-requirements.lock")
+        state_index = job_body.find("pypi-state")
+        if lock_index < 0 or state_index < 0 or not lock_index < state_index:
+            problems.append(
+                f"{pypi_state_job} must install the hash-locked attestation verifier before calling pypi-state"
+            )
     if "create-github-app-token" in release:
         problems.append("release.yml may not use an installation identity that can hide draft releases")
     if release.count("id-token: write") != 2 or release.count("attestations: write") != 1:

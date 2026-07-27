@@ -374,14 +374,22 @@ contains SHA-256 and SHA-512 hashes, matching SRI values, a closed manifest,
 and a deterministic CycloneDX SBOM. GitHub build provenance and immutable-release
 attestations bind GitHub's files to the tag workflow. For each PyPI distribution,
 post-verification also requires the registry's PEP 740 Integrity API to expose a
-publish statement for the exact filename and SHA-256 under the
-`Cranot/compile-code` / `release.yml` / `pypi` Trusted Publisher identity.
+publish attestation and cryptographically verifies it with `pypi-attestations`/
+`sigstore-python`: the DSSE envelope signature checks against the leaf
+certificate, the certificate chains to the production Fulcio root, Rekor
+transparency-log inclusion is verified, and the certificate's own Build Config
+URI / Source Repository claims must name exactly the `Cranot/compile-code`
+repository and `release.yml` workflow. A cryptographically valid attestation
+issued to any other repository or workflow, or one whose signed digest does
+not match the artifact actually being verified, fails closed rather than
+being accepted on the strength of self-reported metadata alone.
 
 The lock audit is the reproducible, non-resolving equivalent of a `pip-audit`
-gate: it parses only the three checked-in uv graphs, requires exact versions,
+gate: it parses only the four checked-in uv graphs (build, smoke, tooling, and
+the Sigstore attestation verifier), requires exact versions,
 SHA-256 hashes, matching root inputs, and the canonical universal-generation
 command, then submits a sorted package/version query set directly to OSV. It
-requires exactly 47 distinct package/version queries and audits every marker
+requires exactly 67 distinct package/version queries and audits every marker
 branch without invoking `pip` and without resolving `roam-code`. A vulnerability, stale
 or malformed lock, changed query count, unavailable service,
 pagination, malformed response, or ignored/incomplete result blocks both

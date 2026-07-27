@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import datetime
 import hashlib
 import io
 import json
@@ -15,6 +16,13 @@ from pathlib import Path
 
 import pytest
 import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes as crypto_hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import NameOID
+from pyasn1.codec.der.encoder import encode as der_encode
+from pyasn1.type.char import UTF8String
 
 from scripts import check as prepush_check
 from scripts import release_artifacts as release
@@ -159,7 +167,32 @@ def _write_manifest(bundle: Path, document: dict[str, object]) -> None:
     (bundle / release.MANIFEST_NAME).write_bytes(release._canonical_json(document))
 
 
+def _accept_any_pypi_attestation(_attestation_value: object, *, filename: str, sha256: str) -> str:
+    """A `verify_pypi_attestation` stand-in for tests that are not about Sigstore.
+
+    Registry-transport tests (byte mismatch, missing/extra files, unsafe
+    URLs, monotonicity, ...) don't care whether a given attestation
+    cryptographically verifies; they inject this so `_remote_release_state`
+    always treats "some attestation was returned" as a match, the way every
+    test in this module did before real verification existed. Tests that
+    ARE about Sigstore verification (below) do not use this stub; they let
+    the real verifier run.
+    """
+    del _attestation_value, filename, sha256
+    return release.PYPI_PUBLISH_ATTESTATION_TYPE
+
+
 def _pypi_provenance(filename: str, sha256: str) -> dict[str, object]:
+    """A structurally well-formed but cryptographically fake PEP 740 provenance document.
+
+    The certificate and signature bytes here are not real Sigstore material
+    -- they exist only to exercise the *shape* checks in
+    `_validate_pypi_publish_provenance`. Every test that uses this fixture
+    also passes `verify_pypi_attestation=_accept_any_pypi_attestation`, so
+    the fake crypto is never actually asked to verify. Tests of the real
+    verifier build genuine (self-signed) Sigstore material instead; see
+    `_sigstore_test_provenance` below.
+    """
     statement = release._canonical_json(
         {
             "_type": release.IN_TOTO_STATEMENT_TYPE,
@@ -195,6 +228,157 @@ def _pypi_provenance(filename: str, sha256: str) -> dict[str, object]:
         ],
         "version": 1,
     }
+
+
+def _fulcio_extension(oid: str, value: str) -> x509.UnrecognizedExtension:
+    """A DER-encoded-UTF8String X.509 extension, the shape Fulcio uses for its OIDC claims."""
+    return x509.UnrecognizedExtension(x509.ObjectIdentifier(oid), der_encode(UTF8String(value)))
+
+
+def _sigstore_test_certificate(*, repository: str, workflow: str, ref: str = "refs/tags/v0.2.0") -> bytes:
+    """A self-signed certificate carrying the same Fulcio OIDC claim extensions a real
+    GitHub Actions Trusted Publisher certificate would carry (issuer, source repository
+    URI, source repository ref, and build config URI -- OIDs 1.3.6.1.4.1.57264.1.{8,12,14,18}
+    per https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md).
+
+    This drives `pypi_attestations`'s REAL `GitHubPublisher` identity-policy code with a
+    controlled identity, without needing a real Fulcio-issued certificate or network
+    access. It is not a stand-in for Fulcio's chain-of-trust verification -- that part
+    is stubbed separately in `_stub_sigstore_production_verifier` -- only for the
+    identity claims the policy reads back out of the certificate.
+    """
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "compile-code release test")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(minutes=5))
+        .add_extension(
+            _fulcio_extension("1.3.6.1.4.1.57264.1.8", "https://token.actions.githubusercontent.com"), critical=False
+        )
+        .add_extension(_fulcio_extension("1.3.6.1.4.1.57264.1.12", f"https://github.com/{repository}"), critical=False)
+        .add_extension(_fulcio_extension("1.3.6.1.4.1.57264.1.14", ref), critical=False)
+        .add_extension(
+            _fulcio_extension(
+                "1.3.6.1.4.1.57264.1.18", f"https://github.com/{repository}/.github/workflows/{workflow}@{ref}"
+            ),
+            critical=False,
+        )
+        .sign(key, crypto_hashes.SHA256())
+    )
+    return cert.public_bytes(Encoding.DER)
+
+
+def _sigstore_test_provenance(*, filename: str, sha256: str, cert_der: bytes) -> dict[str, object]:
+    """A PyPI Integrity API provenance document wrapping one real (self-signed) Sigstore
+    attestation, structurally complete enough for `pypi_attestations.Attestation.to_bundle()`
+    to accept it. Paired with `_stub_sigstore_production_verifier`, this exercises the
+    REAL `pypi_attestations`/`sigstore` subject-binding and identity-policy code, not a
+    reimplementation of it.
+    """
+    statement = json.dumps(
+        {
+            "_type": release.IN_TOTO_STATEMENT_TYPE,
+            "predicateType": release.PYPI_PUBLISH_ATTESTATION_TYPE,
+            "predicate": None,
+            "subject": [{"name": filename, "digest": {"sha256": sha256}}],
+        },
+        sort_keys=True,
+    ).encode()
+    return {
+        "version": 1,
+        "attestation_bundles": [
+            {
+                "publisher": {
+                    "kind": "GitHub",
+                    "repository": release.REPOSITORY,
+                    "workflow": "release.yml",
+                    "environment": "pypi",
+                    "claims": None,
+                },
+                "attestations": [
+                    {
+                        "version": 1,
+                        "verification_material": {
+                            "certificate": base64.b64encode(cert_der).decode("ascii"),
+                            "transparency_entries": [
+                                {
+                                    "logIndex": "1",
+                                    "logId": {"keyId": base64.b64encode(b"fake-key-id").decode("ascii")},
+                                    "kindVersion": {"kind": "hashedrekord", "version": "0.0.2"},
+                                    "integratedTime": "1700000000",
+                                    "inclusionPromise": {
+                                        "signedEntryTimestamp": base64.b64encode(b"fake-set").decode("ascii")
+                                    },
+                                    "inclusionProof": {
+                                        "logIndex": "1",
+                                        "rootHash": base64.b64encode(b"root").decode("ascii"),
+                                        "treeSize": "2",
+                                        "hashes": [base64.b64encode(b"h").decode("ascii")],
+                                        "checkpoint": {"envelope": "fake checkpoint"},
+                                    },
+                                    "canonicalizedBody": base64.b64encode(b"body").decode("ascii"),
+                                }
+                            ],
+                        },
+                        "envelope": {
+                            "statement": base64.b64encode(statement).decode("ascii"),
+                            "signature": base64.b64encode(b"stubbed-because-verifier-is-stubbed").decode("ascii"),
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _real_sigstore_provenances(bundle: Path, *, repository: str, workflow: str) -> dict[str, dict[str, object]]:
+    """Genuine (self-signed) Sigstore provenance documents for every wheel/sdist in `bundle`."""
+    manifest = _manifest(bundle)
+    provenances: dict[str, dict[str, object]] = {}
+    for record in manifest["files"]:
+        if record["role"] not in {"wheel", "sdist"}:
+            continue
+        cert_der = _sigstore_test_certificate(repository=repository, workflow=workflow)
+        provenances[record["filename"]] = _sigstore_test_provenance(
+            filename=record["filename"], sha256=record["hashes"]["sha256"], cert_der=cert_der
+        )
+    return provenances
+
+
+def _stub_sigstore_production_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace `Verifier.production()` with a double whose `verify_dsse` still runs the
+    REAL identity policy against the bundle's real certificate.
+
+    Only the deepest primitives this test suite cannot reasonably reproduce offline are
+    stubbed: Fulcio chain-of-trust construction (which needs the production trust root,
+    normally fetched over the network via TUF), Rekor inclusion-proof math, and the DSSE
+    signature check. Those are `sigstore-python`'s own well-tested internals -- the
+    established verifier this module delegates to rather than hand-rolling -- not
+    something this repository re-verifies.
+
+    What IS exercised for real, unmocked, on every call below: `pypi_attestations`'s
+    subject name/digest binding, and the `GitHubPublisher` Trusted Publisher identity
+    policy's certificate-extension checks (`_GitHubTrustedPublisherPolicy.verify`) --
+    the exact mechanism that must reject a cryptographically-valid attestation issued to
+    a different repository or workflow.
+    """
+    import sigstore.verify
+
+    class _StubVerifier:
+        def verify_dsse(self, bundle: object, policy: object) -> tuple[str, bytes]:
+            policy.verify(bundle.signing_certificate)  # type: ignore[attr-defined]
+            envelope = bundle._dsse_envelope  # type: ignore[attr-defined]
+            return envelope._inner.payload_type, envelope._inner.payload
+
+    monkeypatch.setattr(
+        sigstore.verify.Verifier, "production", classmethod(lambda cls, *, offline=False: _StubVerifier())
+    )
 
 
 def _remote_project(
@@ -1252,6 +1436,38 @@ def test_release_workflow_audit_rejects_tag_guard_mutation_and_binding_loss(tmp_
     )
     assert any("controlled GitHub CLI path" in problem for problem in release.audit_repository(root))
 
+    # A `pypi-state` job that stops installing the Sigstore attestation
+    # verifier would silently fall back to whatever happens to already be on
+    # the runner (nothing) -- the exact "presence, not validity" shape this
+    # gate exists to close. Removing any one of the four installs, or
+    # reordering an install to happen after the verification it feeds, must
+    # both fail closed.
+    workflow.write_text(
+        original.replace("-r release/attestation-requirements.lock\n", "", 1),
+        encoding="utf-8",
+    )
+    assert any("hash-locked Sigstore attestation verifier" in problem for problem in release.audit_repository(root))
+
+    job_match = re.search(r"(?ms)^  prepublish:\n(.*?)(?=^  [a-zA-Z0-9_-]+:\n|\Z)", original)
+    assert job_match is not None
+    body = job_match.group(1)
+    lock_index = body.index("-r release/attestation-requirements.lock")
+    state_index = body.index("pypi-state")
+    assert lock_index < state_index, "prepublish must install before it verifies"
+    lock_line_start = body.rfind("\n", 0, lock_index) + 1
+    lock_line_end = body.index("\n", lock_index) + 1
+    lock_line = body[lock_line_start:lock_line_end]
+    trimmed_body = body[:lock_line_start] + body[lock_line_end:]
+    insertion_point = trimmed_body.index("\n", trimmed_body.index("pypi-state")) + 1
+    mutated_body = trimmed_body[:insertion_point] + lock_line + trimmed_body[insertion_point:]
+    mutated = original[: job_match.start(1)] + mutated_body + original[job_match.end(1) :]
+    assert mutated != original
+    workflow.write_text(mutated, encoding="utf-8")
+    assert any(
+        "must install the hash-locked attestation verifier before calling pypi-state" in problem
+        for problem in release.audit_repository(root)
+    )
+
 
 def test_immutable_release_settings_token_is_mandatory_and_bounded():
     with pytest.raises(release.ReleaseError, match="Administration:read"):
@@ -1567,7 +1783,12 @@ def test_release_guard_token_must_be_environment_scoped_without_repository_fallb
 
 
 def test_hash_locked_requirements_have_only_exact_versions_and_sha256_hashes():
-    for name in ("tooling-requirements.lock", "build-requirements.lock", "smoke-requirements.lock"):
+    for name in (
+        "tooling-requirements.lock",
+        "build-requirements.lock",
+        "smoke-requirements.lock",
+        "attestation-requirements.lock",
+    ):
         text = (ROOT / "release" / name).read_text(encoding="utf-8")
         assert "--index-url" not in text
         assert "--trusted-host" not in text
@@ -1587,11 +1808,12 @@ def test_locked_graph_audit_is_stable_complete_and_never_resolves_roam_code():
     queries, provenance = release.locked_requirement_queries(ROOT)
     package_versions = [(query["package"]["name"], query["version"]) for query in queries]
     assert package_versions == sorted(package_versions)
-    assert len(package_versions) == release.EXPECTED_LOCKED_VERSION_COUNT == 47
+    assert len(package_versions) == release.EXPECTED_LOCKED_VERSION_COUNT == 67
     assert len(package_versions) == len(set(package_versions))
     assert all(query["package"]["ecosystem"] == "PyPI" for query in queries)
     assert "roam-code" not in {name for name, _version in package_versions}
     assert set().union(*map(set, provenance.values())) == {
+        "attestation-requirements.lock",
         "build-requirements.lock",
         "smoke-requirements.lock",
         "tooling-requirements.lock",
@@ -1665,7 +1887,7 @@ def test_locked_graph_exact_query_count_rejects_a_silent_transitive_omission(tmp
     )
     assert substitutions == 1
     lock.write_text(mutated, encoding="utf-8")
-    with pytest.raises(release.ReleaseError, match="query count must remain exactly 47; got 46"):
+    with pytest.raises(release.ReleaseError, match="query count must remain exactly 67; got 66"):
         release.locked_requirement_queries(root)
 
 
@@ -1820,6 +2042,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
             fetch_project=lambda: project,
             fetch_bytes=lambda url: payloads[url],
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
         == "exact"
     )
@@ -1845,6 +2068,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
             fetch_project=lambda: project,
             fetch_bytes=lambda url: wrong[url],
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
 
     extra_project = copy.deepcopy(project)
@@ -1864,6 +2088,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
             dist,
             fetch_project=lambda: extra_project,
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
 
     malformed_project = copy.deepcopy(project)
@@ -1874,6 +2099,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
             dist,
             fetch_project=lambda: malformed_project,
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
 
     unsafe_project = copy.deepcopy(project)
@@ -1885,6 +2111,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
             fetch_project=lambda: unsafe_project,
             fetch_bytes=lambda url: payloads[url],
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
     with pytest.raises(release.ReleaseError, match="unsafe registry URL"):
         release._fetch_url("http://files.pythonhosted.org/substitution", max_bytes=1)
@@ -1916,31 +2143,22 @@ def test_release_asset_urls_and_attestation_base64_are_canonical():
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
+        (lambda doc: doc.update(version=2), "version mismatch"),
+        (lambda doc: doc.update(attestation_bundles=[]), "bundle inventory is malformed"),
+        (lambda doc: doc["attestation_bundles"][0].update(publisher="not-a-dict"), "must be an object"),
+        (lambda doc: doc["attestation_bundles"][0].update(attestations=[]), "attestation inventory is malformed"),
         (
-            lambda doc: doc["attestation_bundles"][0]["publisher"].update(repository="attacker/project"),
-            "lacks the expected",
-        ),
-        (
-            lambda doc: doc["attestation_bundles"][0]["publisher"].update(workflow="other.yml"),
-            "lacks the expected",
-        ),
-        (
-            lambda doc: doc["attestation_bundles"][0]["publisher"].update(environment="other"),
-            "lacks the expected",
-        ),
-        (
-            lambda doc: doc["attestation_bundles"][0]["attestations"][0]["verification_material"].update(
-                transparency_entries=[]
-            ),
-            "transparency log evidence is missing",
-        ),
-        (
-            lambda doc: doc["attestation_bundles"][0]["attestations"][0]["envelope"].update(signature="***"),
-            "not canonical base64",
+            lambda doc: doc["attestation_bundles"][0]["attestations"].__setitem__(0, "not-a-dict"),
+            "must be an object",
         ),
     ],
 )
-def test_pypi_publish_provenance_identity_and_structure_fail_closed(tmp_path: Path, mutation, message: str):
+def test_pypi_publish_provenance_structural_shape_fails_closed(tmp_path: Path, mutation, message: str):
+    """The outer PyPI Integrity API envelope is still hand-validated (it is PyPI's own
+    wrapper format, not something `pypi_attestations` models) before any attestation
+    inside it is handed to the real Sigstore verifier. These mutations never reach
+    cryptographic verification at all -- they are rejected by shape alone.
+    """
     bundle, dist = _bundle(tmp_path)
     project, payloads, provenances = _remote_project(bundle, dist)
     candidate = copy.deepcopy(provenances)
@@ -1952,37 +2170,88 @@ def test_pypi_publish_provenance_identity_and_structure_fail_closed(tmp_path: Pa
             fetch_project=lambda: project,
             fetch_bytes=lambda url: payloads[url],
             fetch_provenance=lambda _version, filename: candidate[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
 
 
-def test_pypi_publish_provenance_binds_each_exact_filename_and_digest(tmp_path: Path):
-    bundle, dist = _bundle(tmp_path)
-    project, payloads, provenances = _remote_project(bundle, dist)
-    filename = next(iter(provenances))
-    candidate = copy.deepcopy(provenances)
-    attestation = candidate[filename]["attestation_bundles"][0]["attestations"][0]
-    statement = json.loads(base64.b64decode(attestation["envelope"]["statement"]))
+def test_pypi_publish_attestation_verifies_real_sigstore_identity_and_digest_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """The proof that this gate is real verification, not a presence check.
 
-    for replacement, message in (
-        ("substitute.whl", "subject filename mismatch"),
-        (filename, "subject SHA-256 mismatch"),
-    ):
-        mutated = copy.deepcopy(candidate)
-        row = mutated[filename]["attestation_bundles"][0]["attestations"][0]
-        changed_statement = copy.deepcopy(statement)
-        if message.startswith("subject filename"):
-            changed_statement["subject"][0]["name"] = replacement
-        else:
-            changed_statement["subject"][0]["digest"]["sha256"] = "0" * 64
-        row["envelope"]["statement"] = base64.b64encode(release._canonical_json(changed_statement)).decode("ascii")
-        with pytest.raises(release.ReleaseError, match=message):
-            release._remote_release_state(
-                bundle,
-                dist,
-                fetch_project=lambda: project,
-                fetch_bytes=lambda url: payloads[url],
-                fetch_provenance=lambda _version, name, docs=mutated: docs[name],
-            )
+    Before this, `_validate_pypi_publish_provenance` only confirmed an attestation
+    existed and trusted a self-reported `publisher` field for identity -- it never
+    checked a signature, a certificate chain, a transparency log, or the
+    certificate's own identity claims. A hand-crafted JSON blob with the right shape
+    and the right self-reported `repository`/`workflow` fields sailed through.
+
+    This test drives the REAL `pypi_attestations`/`sigstore` verification path (only
+    `Verifier.production()`'s network-dependent innards are stubbed; see
+    `_stub_sigstore_production_verifier`) through four outcomes:
+      - correct repository, correct workflow, correct digest -> PASS ("exact");
+      - correct repository/workflow, tampered digest (the artifact does not match
+        what was actually signed) -> FAIL;
+      - cryptographically well-formed attestation issued to a different repository
+        -> FAIL;
+      - cryptographically well-formed attestation issued to a different workflow in
+        the SAME repository -> FAIL.
+    A verification step that only ever passes is indistinguishable from no check at
+    all; this is the "TEST IT CAN FAIL" proof for the identity policy specifically,
+    which is the check most often skipped.
+    """
+    _stub_sigstore_production_verifier(monkeypatch)
+    bundle, dist = _bundle(tmp_path)
+    project, payloads, _fake_provenances = _remote_project(bundle, dist)
+
+    good = _real_sigstore_provenances(bundle, repository=release.REPOSITORY, workflow="release.yml")
+    assert (
+        release._remote_release_state(
+            bundle,
+            dist,
+            fetch_project=lambda: project,
+            fetch_bytes=lambda url: payloads[url],
+            fetch_provenance=lambda _version, filename: good[filename],
+        )
+        == "exact"
+    ), "a genuinely correct Sigstore attestation must verify"
+
+    manifest = _manifest(bundle)
+    tampered: dict[str, dict[str, object]] = {}
+    for record in manifest["files"]:
+        if record["role"] not in {"wheel", "sdist"}:
+            continue
+        cert_der = _sigstore_test_certificate(repository=release.REPOSITORY, workflow="release.yml")
+        tampered[record["filename"]] = _sigstore_test_provenance(
+            filename=record["filename"], sha256="0" * 64, cert_der=cert_der
+        )
+    with pytest.raises(release.ReleaseError, match="lacks a Sigstore-verified"):
+        release._remote_release_state(
+            bundle,
+            dist,
+            fetch_project=lambda: project,
+            fetch_bytes=lambda url: payloads[url],
+            fetch_provenance=lambda _version, filename: tampered[filename],
+        )
+
+    wrong_repository = _real_sigstore_provenances(bundle, repository="attacker/other-project", workflow="release.yml")
+    with pytest.raises(release.ReleaseError, match="lacks a Sigstore-verified"):
+        release._remote_release_state(
+            bundle,
+            dist,
+            fetch_project=lambda: project,
+            fetch_bytes=lambda url: payloads[url],
+            fetch_provenance=lambda _version, filename: wrong_repository[filename],
+        )
+
+    wrong_workflow = _real_sigstore_provenances(bundle, repository=release.REPOSITORY, workflow="unrelated.yml")
+    with pytest.raises(release.ReleaseError, match="lacks a Sigstore-verified"):
+        release._remote_release_state(
+            bundle,
+            dist,
+            fetch_project=lambda: project,
+            fetch_bytes=lambda url: payloads[url],
+            fetch_provenance=lambda _version, filename: wrong_workflow[filename],
+        )
 
 
 def test_pypi_partial_release_and_attestation_pending_states_block(monkeypatch, tmp_path: Path):
@@ -1997,6 +2266,7 @@ def test_pypi_partial_release_and_attestation_pending_states_block(monkeypatch, 
             fetch_project=lambda: partial,
             fetch_bytes=lambda url: payloads[url],
             fetch_provenance=lambda _version, filename: provenances[filename],
+            verify_pypi_attestation=_accept_any_pypi_attestation,
         )
 
     monkeypatch.setattr(release, "_remote_release_state", lambda *_args, **_kwargs: "attestation_pending")
