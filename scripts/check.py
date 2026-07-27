@@ -860,6 +860,24 @@ def _lock_problems(relative: str, text: str) -> list[str]:
     return problems
 
 
+def internal_index() -> bool:
+    """internal/ is gitignored, so nothing else can ever notice its index rot.
+
+    No CI job and no reviewer sees that directory. A stale catalogue there is
+    invisible by construction -- which is exactly how the sibling project's
+    grew to 2053 files behind a 50-line stub that named none of its five most
+    recent documents. This gate is the only place the drift can be caught.
+    Passes silently when internal/ is absent (fresh clones, CI).
+    """
+    ok = run(
+        "internal index",
+        [sys.executable, str(ROOT / "scripts" / "build_internal_index.py")],
+    )
+    if not ok:
+        print("    fix: python scripts/build_internal_index.py --write")
+    return ok
+
+
 def release_sanity() -> bool:
     """Static release contract: exact backend, closed schema/locks, hardened workflows."""
     problems = []
@@ -1029,6 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
         leak_scan(),
         artifact_scan(),
         readme_sanity(),
+        internal_index(),
         release_sanity(),
     ]
     if all(results):
