@@ -1,4 +1,37 @@
 #!/usr/bin/env bash
 # Every push runs the polish pipeline. Bypass only deliberately:
 #   git push --no-verify
-exec python3 "$(git rev-parse --show-toplevel)/scripts/check.py"
+#
+# Stage 0 below scans the EXACT commits about to publish (pushed HISTORY),
+# not just the working tree: a secret or internal-only string committed and
+# then "fixed" by a later commit in this same push is invisible to a
+# whole-tree scan (the final tree is clean) but still travels to the remote
+# in the earlier commit's blob -- purging it afterwards does not un-publish
+# it. The polish pipeline (scripts/check.py) keeps its own whole-tree
+# leak_scan()/artifact_scan() as a cheap backstop for a different failure
+# shape: an uncommitted-but-tracked file present right now. Range scan and
+# tree scan catch different things; both run.
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# Capture git's authoritative ref-update stream once (one line per updated
+# ref: local-ref local-oid remote-ref remote-oid -- covers first pushes,
+# deletions, and multi-ref pushes) so the range scan sees exactly what is
+# about to publish.
+UPDATES_FILE="$(mktemp)"
+cleanup_updates() { rm -f "$UPDATES_FILE"; }
+trap cleanup_updates EXIT HUP INT TERM
+cat >"$UPDATES_FILE"
+
+if ! python3 "$REPO_ROOT/scripts/prepush_leak_scan.py" --pre-push-updates "$UPDATES_FILE" --remote-url "$2"; then
+    echo "" >&2
+    echo "BLOCKED: leak found in the commits about to be pushed -- see above." >&2
+    echo "  Fixing the tree in a later commit does not un-publish history; amend" >&2
+    echo "  or rebase the offending commit(s), or (rare) git push --no-verify." >&2
+    exit 1
+fi
+
+cleanup_updates
+trap - EXIT HUP INT TERM
+exec python3 "$REPO_ROOT/scripts/check.py"

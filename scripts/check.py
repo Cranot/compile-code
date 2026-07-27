@@ -640,6 +640,24 @@ def _source_test_environment() -> dict[str, str]:
     return environment
 
 
+def _leak_pattern_hits(text: str) -> list[tuple[int, str]]:
+    """(line_no, label) for every LEAK_PATTERNS hit in *text*.
+
+    Factored out of ``_scan_file_for_leaks`` so a pre-push RANGE scan (see
+    ``scripts/prepush_leak_scan.py``) can apply the exact same catalogue to
+    historical blob/commit-message content, not just the current working
+    tree -- a secret committed and then reverted by a later commit is still
+    published the moment the range is pushed, regardless of what the final
+    tracked tree looks like.
+    """
+    hits: list[tuple[int, str]] = []
+    for pattern, label in LEAK_PATTERNS:
+        for m in re.finditer(pattern, text):
+            line = text.count("\n", 0, m.start()) + 1
+            hits.append((line, label))
+    return hits
+
+
 def _scan_file_for_leaks(rel: str) -> list[str]:
     """All leak-pattern hits in one tracked file, formatted for display."""
     path = ROOT / rel
@@ -651,12 +669,7 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
         text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError as exc:
         return [f"  {rel}  [unreadable tracked file] {exc}"]
-    hits: list[str] = []
-    for pattern, label in LEAK_PATTERNS:
-        for m in re.finditer(pattern, text):
-            line = text.count("\n", 0, m.start()) + 1
-            hits.append(f"  {rel}:{line}  [{label}] redacted match")
-    return hits
+    return [f"  {rel}:{line}  [{label}] redacted match" for line, label in _leak_pattern_hits(text)]
 
 
 def _tracked_files() -> list[str]:
