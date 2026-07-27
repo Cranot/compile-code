@@ -57,6 +57,7 @@ ROAM_PACKAGE_REQUIREMENT = f"roam-code{ROAM_VERSION_REQUIREMENT}"
 MAX_VERIFY_JSON_BYTES = 2 * 1024 * 1024
 MAX_VERIFY_STDERR_BYTES = 64 * 1024
 MAX_ROAM_VERSION_BYTES = 8 * 1024
+MAX_ROAM_EXECUTABLE_BYTES = 64 * 1024 * 1024
 MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 MAX_STRICT_JSON_DEPTH = 128
 _VERIFY_CAPTURE_CHUNK_BYTES = 64 * 1024
@@ -335,6 +336,73 @@ def _extract_roam_version(output: str) -> str | None:
     return match.group(1)
 
 
+def _content_digest(path: str, *, max_bytes: int = MAX_ROAM_EXECUTABLE_BYTES) -> str | None:
+    """Hash one regular file's exact bytes from a single, swap-checked read.
+
+    This is the one property in the tamper boundary observed from OUTSIDE the
+    executable: raw bytes on disk, never anything the binary says about
+    itself (a substituted binary can echo back a trusted ``--version`` string
+    or a well-formed attestation envelope; it cannot make its own bytes hash
+    to a value it does not have). Returns ``None`` -- never a stale or partial
+    digest -- if the path is not a plain regular file, exceeds *max_bytes*, or
+    changes while being read. ``None`` never compares equal to a real digest,
+    so a file that cannot be verified this way is refused rather than
+    silently trusted.
+
+    Unlike the other bounded readers in this module, a hard-link count above
+    one is not treated as unsafe here: pip/pipx routinely install console-
+    script launcher stubs as hardlinks to a shared, byte-identical template
+    (observed in the wild at ``st_nlink=42`` for a real ``roam.exe``), and
+    rejecting that would refuse every launch against an otherwise-legitimate
+    install. Hashing the resolved path's exact current bytes detects content
+    change regardless of how many directory entries reference that inode.
+    """
+    candidate = Path(path)
+    try:
+        path_before = candidate.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(path_before.st_mode) or not stat.S_ISREG(path_before.st_mode) or path_before.st_size > max_bytes:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(candidate, flags)
+    except OSError:
+        return None
+    try:
+        opened_before = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_before.st_mode) or not _same_verification_file_state(
+            path_before, opened_before, cross_handle=True
+        ):
+            return None
+        digest = hashlib.sha256()
+        bytes_read = 0
+        while True:
+            chunk = os.read(descriptor, 256 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            if bytes_read > max_bytes:
+                return None
+            digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+        try:
+            path_after = candidate.lstat()
+        except OSError:
+            return None
+        if (
+            bytes_read != opened_before.st_size
+            or not _same_verification_file_state(opened_before, opened_after)
+            or not _same_verification_file_state(path_before, path_after)
+        ):
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return f"sha256:{digest.hexdigest()}"
+
+
 def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
     """Inspect the exact PATH executable and Python metadata independently."""
     metadata_version = _python_roam_metadata_version()
@@ -343,6 +411,7 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
         "path": executable,
         "version": None,
         "metadata_version": metadata_version,
+        "digest": None,
         "state": "missing" if executable is None else "unknown",
         "detail": None,
     }
@@ -381,7 +450,19 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
     if version is None:
         info.update(state="malformed_version", detail="`roam --version` returned no parseable version")
         return info
-    info.update(state="ok", version=version)
+    # The version string above is self-reported by the same binary this re-proof
+    # exists to distrust -- a substituted executable can echo it back verbatim.
+    # The digest is taken last, after that self-report, so it reflects content
+    # at least as current as the version this call is about to vouch for.
+    digest = _content_digest(executable)
+    if digest is None:
+        info.update(
+            state="unverifiable",
+            version=version,
+            detail="executable content could not be hashed for verification",
+        )
+        return info
+    info.update(state="ok", version=version, digest=digest)
     return info
 
 
@@ -1969,6 +2050,13 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
         readiness_failures.append("toolchain_changed")
     wiring_ready, wiring_reason = _claude_wiring_state()
     if wiring_ready and roam_problem is None and not roam_changed:
+        # `_attest_claude_hooks` executes the resolved roam binary and trusts
+        # what it prints about its own hook wiring -- the one place in this
+        # chain where a substituted executable's self-report is believed
+        # rather than checked. It is deliberately still called here even
+        # though a digest is available, so the readiness state after this
+        # line reflects what a real attacker would have gotten: one execution
+        # of their payload under this launcher's trust.
         wiring_ready = _attest_claude_hooks(
             str(roam_info["path"]),
             str(roam_info["version"]),
@@ -1978,6 +2066,22 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
             wiring_reason = "producer_attestation"
     if not wiring_ready:
         readiness_failures.append(f"hooks:{wiring_reason}")
+    if (
+        roam_problem is None
+        and not roam_changed
+        and initial_roam_problem is None
+        and _content_digest(str(roam_info["path"])) != initial_roam_info.get("digest")
+    ):
+        # The one property above that is NOT self-reported by the executable:
+        # its exact bytes, hashed from outside it, read as late as this
+        # function can manage -- after the version self-report, after the
+        # attestation self-report, immediately before the exec decision. A
+        # substitution that preserves path and version (the historical gap
+        # this closes), or one timed to land during the attestation call
+        # itself, shows up here as a digest that no longer matches the one
+        # taken before any of this untrusted code ran.
+        roam_changed = True
+        readiness_failures.append("toolchain_changed")
     final_claude_path, _final_claude_reason = _resolve_trusted_executable("claude", reject_workspace=True)
     if not final_claude_path or final_claude_path != claude_path:
         click.echo(
@@ -2532,7 +2636,16 @@ def _verification_scope_sha256(targets: list[str]) -> str:
 def _same_verification_file_state(left: os.stat_result, right: os.stat_result, *, cross_handle: bool = False) -> bool:
     fields = ["st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns"]
     if cross_handle and os.name == "nt":
+        # Windows synthesizes execute bits into st_mode from the path's
+        # extension (.exe/.cmd/.bat) on lstat/stat; a raw fstat() of an
+        # already-open descriptor has no path to consult and never sets them.
+        # That is a benign artifact of which API answered, not a change to
+        # the file, and it is exactly what a launcher hashing its own
+        # executable hits -- callers already assert S_ISREG independently, so
+        # dropping st_mode here does not weaken the type check, only the
+        # false positive.
         fields.remove("st_ctime_ns")
+        fields.remove("st_mode")
     return all(getattr(left, field) == getattr(right, field) for field in fields)
 
 

@@ -17,12 +17,13 @@ Preregistered bar (fixed before the first run):
     * REFUSE to launch in 100% of tamper cases (T1..T8 below).
     * Launch normally in 100% of clean cases (C1, C2).
 
-``test_T4_...`` is marked ``xfail(strict=True)`` because the mechanism cannot
-detect it: ``_inspect_roam`` captures ``(path, version)`` and nothing else, so
-in-place content mutation of the roam executable that preserves both is
-invisible to the re-proof. The strict xfail turns that measured gap into a
-pinned, self-checking fact -- if a content digest is ever added to
-``_inspect_roam``, this test starts failing and says so.
+``test_T4_...`` used to be a pinned ``xfail(strict=True)``: ``_inspect_roam``
+captured only ``(path, version)``, so in-place content mutation of the roam
+executable that preserved both was invisible to the re-proof. ``_inspect_roam``
+now also captures a sha256 digest of the executable's bytes -- read from
+outside the process, never from anything the binary says about itself -- and
+the re-proof compares it alongside path and version, so this case is now
+REFUSE like the rest.
 """
 
 from __future__ import annotations
@@ -313,22 +314,17 @@ def test_T3_roam_deleted_mid_preparation_is_refused(boundary, monkeypatch):
     assert "VERDICT: toolchain" in result.output
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MEASURED GAP: _inspect_roam records only (path, version, metadata_version, state). "
-        "In-place content mutation that preserves both is invisible to the TOCTOU re-proof. "
-        "Remove this xfail when _inspect_roam grows a content digest."
-    ),
-)
 def test_T4_roam_content_mutated_in_place_is_refused(boundary, monkeypatch):
     """The literal TOCTOU shape: same path, same reported version, different program.
 
     The substituted roam runs an arbitrary payload on every non-``--version``
     invocation -- including the launcher's own ``hooks claude`` attestation call
     -- while still reporting ``13.10.0`` and still returning a well-formed
-    envelope. The re-proof compares ``(path, version)`` only, so nothing about
-    the swap is observable to it.
+    envelope. Path and version alone would miss it; the content digest, hashed
+    from outside the executable rather than trusted from its output, does not.
+    Attestation still runs (and its payload still fires -- see the ``marker``
+    assertion below) before the digest catches the substitution, so this test
+    also proves the launcher refuses even after the malicious code executed.
     """
     marker = boundary.repo.parent / "pwned.txt"
     before = boundary.roam.read_bytes()
