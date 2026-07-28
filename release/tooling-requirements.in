@@ -4,11 +4,21 @@ build==1.5.0
 packaging==26.2
 pip==26.1.2
 pyasn1==0.6.4
+# tests/test_release.py drives the REAL pypi_attestations verification path
+# (see the sigstore entry below for the paired rationale). Pinned to the same
+# version release/attestation-requirements.lock already carries.
+pypi-attestations==0.0.29
 pyproject-hooks==1.2.0
 pytest==9.1.1
 pyyaml==6.0.3
 ruff==0.15.22
 setuptools==83.0.0
+# tests/test_release.py drives the REAL sigstore-python verification path
+# (only its network calls are stubbed), together with pypi-attestations above,
+# to prove identity and digest binding against a forged SAN. Pinned to the
+# same version release/attestation-requirements.lock already carries, so the
+# two locks cannot disagree.
+sigstore==4.4.0
 tomli==2.4.1 ; python_version < "3.11"
 twine==6.2.0
 wheel==0.47.0
