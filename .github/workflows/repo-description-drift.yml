@@ -1,0 +1,109 @@
+# Numeric-claim drift gate for the GitHub repository *description*.
+#
+# scripts/check.py covers every count-bearing file in the tree. The GitHub
+# description is not a file: it is edited in the About panel, rendered above
+# the file list and in search results, and copied by listing sites. No
+# in-tree gate can see it, and roam-code's description went 43 commands
+# stale in exactly that blind spot.
+#
+# The checker itself is deliberately NOT vendored here. It lives once, in
+# roam-code, and is checked out at a pinned commit: one implementation, one
+# place to fix it, no second copy to drift. Only the *truth provider*
+# (scripts/description_truth.py) is repo-specific, and it derives its numbers
+# from the roam-code build this project actually resolves through its own
+# dependency pin.
+#
+# Placement: its own workflow, on a schedule plus push-to-main.
+#   * Not in scripts/check.py, which is the blocking quality gate and must
+#     stay offline, token-free and runnable by hand on a laptop.
+#   * On a schedule because the description can change with no commit at all,
+#     and the truth can change with no description edit at all. Only a
+#     periodic run sees the first; the push trigger reports the second within
+#     minutes.
+# Nothing is blocked by this job; a mismatch fails the run, which shows red
+# on the Actions tab and notifies the repository owner.
+name: Repo description drift
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily, off the hour to avoid the cron stampede.
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  description-drift:
+    name: GitHub description numeric claims
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check out the pinned drift checker
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: Cranot/roam-code
+          # Pinned to a commit, never a branch: the checker is executable
+          # input to this job, so it gets the same immutability the rest of
+          # this repository's supply chain gets.
+          ref: f82b44b394d8c34e8ccd52bebe506597723e714b
+          path: .description-checker
+          sparse-checkout: dev/repo_description_drift.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Set up exact Python and pip
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+          pip-version: "26.1.2"
+
+      - name: Install hash-locked quality tools
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install --no-compile --require-hashes --only-binary=:all:
+          -r release/tooling-requirements.lock
+
+      # The provider reads its counts out of the resolved roam-code build, so
+      # the description is checked against what a user who installs this
+      # project actually gets. Installing the project (rather than naming
+      # roam-code directly) keeps the version pin single-sourced in
+      # pyproject.toml.
+      - name: Resolve and install the product dependency graph
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install --no-compile --no-build-isolation
+          --only-binary=:all: -e .
+
+      - name: Show what this repository can prove
+        run: >-
+          python .description-checker/dev/repo_description_drift.py
+          --truth-module scripts/description_truth.py
+          --list-truth
+
+      - name: Check the live description against computed truth
+        env:
+          # Only buys a saner API rate limit; the endpoint is public.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
+        run: >-
+          python .description-checker/dev/repo_description_drift.py
+          --repo "$TARGET_REPO"
+          --truth-module scripts/description_truth.py
