@@ -26,7 +26,7 @@ jobs:
       dist_artifact_digest: ${{ steps.upload_dist.outputs.artifact-digest }}
     steps:
       - name: Check out the immutable tag target
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -205,7 +205,7 @@ jobs:
       state: ${{ steps.registry.outputs.state }}
     steps:
       - name: Check out the exact verifier without credentials
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -333,7 +333,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the exact verifier without credentials
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -395,7 +395,7 @@ jobs:
       tag_object_sha: ${{ steps.artifact.outputs.tag_object_sha }}
     steps:
       - name: Check out the exact read-only verifier
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -564,7 +564,7 @@ jobs:
       wheel_asset_size: ${{ steps.draft.outputs.wheel_asset_size }}
     steps:
       - name: Check out the exact read-only verifier
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -801,7 +801,7 @@ jobs:
       contents: read
     steps:
       - name: Check out the exact read-only verifier
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
