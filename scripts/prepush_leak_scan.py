@@ -88,11 +88,45 @@ def _repo_root() -> str:
     return raw.stdout.decode("utf-8", errors="replace").strip()
 
 
-def _decode(data: bytes) -> str | None:
-    """None means 'skip' (binary or too large)."""
-    if len(data) > _MAX_BLOB_BYTES or b"\x00" in data:
-        return None
-    return data.decode("utf-8", errors="replace")
+# Everything a text file may legitimately contain outside the printable set.
+_TEXT_CONTROL_CHARS = frozenset("\t\n\r\f\v")
+
+
+def _is_utf16_text(data: bytes) -> bool:
+    """True iff NUL-bearing *data* is UTF-16 text rather than binary.
+
+    A byte-order mark settles it. Without one, the bytes are accepted as text
+    only when removing the NUL padding leaves strictly-valid UTF-8 carrying no
+    control characters a text file would not — which a PNG, a zip or an object
+    file will not satisfy, so the binary skip below is preserved.
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return True
+    try:
+        text = data.replace(b"\x00", b"").decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return not any(ch < " " and ch not in _TEXT_CONTROL_CHARS for ch in text)
+
+
+def _decode_views(data: bytes) -> list[str]:
+    """Every text reading of a historical blob; empty means 'skip'.
+
+    ``check._scan_views`` is the landed working-tree rule (f84025f); routing
+    pushed history through it is what closes the gap that commit recorded as
+    still open here. A UTF-16 blob used to be dropped by the ``b"\\x00" in
+    data`` binary test, so a credential committed in a UTF-16 file published
+    with the push while this gate reported clean — and purging history after a
+    push does not un-publish it. Windows PowerShell's ``>`` and ``Out-File``
+    emit UTF-16LE by default, which is how such a file gets committed at all.
+
+    Genuine binary is still skipped, and over-large blobs still are too.
+    """
+    if len(data) > _MAX_BLOB_BYTES:
+        return []
+    if b"\x00" in data and not _is_utf16_text(data):
+        return []
+    return check._scan_views(data)
 
 
 def _should_scan_path(path: str) -> bool:
@@ -282,13 +316,11 @@ def _scan_range(repo_root: str, shas: list[str]) -> list[Finding]:
             raw = blobs.get(oid)
             if raw is None:
                 continue
-            text = _decode(raw)
-            if text is None:
-                continue
-            for line_no, label in check._leak_pattern_hits(text):
-                findings.append((path_label, line_no, label, "redacted match"))
-            for f in secret_scan.scan_text(path_label, text):
-                findings.append((path_label, f["line"], f["pattern_name"], f["matched_text"]))
+            for text in _decode_views(raw):
+                for line_no, label in check._leak_pattern_hits(text):
+                    findings.append((path_label, line_no, label, "redacted match"))
+                for f in secret_scan.scan_text(path_label, text):
+                    findings.append((path_label, f["line"], f["pattern_name"], f["matched_text"]))
 
     return findings
 

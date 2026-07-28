@@ -273,3 +273,61 @@ def test_clean_commit_identity_does_not_false_positive(repo: Path) -> None:
     result = _run(repo, "--range", f"{base}..{tip}")
 
     assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
+
+
+def _commit_bytes(repo: Path, rel_path: str, blob: bytes, message: str) -> str:
+    """Commit raw BYTES, so an encoding can be pinned exactly."""
+    path = repo / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(blob)
+    _git(repo, "add", rel_path)
+    _git(repo, "commit", "-q", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize(
+    ("label", "encode"),
+    [
+        # What Windows PowerShell's `>` and Out-File actually emit.
+        ("utf-16 with BOM", lambda text: text.encode("utf-16")),
+        # BOM-less: every byte is valid UTF-8, so a BOM check alone cannot
+        # see this one and the UTF-8 read "succeeds" into NUL-interleaved text.
+        ("utf-16 without BOM", lambda text: text.encode("utf-16-le")),
+    ],
+)
+def test_utf16_blob_in_pushed_history_is_scanned(repo: Path, label: str, encode) -> None:
+    """A UTF-16 blob used to publish unseen -- the gap f84025f left open here.
+
+    That commit fixed the working-tree scanner and recorded that this script,
+    which decodes historical blobs itself, still dropped UTF-16 via its
+    `b"\x00" in data` binary test. A credential committed in a UTF-16 file
+    therefore travelled to the remote while this gate printed clean, and
+    purging history after a push does not un-publish it.
+    """
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    token = "gh" + "p_" + "A9f2Kd8Lm3" + "Qp7Rt1Zx5V" + "b6Nc4Ye0Wu" + "2Ij8Hq"
+    _commit_bytes(repo, "cred.md", encode(f'api = "{token}"\n'), "add a credential in a wide encoding")
+    tip = _commit(repo, "cred.md", "api = os.environ['API']\n", "rotate the credential out of the tree")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"{label} blob published unseen (exit {result.returncode}):\n{result.stderr}"
+    assert "cred.md" in result.stderr
+
+
+def test_binary_blobs_are_still_skipped(repo: Path) -> None:
+    """Conservation check: widening the text rule must not swallow binary.
+
+    Without this, "decode everything" would pass the UTF-16 tests above while
+    burying the gate in noise from every committed PNG and object file. A fix
+    that makes everything loud is not a fix.
+    """
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 8
+    elf = b"\x7fELF\x02\x01\x01" + bytes(range(256)) * 8
+    _commit_bytes(repo, "image.dat", png, "add a png-shaped blob")
+    tip = _commit_bytes(repo, "object.dat", elf, "add an object-file-shaped blob")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"binary blobs produced findings:\n{result.stderr}"
