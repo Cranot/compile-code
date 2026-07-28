@@ -65,6 +65,26 @@ ROOT = Path(__file__).resolve().parent.parent
 
 _ALLOWLIST_RE = re.compile(r"(?i)(?:#|//|;)\s*secretsallow\s*$")
 
+
+def decode_text(data: bytes) -> str:
+    """Decode text by its UTF-32/UTF-16/UTF-8 byte-order mark, without guessing."""
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return data.decode("utf-32", errors="replace")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+def decode_views(data: bytes) -> list[str]:
+    """Return the BOM-directed decode plus a NUL-stripped view when needed."""
+    primary = decode_text(data)
+    if "\x00" not in primary:
+        return [primary]
+    return [primary, primary.replace("\x00", "")]
+
+
 # ---------------------------------------------------------------------------
 # Pattern catalogue -- ported verbatim from roam-code's
 # src/roam/commands/cmd_secrets.py (_SECRET_PATTERN_DEFS), 2026-07-27.
@@ -439,6 +459,16 @@ def _unscannable_finding(rel_path: str, reason: str) -> dict:
     }
 
 
+def _finding_identity(finding: dict) -> tuple[object, ...]:
+    return (
+        finding["file"],
+        finding["line"],
+        finding["severity"],
+        finding["pattern_name"],
+        finding["matched_text"],
+    )
+
+
 def scan_repo(root: Path) -> list[dict]:
     findings: list[dict] = []
     for rel_path in _tracked_files(root):
@@ -460,11 +490,19 @@ def scan_repo(root: Path) -> list[dict]:
             findings.append(_unscannable_finding(rel_path, "tracked path is not a regular file"))
             continue
         try:
-            text = full.read_text(encoding="utf-8", errors="replace")
+            data = full.read_bytes()
         except OSError as exc:
             findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
-        findings.extend(scan_text(rel_path, text))
+        prior_view_findings: set[tuple[object, ...]] = set()
+        for text in decode_views(data):
+            view_findings = scan_text(rel_path, text)
+            findings.extend(
+                finding for finding in view_findings if _finding_identity(finding) not in prior_view_findings
+            )
+            # Preserve repeated matches within one view; suppress only a
+            # finding already emitted from an earlier reading of these bytes.
+            prior_view_findings.update(_finding_identity(finding) for finding in view_findings)
     findings.sort(key=lambda f: (f["file"], f["line"], f["pattern_name"]))
     return findings
 

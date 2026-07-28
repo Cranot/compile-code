@@ -81,6 +81,65 @@ def test_benign_text_is_not_flagged(text: str) -> None:
     assert not _detect(text), f"false positive on: {text!r}"
 
 
+@pytest.mark.parametrize(
+    ("label", "encode"),
+    [
+        ("utf-8", lambda text: text.encode("utf-8")),
+        ("utf-8-BOM", lambda text: text.encode("utf-8-sig")),
+        ("utf-16-BOM", lambda text: text.encode("utf-16")),
+        ("utf-16-LE-no-BOM", lambda text: text.encode("utf-16-le")),
+        ("utf-16-BE-no-BOM", lambda text: text.encode("utf-16-be")),
+    ],
+)
+def test_repo_scan_detects_every_supported_text_encoding_with_clean_control(
+    tmp_path, monkeypatch, label: str, encode
+) -> None:
+    value = "gh" + "p_" + "A9f2Kd8Lm3" + "Qp7Rt1Zx5V" + "b6Nc4Ye0Wu" + "2Ij8Hq"
+    planted = f'auth = "{value}"\n'
+    expected_count = len(secret_scan.scan_text("planted.txt", planted))
+    assert expected_count > 0
+
+    planted_name = "planted.txt"
+    clean_name = "clean.txt"
+    (tmp_path / planted_name).write_bytes(encode(planted))
+    (tmp_path / clean_name).write_bytes(encode("auth = os.environ['AUTH']\n"))
+    monkeypatch.setattr(secret_scan, "_tracked_files", lambda root: [planted_name, clean_name])
+
+    findings = secret_scan.scan_repo(tmp_path)
+
+    assert len([item for item in findings if item["file"] == planted_name]) == expected_count, label
+    assert [item for item in findings if item["file"] == clean_name] == [], label
+
+
+def test_repo_scan_deduplicates_views_to_utf8_count_with_clean_control(tmp_path, monkeypatch) -> None:
+    value = "gh" + "p_" + "A9f2Kd8Lm3" + "Qp7Rt1Zx5V" + "b6Nc4Ye0Wu" + "2Ij8Hq"
+    planted = f'auth = "{value}"\n'
+
+    utf8_name = "utf8.txt"
+    utf16_name = "utf16.txt"
+    overlap_name = "nul-bearing.txt"
+    clean_name = "clean.txt"
+    (tmp_path / utf8_name).write_bytes(planted.encode("utf-8"))
+    (tmp_path / utf16_name).write_bytes(planted.encode("utf-16-le"))
+    (tmp_path / overlap_name).write_bytes(planted.encode("utf-8") + b"\x00")
+    (tmp_path / clean_name).write_bytes(b"auth = os.environ['AUTH']\n\x00")
+    monkeypatch.setattr(
+        secret_scan,
+        "_tracked_files",
+        lambda root: [utf8_name, utf16_name, overlap_name, clean_name],
+    )
+
+    findings = secret_scan.scan_repo(tmp_path)
+    counts = {
+        name: len([item for item in findings if item["file"] == name]) for name in (utf8_name, utf16_name, overlap_name)
+    }
+
+    assert counts[utf8_name] > 0
+    assert counts[utf16_name] == counts[utf8_name]
+    assert counts[overlap_name] == counts[utf8_name]
+    assert [item for item in findings if item["file"] == clean_name] == []
+
+
 def test_catalogue_covers_the_major_ai_providers() -> None:
     """Guards the gap itself: a future edit that drops the whole AI-provider
     category should fail here even if every individual case above vanished."""
@@ -210,7 +269,7 @@ def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) 
     def deny(self, *args, **kwargs):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(secret_scan.Path, "read_text", deny)
+    monkeypatch.setattr(secret_scan.Path, "read_bytes", deny)
 
     findings = secret_scan.scan_repo(tmp_path)
     assert [(f["file"], f["pattern_name"]) for f in findings] == [("locked.py", "Unscannable Tracked File")]
