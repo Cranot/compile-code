@@ -659,6 +659,31 @@ def _leak_pattern_hits(text: str) -> list[tuple[int, str]]:
     return hits
 
 
+def _scan_views(data: bytes) -> list[str]:
+    """Every text reading of *data* the patterns must be applied to.
+
+    A UTF-16 file read as UTF-8 survives ``errors="ignore"`` intact -- every
+    NUL padding byte is itself valid UTF-8 -- so a real token arrives as
+    ``g\\x00h\\x00p\\x00_\\x00...`` and matches no pattern in the catalogue.
+    The gate then reports clean on content it decoded wrong, which is not the
+    same as content it proved safe. Windows PowerShell's ``>`` and
+    ``Out-File`` emit UTF-16LE by default, and this repository is developed on
+    Windows, so ``gh auth token > token.txt`` is the concrete way a credential
+    lands in a tracked file that this scanner cannot see.
+
+    Decoding by BOM handles the common case exactly. The NUL-stripped view is
+    the belt-and-braces one: it costs a second pass only on content that
+    already contains embedded NULs, which no legitimate tracked text file in
+    this repository does.
+    """
+    views = [data.decode("utf-8", errors="ignore")]
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        views.append(data.decode("utf-16", errors="ignore"))
+    if any("\x00" in view for view in views):
+        views.extend(view.replace("\x00", "") for view in list(views) if "\x00" in view)
+    return views
+
+
 def _scan_file_for_leaks(rel: str) -> list[str]:
     """All leak-pattern hits in one tracked file, formatted for display."""
     path = ROOT / rel
@@ -667,10 +692,14 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
     if path.suffix in (".png", ".jpg", ".gif", ".ico"):
         return []
     try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        data = path.read_bytes()
     except OSError as exc:
         return [f"  {rel}  [unreadable tracked file] {exc}"]
-    return [f"  {rel}:{line}  [{label}] redacted match" for line, label in _leak_pattern_hits(text)]
+    hits: dict[tuple[int, str], None] = {}
+    for view in _scan_views(data):
+        for hit in _leak_pattern_hits(view):
+            hits[hit] = None
+    return [f"  {rel}:{line}  [{label}] redacted match" for line, label in sorted(hits)]
 
 
 def _tracked_files() -> list[str]:

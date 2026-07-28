@@ -4,6 +4,7 @@
 
 - Stops the tracked-tree scanners from reporting clean without reading anything. `scripts/check.py`'s `leak_scan()`/`artifact_scan()` and CI's `scripts/secret_scan.py` all derive their verdict from a `git ls-files` inventory, and a successful-but-empty inventory made every one of them an unconditional PASS. Both enumerations now strip Git's repository-redirection controls (`GIT_INDEX_FILE`/`GIT_DIR`/`GIT_WORK_TREE`, which a pre-push hook exports and which make `ls-files` answer about a different index and exit 0) and fail closed on an empty answer, matching the defence `_repository_state()` and the product's own git calls already applied.
 - Makes `scripts/secret_scan.py` report a tracked symlink or an unreadable tracked file as a finding instead of skipping it, so the scan can no longer call content clean that it never decoded. `scripts/check.py`'s equivalent already reported both.
+- Applies the leak catalogue to UTF-16 tracked files. Read as UTF-8 under `errors="ignore"` a UTF-16 file survives intact rather than failing — every NUL padding byte is itself valid UTF-8 — so a credential arrived as `g\x00h\x00p\x00_\x00…` and matched no pattern while the gate printed PASS. Windows PowerShell's `>` and `Out-File` emit UTF-16LE by default, which makes `gh auth token > token.txt` a concrete way a credential lands in a tracked file this scanner could not see. BOM-marked and BOM-less UTF-16 are both covered.
 
 ## 0.2.0 - 2026-07-23
 

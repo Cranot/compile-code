@@ -460,6 +460,36 @@ def test_empty_git_inventory_blocks_leak_and_artifact_scans(monkeypatch, capsys)
     assert output.count("zero tracked files") == 2
 
 
+def test_leak_patterns_survive_utf16_tracked_files(tmp_path, monkeypatch):
+    """A UTF-16 file read as UTF-8 is decoded wrong, not decoded empty.
+
+    Every NUL padding byte is valid UTF-8, so ``errors="ignore"`` preserved
+    them and a real token arrived as ``g\\x00h\\x00p\\x00_\\x00...`` -- matching
+    nothing in the catalogue while the gate printed PASS. Windows PowerShell's
+    ``>`` and ``Out-File`` write UTF-16LE by default, so this is how a token
+    redirected to a file and committed slips a Windows-developed repo.
+    """
+    token = "ghp_" + "A" * 36
+    encodings = {
+        "utf8.txt": token.encode("utf-8"),
+        "utf16le_bom.txt": token.encode("utf-16"),  # what PowerShell `>` writes
+        "utf16be_bom.txt": b"\xfe\xff" + token.encode("utf-16-be"),
+        "utf16le_raw.txt": token.encode("utf-16-le"),
+    }
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+    for name, blob in encodings.items():
+        (tmp_path / name).write_bytes(blob)
+        assert check._scan_file_for_leaks(name) == [f"  {name}:1  [GitHub token] redacted match"], name
+
+    # A hit must still be reported exactly once when several views agree.
+    (tmp_path / "plain.txt").write_bytes(token.encode("utf-8"))
+    assert len(check._scan_file_for_leaks("plain.txt")) == 1
+
+    # Clean UTF-8 text stays clean -- the extra views must not invent hits.
+    (tmp_path / "clean.py").write_bytes(b"import os\nVALUE = 'not a credential'\n")
+    assert check._scan_file_for_leaks("clean.py") == []
+
+
 def test_git_inventory_ignores_inherited_git_redirection(monkeypatch):
     """check.py runs from .githooks/pre-push, where Git exports repository-local
     GIT_* controls. An inherited GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE makes
