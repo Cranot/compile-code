@@ -409,16 +409,30 @@ def test_post_discovery_symlink_swap_is_rejected(tmp_path: Path):
 
 
 def test_post_discovery_regular_file_swap_is_rejected(tmp_path: Path):
+    """A same-path swap must be caught by inode identity, not by unlink timing.
+
+    Swapping via ``unlink()`` followed by recreating at the same path lets the
+    filesystem's allocator hand back the inode number it just freed -- tmpfs
+    (the common ``/tmp`` backing on Linux CI runners) does this reliably for a
+    single-file churn in an otherwise-empty directory, so the "swap" can be
+    invisible to identity comparison purely by construction, independent of
+    whether the check is doing its job. Building the replacement at a distinct
+    path first and swapping it in with ``os.replace`` (mirroring
+    ``test_path_replacement_during_read_is_disclosed`` below) guarantees a
+    freshly allocated inode, so this actually proves the race check catches a
+    different file installed at the same path.
+    """
     root = tmp_path / "root"
     root.mkdir()
     ledger = root / "session.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
     _write_ledger(ledger, [_user("inside")])
     limits = classify.ScanLimits(max_files=2)
     disclosure = classify.ScanDisclosure()
     candidates = classify._discover_session_ledgers([root], limits, disclosure)
     assert len(candidates) == 1
-    ledger.unlink()
-    _write_ledger(ledger, [_user("REPLACEMENT_CANARY")])
+    _write_ledger(replacement, [_user("REPLACEMENT_CANARY")])
+    os.replace(replacement, ledger)
 
     analysis = classify._classify_candidate(
         candidates[0],

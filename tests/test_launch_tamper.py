@@ -64,13 +64,27 @@ def _shim_path(directory: Path, name: str) -> Path:
 
 
 def _write_shim(directory: Path, name: str, *, cmd_body: str, py_body: str) -> Path:
-    """Write a real, resolvable, runnable executable for this platform."""
+    """Write a real, resolvable, runnable executable for this platform.
+
+    The POSIX shebang names this interpreter (``sys.executable``) by absolute
+    path rather than ``#!/usr/bin/env python3``. A shebang interpreter is
+    resolved by the kernel: an absolute path execs directly with no PATH
+    lookup at all, while ``env python3`` requires the *child's* PATH -- built
+    by ``_trusted_tool_env`` from the hermetic PATH this fixture sets -- to
+    contain a directory with a ``python3`` on it. It deliberately does not,
+    the same way it deliberately excludes every other untrusted directory, so
+    ``env python3`` reliably fails with exit 127 on a real Linux runner (this
+    was invisible from a Windows dev machine, where these shims are ``.cmd``
+    files and never touch a shebang at all). That 127 is real launcher
+    behaviour, not a bug -- but it preempts the tamper boundary every one of
+    these tests exists to prove, so the shim must actually start.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     path = _shim_path(directory, name)
     if WINDOWS:
         path.write_text("@echo off\r\n" + cmd_body, encoding="utf-8", newline="")
     else:
-        path.write_text("#!/usr/bin/env python3\n" + py_body, encoding="utf-8")
+        path.write_text(f"#!{sys.executable}\n" + py_body, encoding="utf-8")
         path.chmod(0o755)
     return path
 
