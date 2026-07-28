@@ -42,6 +42,16 @@ dev = [
     "PyYAML==6.0.3",
     "ruff==0.15.22",
     "zizmor==1.27.0",
+    # tests/test_release.py builds DER-encoded certificate extensions to prove
+    # the Sigstore identity check rejects a forged SAN. Pinned to the same
+    # version release/attestation-requirements.lock already carries, so the
+    # test env and the release toolchain agree.
+    #
+    # It was previously declared ONLY in that release lock, so the test passed
+    # on any machine whose venv had installed the release tooling and failed on
+    # a clean CI runner -- the same environment-dependent shape that hid this
+    # repo's dependency-floor break for twelve days.
+    "pyasn1==0.6.4",
 ]
 
 [project.scripts]
