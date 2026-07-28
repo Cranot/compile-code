@@ -40,20 +40,29 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 
 ## Install and use in 60 seconds
 
-Release `0.2.0` is deliberately dependency-gated. Install it only after
-`roam-code 13.10.0` is available on PyPI; the installer resolves that real
-dependency in the tested `>=13.10.0,<14` compatibility interval and fails
-instead of silently substituting an older or future-major kernel.
+Release `0.2.0` is deliberately dependency-gated, and that gate is now open:
+`roam-code 13.10.0` is available on PyPI, so the tested `>=13.10.0,<14`
+compatibility interval resolves. The installer fails instead of silently
+substituting an older or future-major kernel.
+
+compile-code itself is not on PyPI yet and `v0.2.0` is not tagged yet, so
+install the unpinned `main` today:
 
 ```bash
-python -m pip install "compile-code==0.2.0"                    # owner-gated PyPI release
-# or, after the same tag is published:
-python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.0"
+python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git"
 cd your-repo
 compile claude          # index + wire + launch Claude Code, all-in-one
 ```
 
-The install resolves the `compile` CLI and its roam-code engine together. The
+Once the release ships, the pinned forms below resolve. Until then they fail
+by design rather than installing something untested:
+
+```bash
+python -m pip install "compile-code==0.2.0"                    # owner-gated PyPI release
+python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.0"
+```
+
+Every path resolves the `compile` CLI and its roam-code engine together. The
 closed compatibility interval makes the command auditable, admits compatible
 13.x fixes, and prevents an untested future major from entering the immutable
 0.2.0 release.
@@ -294,12 +303,12 @@ planted hallucinations caught in both languages.
 
 | Command | What it does |
 |---|---|
-| `compile claude [...]` | Index + prove wiring + launch Claude Code (remaining args pass through; use `--` when an agent arg collides with Compile options; `--allow-unwired` explicitly accepts degraded mode) |
+| `compile claude [...]` | Index + prove wiring + launch Claude Code (remaining args pass through; use `--` when an agent arg collides with Compile options; `--allow-unwired` explicitly accepts degraded mode; `--read-only` enforces Roam read-only mode for the launched agent) |
 | `compile init` | Index the repo (incremental afterwards; `--force` rebuilds) |
 | `compile wire claude` | Persistent hooks plus curated Roam permissions/guidance; `--user` for all repos, `--no-verify` to skip the post-edit check |
 | `compile unwire claude` | Remove the hooks (`--user` for the user-global install) |
 | `compile run "task"` | Headless: print the compiled envelope (`--json` for scripts/CI) |
-| `compile verify [files...]` | Scoped review of the changed files (`--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
+| `compile verify [files...]` | Scoped review of the changed files (`--changed`, `--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
 | `compile baseline [dirs...]` | Snapshot accepted debt for a clean whole-repo tree (refuses a dirty tree) |
 | `compile report` | Persist a whole-repo verify report without gating |
 | `compile stats` | Routing/latency/cache telemetry for this repo |
@@ -342,7 +351,9 @@ govern its network traffic; Compile does not make that traffic local.
 `compile doctor` diagnoses the three states that matter: toolchain on PATH,
 index present, hooks wired (at either level). Every failure surfaces as a
 one-line `VERDICT:` with the fix — never a traceback. Exit codes: `0` ok,
-`1` user-fixable state, `2` toolchain missing, `124` timeout.
+`1` user-fixable state, `2` toolchain missing or broken, `124` timeout,
+`130` interrupted. `compile verify` additionally propagates the toolchain's
+own exit code, including `5` for a quality-gate failure.
 
 The supported package interval is `roam-code >= 13.10.0,<14`. Doctor resolves
 the exact `roam` executable selected by PATH and reports that executable's path
