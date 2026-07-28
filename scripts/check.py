@@ -674,11 +674,27 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
 
 
 def _tracked_files() -> list[str]:
-    """Return the exact NUL-delimited Git inventory or fail the gate closed."""
+    """Return the exact NUL-delimited Git inventory or fail the gate closed.
+
+    Two ways this enumeration can lie, both of which end with a scan that
+    reads nothing and reports clean:
+
+    * Inherited redirection. Git hooks export repository-local ``GIT_*``
+      controls, and ``check.py`` runs from ``.githooks/pre-push``. An ambient
+      ``GIT_INDEX_FILE``/``GIT_DIR``/``GIT_WORK_TREE`` points ``git ls-files``
+      at a different index -- exit 0, empty stdout, no error anywhere. The
+      same defence ``_repository_state()`` already applies is applied here.
+    * An empty answer. Zero tracked files is never a real pre-push state (a
+      push with nothing tracked has nothing to publish), so it means the
+      inventory failed to compute rather than that there is nothing to scan.
+      Returning ``[]`` would silently turn ``leak_scan()`` and
+      ``artifact_scan()`` into unconditional PASSes.
+    """
     try:
         proc = subprocess.run(
             ["git", "ls-files", "-z"],
             cwd=ROOT,
+            env=_without_git_controls(),
             capture_output=True,
             timeout=60,
             check=False,
@@ -688,7 +704,10 @@ def _tracked_files() -> list[str]:
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()[-1_000:]
         raise RuntimeError(f"git ls-files failed ({proc.returncode}): {detail}")
-    return [os.fsdecode(item) for item in proc.stdout.split(b"\0") if item]
+    tracked = [os.fsdecode(item) for item in proc.stdout.split(b"\0") if item]
+    if not tracked:
+        raise RuntimeError("git ls-files reported zero tracked files; the scan would pass without reading anything")
+    return tracked
 
 
 def leak_scan() -> bool:

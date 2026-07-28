@@ -25,6 +25,8 @@ gate it is testing. Real secrets do not arrive pre-split like this.
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from scripts import secret_scan
@@ -157,3 +159,70 @@ def test_own_test_corpus_predicate_is_one_file_not_a_directory() -> None:
     assert not secret_scan._is_own_test_corpus("tests/test_secret_scan_other.py")
     assert not secret_scan._is_own_test_corpus("tests/test_prepush_leak_scan.py")
     assert not secret_scan._is_own_test_corpus("scripts/secret_scan.py")
+
+
+# --- the gate must never report clean without having read anything ----------
+
+
+def test_tracked_inventory_ignores_inherited_git_redirection(monkeypatch, tmp_path) -> None:
+    """``git ls-files`` must answer about THIS tree.
+
+    An ambient ``GIT_INDEX_FILE``/``GIT_DIR``/``GIT_WORK_TREE`` points it at
+    another index: exit 0, empty stdout, no error -- and the whole scan then
+    reports clean having opened nothing.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **kwargs):
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 0, stdout=b"README.md\0", stderr=b"")
+
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "elsewhere.index"))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "elsewhere.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path))
+    monkeypatch.setattr(secret_scan.subprocess, "run", fake_run)
+
+    assert secret_scan._tracked_files(tmp_path) == ["README.md"]
+    assert not [key for key in captured["environment"] if key.upper().startswith("GIT_")]
+
+
+def test_empty_tracked_inventory_fails_the_scan_closed(monkeypatch, tmp_path) -> None:
+    """Zero tracked files means the inventory did not compute, not that the
+    repository is clean. A successful-but-empty ``git ls-files`` must not let
+    the CI secret gate exit 0 without decoding a single byte."""
+    empty = subprocess.CompletedProcess(["git", "ls-files"], 0, stdout=b"", stderr=b"")
+    monkeypatch.setattr(secret_scan.subprocess, "run", lambda *args, **kwargs: empty)
+
+    with pytest.raises(SystemExit) as excinfo:
+        secret_scan._tracked_files(tmp_path)
+    assert "zero tracked files" in str(excinfo.value)
+
+
+def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) -> None:
+    """Content the scanner could not decode is not content it proved clean.
+
+    ``scripts/check.py::_scan_file_for_leaks`` already reports an unreadable
+    tracked file; this scanner used to ``continue`` past it.
+    """
+    (tmp_path / "locked.py").write_text("placeholder\n", encoding="utf-8")
+    monkeypatch.setattr(secret_scan, "_tracked_files", lambda root: ["locked.py"])
+
+    def deny(self, *args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(secret_scan.Path, "read_text", deny)
+
+    findings = secret_scan.scan_repo(tmp_path)
+    assert [(f["file"], f["pattern_name"]) for f in findings] == [("locked.py", "Unscannable Tracked File")]
+
+
+def test_tracked_symlink_is_reported_and_worktree_deletion_is_not(monkeypatch, tmp_path) -> None:
+    """A symlink can point the scanner's read outside the scanned content, so
+    it is a finding. A tracked path deleted from the worktree genuinely has no
+    content to scan, so it stays a skip -- a true nothing, not an uncomputed
+    one."""
+    monkeypatch.setattr(secret_scan, "_tracked_files", lambda root: ["link.py", "deleted.py"])
+    monkeypatch.setattr(secret_scan.Path, "is_symlink", lambda self: self.name == "link.py")
+
+    findings = secret_scan.scan_repo(tmp_path)
+    assert [(f["file"], f["matched_text"]) for f in findings] == [("link.py", "tracked symlink")]

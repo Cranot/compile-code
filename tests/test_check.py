@@ -440,3 +440,41 @@ def test_git_inventory_failure_blocks_leak_and_artifact_scans(monkeypatch, capsy
     assert check.artifact_scan() is False
     output = capsys.readouterr().out
     assert output.count("git ls-files failed") == 2
+
+
+def test_empty_git_inventory_blocks_leak_and_artifact_scans(monkeypatch, capsys):
+    """A successful-but-empty inventory is the dangerous case, not the failing one.
+
+    ``git ls-files`` exits 0 with empty stdout whenever it is answering about
+    an index that has nothing in it. Both scans are built as "hits found in
+    the enumerated files", so an empty enumeration made them unconditional
+    PASSes -- two of the thirteen gates reporting clean without opening a
+    single file, and nothing in the output saying so.
+    """
+    empty = subprocess.CompletedProcess(["git", "ls-files"], 0, stdout=b"", stderr=b"")
+    monkeypatch.setattr(check.subprocess, "run", lambda *args, **kwargs: empty)
+
+    assert check.leak_scan() is False
+    assert check.artifact_scan() is False
+    output = capsys.readouterr().out
+    assert output.count("zero tracked files") == 2
+
+
+def test_git_inventory_ignores_inherited_git_redirection(monkeypatch):
+    """check.py runs from .githooks/pre-push, where Git exports repository-local
+    GIT_* controls. An inherited GIT_INDEX_FILE/GIT_DIR/GIT_WORK_TREE makes
+    ``git ls-files`` enumerate a different index and exit 0 -- the same defence
+    ``_repository_state()`` already applies has to apply here too."""
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(args[0], 0, stdout=b"README.md\0scripts/check.py\0", stderr=b"")
+
+    monkeypatch.setenv("GIT_INDEX_FILE", "elsewhere.index")
+    monkeypatch.setenv("GIT_DIR", "redirected/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "redirected")
+    monkeypatch.setattr(check.subprocess, "run", fake_run)
+
+    assert check._tracked_files() == ["README.md", "scripts/check.py"]
+    assert [key for key in captured["environment"] if key.upper().startswith("GIT_")] == []

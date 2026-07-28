@@ -54,6 +54,7 @@ catalogue's own test file for the identical reason.
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 import sys
@@ -388,10 +389,22 @@ def _is_own_test_corpus(rel_path: str) -> bool:
     return rel_path.replace("\\", "/") in _OWN_TEST_CORPUS_FILES
 
 
+def _without_git_controls() -> dict[str, str]:
+    """Copy the environment without Git's repository-redirection controls.
+
+    Mirrors ``scripts/check.py::_without_git_controls`` deliberately: both
+    gates enumerate the tracked tree, and both must enumerate *this* tree.
+    An ambient ``GIT_INDEX_FILE``/``GIT_DIR``/``GIT_WORK_TREE`` makes
+    ``git ls-files`` answer about a different index and exit 0.
+    """
+    return {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+
+
 def _tracked_files(root: Path) -> list[str]:
     proc = subprocess.run(
         ["git", "ls-files", "-z"],
         cwd=root,
+        env=_without_git_controls(),
         capture_output=True,
         timeout=60,
         check=False,
@@ -399,7 +412,31 @@ def _tracked_files(root: Path) -> list[str]:
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()
         raise SystemExit(f"could not enumerate tracked files (git exit {proc.returncode}): {detail}")
-    return [part for part in proc.stdout.decode("utf-8", "replace").split("\0") if part]
+    tracked = [part for part in proc.stdout.decode("utf-8", "replace").split("\0") if part]
+    if not tracked:
+        # Zero tracked files is not "nothing to scan" -- a checkout CI can run
+        # this against always has tracked files. It means the inventory failed
+        # to compute, and returning [] would make this gate report clean
+        # without having opened a single file.
+        raise SystemExit("could not enumerate tracked files: git ls-files reported zero tracked files")
+    return tracked
+
+
+def _unscannable_finding(rel_path: str, reason: str) -> dict:
+    """A tracked file this scanner could not read is a finding, not a skip.
+
+    ``scripts/check.py::_scan_file_for_leaks`` already reports tracked
+    symlinks and unreadable tracked files instead of passing over them. A
+    scanner that answers "clean" for content it never decoded is stating a
+    result it did not compute.
+    """
+    return {
+        "file": rel_path,
+        "line": 1,
+        "severity": "high",
+        "pattern_name": "Unscannable Tracked File",
+        "matched_text": reason,
+    }
 
 
 def scan_repo(root: Path) -> list[dict]:
@@ -411,11 +448,21 @@ def scan_repo(root: Path) -> list[dict]:
         if suffix in _BINARY_EXTENSIONS:
             continue
         full = root / rel_path
-        if not full.is_file() or full.is_symlink():
+        if full.is_symlink():
+            findings.append(_unscannable_finding(rel_path, "tracked symlink"))
+            continue
+        if not full.exists():
+            # Tracked but deleted from the worktree: there is genuinely no
+            # content here to scan. That is a true "nothing", not an
+            # uncomputed one, so it stays a skip.
+            continue
+        if not full.is_file():
+            findings.append(_unscannable_finding(rel_path, "tracked path is not a regular file"))
             continue
         try:
             text = full.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+        except OSError as exc:
+            findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
         findings.extend(scan_text(rel_path, text))
     findings.sort(key=lambda f: (f["file"], f["line"], f["pattern_name"]))
