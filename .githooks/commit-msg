@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # commit-msg hook — reject any Co-Authored-By trailer or AI attribution.
 #
 # Enforces: commits on this repo are authored solely by Cranot.
@@ -12,7 +12,7 @@
 # To bypass for a one-off legitimate commit (rare): --no-verify, but
 # audit the commit message manually first.
 
-set -e
+set -euo pipefail
 
 MSG_FILE="$1"
 
@@ -30,6 +30,9 @@ if grep -iE '^[[:space:]]*Co-Authored-By:' "$MSG_FILE" > /dev/null; then
     echo "  If you used 'git commit -m', re-run without it." >&2
     echo "  If your tooling auto-adds it, update the tool config or template." >&2
     exit 1
+elif [[ "$?" -gt 1 ]]; then
+    echo "ERROR: commit-msg hook could not read $MSG_FILE" >&2
+    exit 1
 fi
 
 # Also reject explicit AI / Anthropic attribution patterns in the message body.
@@ -42,6 +45,9 @@ if grep -iE '(generated with|anthropic\.com|noreply@anthropic|claude\.ai|claude 
     grep -iE '(generated with|anthropic\.com|noreply@anthropic|claude\.ai|claude (opus|sonnet|haiku|code))' "$MSG_FILE" | sed 's/^/    /' >&2
     echo "" >&2
     echo "  Fix: remove the AI-attribution line from your commit message." >&2
+    exit 1
+elif [[ "$?" -gt 1 ]]; then
+    echo "ERROR: commit-msg hook could not read $MSG_FILE" >&2
     exit 1
 fi
 
