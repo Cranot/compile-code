@@ -160,14 +160,22 @@ def _batch_changed_paths(repo_root: str, shas: list[str]) -> dict[str, list[tupl
 def _batch_blobs_and_messages(
     repo_root: str, commit_shas: list[str], blob_oids: list[str]
 ) -> tuple[dict[str, str], dict[str, bytes]]:
-    """One `git cat-file --batch` call for every commit object (to extract
-    its message) and every blob object (its content) needed anywhere in the
-    range. Returns ({commit_sha: message}, {blob_oid: raw_bytes})."""
-    commit_msgs: dict[str, str] = {}
+    """One `git cat-file --batch` call for every commit object (kept whole)
+    and every blob object (its content) needed anywhere in the range.
+    Returns ({commit_sha: full_commit_object_text}, {blob_oid: raw_bytes}).
+
+    The commit object is kept WHOLE -- header included -- because the
+    `author` and `committer` header lines carry a name and an email address
+    that publish with the commit exactly like its message does, and are
+    exactly as unremovable afterwards. This function used to discard the
+    header and return only the message, which left that surface unscanned.
+    `_scan_range` splits the two apart so each is reported under its own
+    label with its own line numbers."""
+    commit_objs: dict[str, str] = {}
     blobs: dict[str, bytes] = {}
     all_oids = list(dict.fromkeys([*commit_shas, *blob_oids]))
     if not all_oids:
-        return commit_msgs, blobs
+        return commit_objs, blobs
 
     stdin = ("\n".join(all_oids) + "\n").encode("ascii")
     proc = subprocess.run(
@@ -205,9 +213,7 @@ def _batch_blobs_and_messages(
         pos += 1
         seen.add(oid)
         if obj_type == "commit":
-            text = content.decode("utf-8", errors="replace")
-            _header, sep, message = text.partition("\n\n")
-            commit_msgs[oid] = message if sep else ""
+            commit_objs[oid] = content.decode("utf-8", errors="replace")
         elif obj_type == "blob":
             blobs[oid] = content
         # tree/tag objects can appear if a caller ever asks for one; neither
@@ -217,7 +223,7 @@ def _batch_blobs_and_messages(
     missing = set(all_oids) - seen
     if missing:
         raise prepush_refs.PrePushGitError(f"cat-file --batch: no record returned for {sorted(missing)[:5]}")
-    return commit_msgs, blobs
+    return commit_objs, blobs
 
 
 Finding = tuple[str, int, str, str]  # (label, line_no, kind, detail)
@@ -241,12 +247,30 @@ def _scan_range(repo_root: str, shas: list[str]) -> list[Finding]:
         for path, oid in keep:
             wanted_paths[oid] = path
 
-    commit_msgs, blobs = _batch_blobs_and_messages(repo_root, shas, list(wanted_paths.keys()))
+    commit_objs, blobs = _batch_blobs_and_messages(repo_root, shas, list(wanted_paths.keys()))
 
     for sha in shas:
         short = sha[:10]
 
-        message = commit_msgs.get(sha, "")
+        # A commit object is "<header block>\n\n<message>". Scan both halves.
+        # If the separator is absent the object is malformed; treat the whole
+        # thing as header so it is still scanned rather than silently dropped.
+        raw_commit = commit_objs.get(sha, "")
+        header, sep, message = raw_commit.partition("\n\n")
+        if not sep:
+            header, message = raw_commit, ""
+
+        # Identity metadata publishes with the commit and cannot be edited
+        # out afterwards any more than the message can. A real name, a
+        # personal address, or an employer domain left in user.name /
+        # user.email travels to the remote in these two lines.
+        identity = "\n".join(line for line in header.splitlines() if line.startswith(("author ", "committer ")))
+        ident_label = f"{short} (commit identity)"
+        for line_no, label in check._leak_pattern_hits(identity):
+            findings.append((ident_label, line_no, label, "redacted match"))
+        for f in secret_scan.scan_text(ident_label, identity):
+            findings.append((ident_label, f["line"], f["pattern_name"], f["matched_text"]))
+
         msg_label = f"{short} (commit message)"
         for line_no, label in check._leak_pattern_hits(message):
             findings.append((msg_label, line_no, label, "redacted match"))

@@ -236,3 +236,40 @@ def test_secret_scan_catalogue_is_also_applied_to_pushed_history(repo: Path) -> 
 
     assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stderr}"
     assert "Anthropic OAuth Token" in result.stderr
+
+
+def test_commit_identity_metadata_is_scanned_not_just_the_message(repo: Path) -> None:
+    """The `author`/`committer` header lines publish with the commit exactly
+    like its message does, and are exactly as unremovable afterwards. The
+    scanner used to `partition("\n\n")` the commit object and keep only the
+    message, so a credential, a real name, or an employer domain sitting in
+    user.name / user.email travelled to the remote completely unscanned."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+
+    # Plant the leak ONLY in the identity metadata. The tree, the diff and
+    # the commit message are all clean, so every other surface this scanner
+    # inspects stays quiet -- if this test fails, the identity surface is the
+    # only thing that could have caught it.
+    # Built by concatenation, never written as a literal, so this test file
+    # does not itself trip the gate it is testing (same convention as the
+    # other planted-leak tests above).
+    leak_secret = "AKIA" + "V" * 16
+    _git(repo, "config", "user.name", leak_secret)
+    tip = _commit(repo, "notes.txt", "nothing interesting here\n", "an entirely unremarkable commit subject")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
+    assert "commit identity" in result.stderr, result.stderr
+    assert "AWS" in result.stderr, result.stderr
+
+
+def test_clean_commit_identity_does_not_false_positive(repo: Path) -> None:
+    """An ordinary name/email pair must not trip the new identity surface --
+    a gate that fires on every commit is a gate that gets bypassed."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit(repo, "notes.txt", "still benign\n", "clean follow-up commit")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"

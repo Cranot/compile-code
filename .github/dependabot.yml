@@ -1,0 +1,34 @@
+version: 2
+
+# WHY: every third-party action in this repo is pinned to a full-length commit
+# SHA, and the repository now enforces that server-side
+# (actions/permissions -> sha_pinning_required). A SHA pin is only half of the
+# control: it freezes the bytes, but it also freezes them at a version that
+# never advances on its own. Without an update channel a pin silently rots
+# into an unpatched pin, and the stronger the pinning the longer the rot goes
+# unnoticed. Dependabot's security updates already flow here (they are enabled
+# repo-wide and bypass the cooldown below), but they only fire on a published
+# advisory -- routine SHA refreshes need this file.
+#
+# Scope is deliberately github-actions only. Python dependency integrity in
+# this repo is already governed by the hash-locked release/*.lock files, which
+# are regenerated as a reviewed release step rather than by a bot.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"
+    # Let a new action release mature before adopting its SHA. Guards against
+    # day-zero adoption of a compromised or immediately-regressed release.
+    # Security updates ignore cooldown and continue to arrive immediately.
+    cooldown:
+      default-days: 7
+      include:
+        - "*"
