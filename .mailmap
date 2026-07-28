@@ -1,0 +1,19 @@
+# Canonical author identity.
+#
+# Every identity below is the same person. They accumulated from different
+# machines and git configs over the life of the repo.
+#
+# `leak-proof-test <test@example.invalid>` is not a contributor at all: it was
+# an ad-hoc repo-local git identity set while developing the leak-scan hook on
+# 2026-07-27, which then silently authored the next ten commits before anyone
+# noticed. The local override has been removed, so new commits are attributed
+# correctly. The ten published commits cannot be re-authored without rewriting
+# public history and force-pushing, so they are reconciled here instead.
+#
+# `git shortlog`, `git blame`, `git log --use-mailmap` and GitHub's contributor
+# graph all honour this file.
+
+Cranot <44682693+Cranot@users.noreply.github.com> <cranot@users.noreply.github.com>
+Cranot <44682693+Cranot@users.noreply.github.com> <bonum.galaxy@gmail.com>
+Cranot <44682693+Cranot@users.noreply.github.com> <unionwebapps@gmail.com>
+Cranot <44682693+Cranot@users.noreply.github.com> leak-proof-test <test@example.invalid>
