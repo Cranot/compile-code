@@ -26,6 +26,11 @@ import sysconfig
 import tempfile
 from pathlib import Path
 
+try:
+    from scripts.inventory import InventoryError, filesystem_files, git_candidate_files, without_git_controls
+except ModuleNotFoundError:  # Direct ``python scripts/check.py`` execution.
+    from inventory import InventoryError, filesystem_files, git_candidate_files, without_git_controls
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Credential shapes + private-infrastructure strings that must never ship.
@@ -155,8 +160,7 @@ def _path_is_committed_artifact(rel: str) -> bool:
 
 def _without_git_controls(environment: dict[str, str] | None = None) -> dict[str, str]:
     """Copy an environment without repository-redirection controls exported by Git hooks."""
-    source = os.environ if environment is None else environment
-    return {key: value for key, value in source.items() if not key.upper().startswith("GIT_")}
+    return without_git_controls(environment)
 
 
 def _repository_state() -> bytes:
@@ -621,6 +625,35 @@ def zizmor_gates() -> list[bool]:
     return results
 
 
+def ruff_gates() -> list[bool]:
+    """Run both Ruff gates only after proving their shared source inventory."""
+    roots = [ROOT / name for name in ("src", "tests", "scripts")]
+    try:
+        files = filesystem_files(roots, suffixes=frozenset({".py", ".pyi"}))
+        empty_roots = [
+            root.relative_to(ROOT).as_posix() for root in roots if not any(root in path.parents for path in files)
+        ]
+        if not files or empty_roots:
+            detail = f"empty roots: {', '.join(empty_roots)}" if empty_roots else "zero Python files"
+            raise InventoryError(detail)
+    except InventoryError as exc:
+        for title in ("ruff check", "ruff format --check"):
+            print(f"[check] {title}: FAIL")
+            print(f"could not establish Python source inventory: {exc}")
+        return [False, False]
+    count = len(files)
+    return [
+        run(
+            f"ruff check ({count} Python files)",
+            [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"],
+        ),
+        run(
+            f"ruff format --check ({count} Python files)",
+            [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"],
+        ),
+    ]
+
+
 def _source_test_environment() -> dict[str, str]:
     """Bind pytest to this checkout instead of any previously installed wheel."""
     # Git hooks export repository-local GIT_* controls. Passing those into a
@@ -703,7 +736,7 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
 
 
 def _tracked_files() -> list[str]:
-    """Return the exact NUL-delimited Git inventory or fail the gate closed.
+    """Return tracked plus new non-ignored files or fail the gate closed.
 
     Two ways this enumeration can lie, both of which end with a scan that
     reads nothing and reports clean:
@@ -720,23 +753,9 @@ def _tracked_files() -> list[str]:
       ``artifact_scan()`` into unconditional PASSes.
     """
     try:
-        proc = subprocess.run(
-            ["git", "ls-files", "-z"],
-            cwd=ROOT,
-            env=_without_git_controls(),
-            capture_output=True,
-            timeout=60,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"could not enumerate tracked files: {exc}") from exc
-    if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", "replace").strip()[-1_000:]
-        raise RuntimeError(f"git ls-files failed ({proc.returncode}): {detail}")
-    tracked = [os.fsdecode(item) for item in proc.stdout.split(b"\0") if item]
-    if not tracked:
-        raise RuntimeError("git ls-files reported zero tracked files; the scan would pass without reading anything")
-    return tracked
+        return git_candidate_files(ROOT, run_command=subprocess.run)
+    except InventoryError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def leak_scan() -> bool:
@@ -747,7 +766,10 @@ def leak_scan() -> bool:
         print(f"  {exc}")
         return False
     hits = [hit for rel in tracked for hit in _scan_file_for_leaks(rel)]
-    print(f"[check] leak scan: {'PASS' if not hits else 'FAIL'}")
+    print(
+        f"[check] leak scan: {'PASS' if not hits else 'FAIL'} "
+        f"(examined {len(tracked)} candidate paths; {len(hits)} findings)"
+    )
     for h in hits[:10]:
         print(h)
     return not hits
@@ -761,7 +783,10 @@ def artifact_scan() -> bool:
         print(f"  {exc}")
         return False
     hits = [rel for rel in tracked if _path_is_committed_artifact(rel)]
-    print(f"[check] artifact scan: {'PASS' if not hits else 'FAIL'}")
+    print(
+        f"[check] artifact scan: {'PASS' if not hits else 'FAIL'} "
+        f"(examined {len(tracked)} candidate paths; {len(hits)} findings)"
+    )
     for rel in hits[:10]:
         print(f"  {rel}  [committed artifact]")
     return not hits
@@ -1083,8 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     results = [
         dependency_audit(),
-        run("ruff check", [sys.executable, "-m", "ruff", "check", "src", "tests", "scripts"]),
-        run("ruff format --check", [sys.executable, "-m", "ruff", "format", "--check", "src", "tests", "scripts"]),
+        *ruff_gates(),
         *zizmor_gates(),
         run(
             "pytest",

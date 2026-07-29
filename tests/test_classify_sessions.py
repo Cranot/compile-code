@@ -169,7 +169,7 @@ def test_file_discovery_is_capped_and_discloses_truncation(tmp_path: Path, capsy
     code, report, _ = _run_json(capsys, str(tmp_path), "--max-files", "2")
     discovery = report["scan"]["discovery"]
 
-    assert code == 0
+    assert code == 1
     assert report["summary"]["scanned_sessions"] == 2
     assert discovery["ledgers_discovered"] == 2
     assert discovery["file_limit_reached"] is True
@@ -309,7 +309,7 @@ def test_file_byte_and_row_budgets_are_disclosed(tmp_path: Path, capsys):
     )
     scan = report["scan"]
 
-    assert code == 0
+    assert code == 1
     assert scan["bytes_read"] <= 140
     assert scan["rows"]["row_limit_files"] >= 1
     assert scan["files"]["truncated"] >= 1
@@ -332,11 +332,23 @@ def test_global_byte_budget_stops_later_files_and_discloses_partial_row(tmp_path
     )
     scan = report["scan"]
 
-    assert code == 0
+    assert code == 1
     assert scan["bytes_read"] == 64
     assert scan["truncation"]["total_byte_limit_reached"] is True
     assert scan["files"]["skipped_total_budget"] == 1
     assert scan["rows"]["truncated"] == 1
+
+
+def test_partial_source_inventory_reports_results_but_exits_incomplete(tmp_path: Path, capsys):
+    ledger = tmp_path / "present.jsonl"
+    _write_ledger(ledger, [_user("healthy")])
+
+    code, report, _ = _run_json(capsys, str(ledger), str(tmp_path / "missing.jsonl"))
+
+    assert code == 1
+    assert report["summary"]["scanned_sessions"] == 1
+    assert report["scan"]["coverage"]["complete"] is False
+    assert report["scan"]["coverage"]["incomplete_reasons"] == ["sources_missing"]
 
 
 def test_symlinked_ledger_is_rejected_without_reading_target(tmp_path: Path, capsys):

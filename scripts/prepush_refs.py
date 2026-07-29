@@ -14,19 +14,16 @@ specific.
 Ported from roam-code's ``scripts/prepush_refs.py`` (D:/Safe/Projects/
 roam-code) with one deliberate simplification: instead of an authoritative
 ``git ls-remote`` network round-trip to bound a brand-new ref's scan, this
-version bounds it locally via ``--not --remotes`` (everything already
-reachable from some remote-tracking ref is presumably already published).
-That is a heuristic, not a proof -- a stale remote-tracking ref could under-
-exclude a few already-published commits -- but the failure direction is
-always safe (a few extra already-published commits get harmlessly re-
-scanned; nothing pushed is ever skipped), and it keeps the gate network-
-free, which matters more for a hook that runs on every single push.
+version uses only remote-tracking refs for the TARGET remote. A commit cached
+under a private or otherwise different remote is not evidence it already
+reached the current target. With no target name, a new ref scans its full
+reachable history rather than trusting an ambiguous cached inventory.
 
 Deliberately excludes ``--branches`` from that bound: the ref being pushed
 IS a local branch, so its own tip is trivially "reachable from a local
 branch" and including ``--branches`` in the exclusion set would silently
 scan nothing at all on a first push of a new branch. Only remote-tracking
-refs (``refs/remotes/*``) count as evidence of prior publication.
+refs for the named target count as evidence of prior publication there.
 """
 
 from __future__ import annotations
@@ -100,7 +97,7 @@ def _git_bytes(repo_root: str | None, args: list[str], *, operation: str) -> byt
     return proc.stdout
 
 
-def resolve_commits(repo_root: str, updates: list[RefUpdate]) -> list[str]:
+def resolve_commits(repo_root: str, updates: list[RefUpdate], *, remote_name: str | None = None) -> list[str]:
     """Return the deduplicated, order-stable list of commit SHAs newly
     introduced by *updates* -- the exact set about to be published.
 
@@ -117,7 +114,9 @@ def resolve_commits(repo_root: str, updates: list[RefUpdate]) -> list[str]:
         if update.is_deletion:
             continue
         if update.is_new_remote_ref:
-            args = ["rev-list", update.local_oid, "--not", "--remotes"]
+            args = ["rev-list", update.local_oid]
+            if remote_name:
+                args.extend(["--not", f"--remotes={remote_name}"])
         else:
             args = ["rev-list", f"{update.remote_oid}..{update.local_oid}"]
         raw = _git_bytes(repo_root, args, operation=f"resolve push range for {update.local_ref}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone secret scan over this repository's tracked files.
+"""Standalone secret scan over tracked and new non-ignored repository files.
 
 Ported from roam-code's two-part scanner (D:/Safe/Projects/roam-code,
 2026-07-27):
@@ -36,7 +36,7 @@ pattern already known to be covered proves nothing about coverage.
 
 NOTE ON TEST FIXTURES: this scanner does not exempt ``tests/`` wholesale
 (mirroring roam-code's ``scripts/secret_scan.py``, not its test-suppressing
-``cmd_secrets.scan_project``) -- it scans every tracked file's content.
+``cmd_secrets.scan_project``) -- it scans every candidate file's content.
 Planted test secrets must therefore be split across string-literal
 concatenations so the raw source text never contains a contiguous match
 (see tests/test_secret_scan.py); real secrets do not arrive pre-split.
@@ -54,12 +54,16 @@ catalogue's own test file for the identical reason.
 from __future__ import annotations
 
 import math
-import os
 import re
 import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
+
+try:
+    from scripts.inventory import InventoryError, git_candidate_files, without_git_controls
+except ModuleNotFoundError:  # Direct ``python scripts/secret_scan.py`` execution.
+    from inventory import InventoryError, git_candidate_files, without_git_controls
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -413,33 +417,18 @@ def _without_git_controls() -> dict[str, str]:
     """Copy the environment without Git's repository-redirection controls.
 
     Mirrors ``scripts/check.py::_without_git_controls`` deliberately: both
-    gates enumerate the tracked tree, and both must enumerate *this* tree.
+    gates enumerate the current candidate tree, and both must enumerate *this* tree.
     An ambient ``GIT_INDEX_FILE``/``GIT_DIR``/``GIT_WORK_TREE`` makes
     ``git ls-files`` answer about a different index and exit 0.
     """
-    return {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+    return without_git_controls()
 
 
 def _tracked_files(root: Path) -> list[str]:
-    proc = subprocess.run(
-        ["git", "ls-files", "-z"],
-        cwd=root,
-        env=_without_git_controls(),
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", "replace").strip()
-        raise SystemExit(f"could not enumerate tracked files (git exit {proc.returncode}): {detail}")
-    tracked = [part for part in proc.stdout.decode("utf-8", "replace").split("\0") if part]
-    if not tracked:
-        # Zero tracked files is not "nothing to scan" -- a checkout CI can run
-        # this against always has tracked files. It means the inventory failed
-        # to compute, and returning [] would make this gate report clean
-        # without having opened a single file.
-        raise SystemExit("could not enumerate tracked files: git ls-files reported zero tracked files")
-    return tracked
+    try:
+        return git_candidate_files(root, run_command=subprocess.run)
+    except InventoryError as exc:
+        raise SystemExit(f"could not establish candidate file inventory: {exc}") from exc
 
 
 def _unscannable_finding(rel_path: str, reason: str) -> dict:
@@ -469,9 +458,11 @@ def _finding_identity(finding: dict) -> tuple[object, ...]:
     )
 
 
-def scan_repo(root: Path) -> list[dict]:
+def _scan_repo(root: Path) -> tuple[list[dict], int, int]:
     findings: list[dict] = []
-    for rel_path in _tracked_files(root):
+    candidates = _tracked_files(root)
+    files_examined = 0
+    for rel_path in candidates:
         if _in_skip_dir(rel_path) or _is_own_test_corpus(rel_path):
             continue
         suffix = Path(rel_path).suffix.lower()
@@ -494,6 +485,7 @@ def scan_repo(root: Path) -> list[dict]:
         except OSError as exc:
             findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
+        files_examined += 1
         prior_view_findings: set[tuple[object, ...]] = set()
         for text in decode_views(data):
             view_findings = scan_text(rel_path, text)
@@ -504,7 +496,11 @@ def scan_repo(root: Path) -> list[dict]:
             # finding already emitted from an earlier reading of these bytes.
             prior_view_findings.update(_finding_identity(finding) for finding in view_findings)
     findings.sort(key=lambda f: (f["file"], f["line"], f["pattern_name"]))
-    return findings
+    return findings, len(candidates), files_examined
+
+
+def scan_repo(root: Path) -> list[dict]:
+    return _scan_repo(root)[0]
 
 
 def format_findings(findings: list[dict]) -> str:
@@ -515,11 +511,14 @@ def format_findings(findings: list[dict]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    findings = scan_repo(ROOT)
+    findings, candidate_count, files_examined = _scan_repo(ROOT)
     if findings:
         print(format_findings(findings), file=sys.stderr)
         return 1
-    print("secret scan: no findings")
+    print(
+        f"secret scan: PASS (established {candidate_count} candidate paths; "
+        f"examined {files_examined} text files; 0 findings)"
+    )
     return 0
 
 

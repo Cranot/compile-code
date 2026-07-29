@@ -257,6 +257,32 @@ def test_empty_tracked_inventory_fails_the_scan_closed(monkeypatch, tmp_path) ->
     assert "zero tracked files" in str(excinfo.value)
 
 
+def test_new_nonignored_file_is_scanned_and_healthy_inventory_stays_clean(tmp_path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("healthy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    value = "gh" + "p_" + "A9f2Kd8Lm3" + "Qp7Rt1Zx5V" + "b6Nc4Ye0Wu" + "2Ij8Hq"
+    (tmp_path / "fresh.py").write_text("auth = " + repr(value) + "\n", encoding="utf-8")
+
+    findings = secret_scan.scan_repo(tmp_path)
+
+    assert secret_scan._tracked_files(tmp_path) == ["README.md", "fresh.py"]
+    assert any(finding["file"] == "fresh.py" for finding in findings)
+    (tmp_path / "fresh.py").write_text("auth = os.environ['AUTH']\n", encoding="utf-8")
+    assert secret_scan.scan_repo(tmp_path) == []
+
+
+def test_clean_secret_scan_reports_established_and_examined_counts(tmp_path, monkeypatch, capsys) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("healthy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    (tmp_path / "fresh.py").write_text("healthy = True\n", encoding="utf-8")
+    monkeypatch.setattr(secret_scan, "ROOT", tmp_path)
+
+    assert secret_scan.main([]) == 0
+    assert "established 2 candidate paths; examined 2 text files; 0 findings" in capsys.readouterr().out
+
+
 def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) -> None:
     """Content the scanner could not decode is not content it proved clean.
 

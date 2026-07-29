@@ -2,7 +2,7 @@
 """prepush_leak_scan.py -- the BLOCKING pre-push leak gate over PUSHED HISTORY.
 
 ``scripts/check.py``'s ``leak_scan()`` (and CI's ``scripts/secret_scan.py``)
-scan the current TRACKED TREE. That is blind to a secret or internal-only
+scan the current tracked-plus-new candidate tree. That is blind to a secret or internal-only
 string that was committed and then "fixed" by a LATER commit in the same
 push: the final tree is clean, but the blob object for the earlier commit
 still travels to the remote and is retrievable from history forever. For a
@@ -57,6 +57,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import check  # noqa: E402
+import inventory  # noqa: E402
 import prepush_refs  # noqa: E402
 import secret_scan  # noqa: E402
 
@@ -162,18 +163,20 @@ def _batch_changed_paths(repo_root: str, shas: list[str]) -> dict[str, list[tupl
     stdin = ("\n".join(shas) + "\n").encode("ascii")
     raw = _git_bytes(
         repo_root,
-        ["diff-tree", "--raw", "-r", "--root", "-m", "--diff-filter=d", "--stdin"],
+        ["diff-tree", "--raw", "-r", "--root", "-m", "--always", "--diff-filter=d", "--stdin"],
         operation="batch-list changed paths",
         input_bytes=stdin,
     )
     text = raw.decode("utf-8", errors="replace")
     result: dict[str, list[tuple[str, str]]] = {sha: [] for sha in shas}
+    headers_seen: set[str] = set()
     current: str | None = None
     for line in text.split("\n"):
         if not line:
             continue
         if line in sha_set:
             current = line
+            headers_seen.add(line)
             continue
         if line.startswith(":"):
             if current is None:
@@ -188,6 +191,10 @@ def _batch_changed_paths(repo_root: str, shas: list[str]) -> dict[str, list[tupl
             result[current].append((path, new_oid))
             continue
         raise prepush_refs.PrePushGitError(f"unexpected diff-tree --stdin line: {line!r}")
+    try:
+        inventory.require_complete_inventory(shas, headers_seen, label="diff-tree per-commit path inventory")
+    except inventory.InventoryError as exc:
+        raise prepush_refs.PrePushGitError(str(exc)) from exc
     return result
 
 
@@ -374,7 +381,7 @@ def _resolve_commits(repo_root: str, args: argparse.Namespace) -> list[str]:
             # here means the capture step itself is broken. Fail closed.
             sys.stderr.write("ERROR: --pre-push-updates contained no ref updates.\n")
             raise SystemExit(1)
-        return prepush_refs.resolve_commits(repo_root, updates)
+        return prepush_refs.resolve_commits(repo_root, updates, remote_name=args.remote_name)
 
     # No stdin capture supplied (manual/standalone run). Fall back to the
     # conventional "what am I about to push" range IF this branch has an

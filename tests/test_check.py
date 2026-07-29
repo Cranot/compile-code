@@ -508,3 +508,70 @@ def test_git_inventory_ignores_inherited_git_redirection(monkeypatch):
 
     assert check._tracked_files() == ["README.md", "scripts/check.py"]
     assert [key for key in captured["environment"] if key.upper().startswith("GIT_")] == []
+
+
+def test_git_inventory_includes_new_nonignored_files_with_clean_control(tmp_path, monkeypatch):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("healthy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    (tmp_path / "fresh.py").write_text("healthy = True\n", encoding="utf-8")
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check._tracked_files() == ["README.md", "fresh.py"]
+
+
+def test_untracked_degenerate_inventory_blocks_leak_and_artifact_scans(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("healthy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    value = "gh" + "p_" + "A" * 36
+    (tmp_path / "fresh.py").write_text("auth = " + repr(value) + "\n", encoding="utf-8")
+    artifact = tmp_path / "build" / "generated.py"
+    artifact.parent.mkdir()
+    artifact.write_text("generated = True\n", encoding="utf-8")
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False
+    assert check.artifact_scan() is False
+    output = capsys.readouterr().out
+    assert "examined 3 candidate paths" in output
+    assert "fresh.py" in output
+    assert "build/generated.py" in output
+
+
+def test_tree_scans_report_healthy_inventory_counts(tmp_path, monkeypatch, capsys):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("healthy\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    (tmp_path / "fresh.py").write_text("healthy = True\n", encoding="utf-8")
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is True
+    assert check.artifact_scan() is True
+    assert capsys.readouterr().out.count("examined 2 candidate paths") == 2
+
+
+def test_empty_quality_source_inventory_fails_both_ruff_gates(tmp_path, monkeypatch, capsys):
+    for name in ("src", "tests", "scripts"):
+        (tmp_path / name).mkdir()
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+    calls = []
+    monkeypatch.setattr(check, "run", lambda title, command, **kwargs: calls.append((title, command)) or True)
+
+    assert check.ruff_gates() == [False, False]
+    assert calls == []
+    output = capsys.readouterr().out
+    assert output.count("could not establish Python source inventory") == 2
+
+
+def test_healthy_quality_source_inventory_reaches_both_ruff_gates(tmp_path, monkeypatch):
+    for name in ("src", "tests", "scripts"):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / f"{name}.py").write_text("value = 1\n", encoding="utf-8")
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+    calls = []
+    monkeypatch.setattr(check, "run", lambda title, command, **kwargs: calls.append(title) or True)
+
+    assert check.ruff_gates() == [True, True]
+    assert calls == ["ruff check (3 Python files)", "ruff format --check (3 Python files)"]

@@ -136,6 +136,29 @@ class ScanDisclosure:
     rows_oversized: int = 0
     rows_truncated: int = 0
 
+    def incomplete_reasons(self) -> list[str]:
+        """Content-free reasons the requested scan coverage is incomplete."""
+        counters = {
+            "sources_missing": self.sources_missing,
+            "sources_rejected_symlink": self.sources_rejected_symlink,
+            "sources_rejected_non_regular": self.sources_rejected_non_regular,
+            "discovery_errors": self.discovery_errors,
+            "discovery_limit_reached": int(self.discovery_limit_reached),
+            "file_limit_reached": int(self.file_limit_reached),
+            "files_rejected_symlink": self.files_rejected_symlink,
+            "files_rejected_non_regular": self.files_rejected_non_regular,
+            "files_rejected_hardlink": self.files_rejected_hardlink,
+            "files_rejected_outside_root": self.files_rejected_outside_root,
+            "files_rejected_race": self.files_rejected_race,
+            "files_changed_during_read": self.files_changed_during_read,
+            "files_unreadable": self.files_unreadable,
+            "files_truncated": self.files_truncated,
+            "files_skipped_total_budget": self.files_skipped_total_budget,
+            "total_byte_limit_reached": int(self.total_byte_limit_reached),
+            "row_limit_files": self.row_limit_files,
+        }
+        return [name for name, count in counters.items() if count]
+
     def public(self, limits: ScanLimits) -> dict[str, object]:
         invalid_rows = (
             self.rows_invalid_json
@@ -154,6 +177,10 @@ class ScanDisclosure:
             )
         )
         return {
+            "coverage": {
+                "complete": not self.incomplete_reasons(),
+                "incomplete_reasons": self.incomplete_reasons(),
+            },
             "limits": asdict(limits),
             "sources": {
                 "requested": self.source_count,
@@ -1004,6 +1031,11 @@ def _print_prose_report(report: dict[str, object]) -> None:
         f"[classify] disclosure: files={files['scanned']} bytes={scan['bytes_read']} "
         f"invalid_rows={rows['invalid_total']} truncated={scan['truncation']['occurred']}"
     )
+    coverage = scan["coverage"]
+    print(
+        f"[classify] inventory coverage: {'complete' if coverage['complete'] else 'INCOMPLETE'}"
+        + ("" if coverage["complete"] else f" ({', '.join(coverage['incomplete_reasons'])})")
+    )
     sensitive = report.get("sensitive_content")
     if not isinstance(sensitive, dict):
         return
@@ -1134,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
     else:
         _print_prose_report(report)
-    return 0 if sessions else 1
+    return 0 if sessions and not disclosure.incomplete_reasons() else 1
 
 
 if __name__ == "__main__":

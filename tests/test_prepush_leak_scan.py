@@ -2,7 +2,7 @@
 only exists in HISTORY, and must not block a clean one.
 
 BLIND SPOT this closes: scripts/check.py's leak_scan() (and CI's
-scripts/secret_scan.py) both scan the current TRACKED TREE. A secret
+scripts/secret_scan.py) both scan the current tracked-plus-new candidate tree. A secret
 committed and then "fixed" by a later commit in the same push is invisible
 to either -- the final tree is clean -- but the earlier commit's blob still
 reaches the remote the moment the push completes, and purging history
@@ -107,6 +107,32 @@ def test_clean_range_passes(repo: Path) -> None:
     assert "clean" in result.stdout
 
 
+def test_allow_empty_commit_has_a_complete_zero_path_inventory(repo: Path) -> None:
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    _git(repo, "commit", "--allow-empty", "-qm", "intentional empty commit")
+    tip = _git(repo, "rev-parse", "HEAD")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"a proven empty path set was mistaken for an absent inventory:\n{result.stderr}"
+    assert "1 commit(s) scanned, 0 findings" in result.stdout
+
+
+def test_partial_per_commit_path_inventory_fails_closed(monkeypatch) -> None:
+    from scripts import prepush_leak_scan
+
+    first = "a" * 40
+    second = "b" * 40
+    monkeypatch.setattr(
+        prepush_leak_scan,
+        "_git_bytes",
+        lambda *args, **kwargs: (first + "\n").encode("ascii"),
+    )
+
+    with pytest.raises(prepush_leak_scan.prepush_refs.PrePushGitError, match="missing 1 of 2 requested commits"):
+        prepush_leak_scan._batch_changed_paths(".", [first, second])
+
+
 def test_new_branch_first_push_is_scanned_not_skipped(repo: Path) -> None:
     """The --pre-push-updates path with an all-zero remote oid (first push of
     a new ref) must still resolve and scan real commits, not treat 'no known
@@ -122,6 +148,21 @@ def test_new_branch_first_push_is_scanned_not_skipped(repo: Path) -> None:
     result = _run(repo, "--pre-push-updates", "updates.txt")
 
     assert result.returncode == 2, f"expected BLOCKED on first push, got exit {result.returncode}:\n{result.stderr}"
+    assert "AWS access key" in result.stderr
+
+
+def test_new_target_remote_does_not_trust_another_remotes_cached_inventory(repo: Path) -> None:
+    """A commit cached under a different remote has not reached this target."""
+    value = "AK" + "IA" + "Q" * 16
+    tip = _commit(repo, "config.py", f'value = "{value}"\n', "private-only commit")
+    _git(repo, "update-ref", "refs/remotes/private/main", tip)
+    updates_file = repo / "updates.txt"
+    zero = "0" * 40
+    updates_file.write_text(f"refs/heads/main {tip} refs/heads/main {zero}\n", encoding="utf-8")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "public")
+
+    assert result.returncode == 2, f"another remote hid a first-publication commit:\n{result.stdout}\n{result.stderr}"
     assert "AWS access key" in result.stderr
 
 

@@ -16,6 +16,11 @@ set -euo pipefail
 
 MSG_FILE="$1"
 
+if [ ! -f "$MSG_FILE" ] || [ -L "$MSG_FILE" ] || [ ! -r "$MSG_FILE" ]; then
+    echo "ERROR: commit-msg hook could not establish the message-file inventory: expected one readable regular file." >&2
+    exit 1
+fi
+
 # Case-insensitive: catch Co-Authored-By, Co-authored-by, CO-AUTHORED-BY, etc.
 if grep -iE '^[[:space:]]*Co-Authored-By:' "$MSG_FILE" > /dev/null; then
     echo "ERROR: commit-msg hook (.githooks/commit-msg)" >&2
@@ -30,9 +35,12 @@ if grep -iE '^[[:space:]]*Co-Authored-By:' "$MSG_FILE" > /dev/null; then
     echo "  If you used 'git commit -m', re-run without it." >&2
     echo "  If your tooling auto-adds it, update the tool config or template." >&2
     exit 1
-elif [[ "$?" -gt 1 ]]; then
-    echo "ERROR: commit-msg hook could not read $MSG_FILE" >&2
-    exit 1
+else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "ERROR: commit-msg hook could not examine the message file (grep exit $status)." >&2
+        exit 1
+    fi
 fi
 
 # Also reject explicit AI / Anthropic attribution patterns in the message body.
@@ -46,9 +54,13 @@ if grep -iE '(generated with|anthropic\.com|noreply@anthropic|claude\.ai|claude 
     echo "" >&2
     echo "  Fix: remove the AI-attribution line from your commit message." >&2
     exit 1
-elif [[ "$?" -gt 1 ]]; then
-    echo "ERROR: commit-msg hook could not read $MSG_FILE" >&2
-    exit 1
+else
+    status=$?
+    if [ "$status" -ne 1 ]; then
+        echo "ERROR: commit-msg hook could not examine the message file (grep exit $status)." >&2
+        exit 1
+    fi
 fi
 
+echo "commit-msg attribution scan: PASS (examined 1 message file; 0 findings)"
 exit 0

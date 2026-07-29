@@ -9,7 +9,7 @@
 # in the earlier commit's blob -- purging it afterwards does not un-publish
 # it. The polish pipeline (scripts/check.py) keeps its own whole-tree
 # leak_scan()/artifact_scan() as a cheap backstop for a different failure
-# shape: an uncommitted-but-tracked file present right now. Range scan and
+# shape: a tracked or new non-ignored file present right now. Range scan and
 # tree scan catch different things; both run.
 set -e
 
@@ -24,7 +24,8 @@ cleanup_updates() { rm -f "$UPDATES_FILE"; }
 trap cleanup_updates EXIT HUP INT TERM
 cat >"$UPDATES_FILE"
 
-if ! python3 "$REPO_ROOT/scripts/prepush_leak_scan.py" --pre-push-updates "$UPDATES_FILE" --remote-url "$2"; then
+if ! python3 "$REPO_ROOT/scripts/prepush_leak_scan.py" \
+    --pre-push-updates "$UPDATES_FILE" --remote-name "$1" --remote-url "$2"; then
     echo "" >&2
     echo "BLOCKED: leak found in the commits about to be pushed -- see above." >&2
     echo "  Fixing the tree in a later commit does not un-publish history; amend" >&2
