@@ -975,14 +975,20 @@ def _ensure_indexed_for_launch(*, executable: str | None = None, env: dict[str, 
         click.echo("compile: indexing repo (HEAD drift)...")
         rc = _delegate("index", executable=executable, env=env) if executable else _delegate("index")
         if rc != 0:
-            click.echo("VERDICT: indexing failed — rerun `compile claude` after fixing the index")
+            click.echo(
+                f"VERDICT: indexing failed: .roam/index.db was not refreshed (roam exit {rc}); "
+                "rerun `compile claude` after fixing the index"
+            )
             return rc
         _mark_launch_indexed()
         return 0
     click.echo("compile: indexing repo (first run)...")
     rc = _delegate("init", executable=executable, env=env) if executable else _delegate("init")
     if rc != 0:
-        click.echo("VERDICT: indexing failed — rerun `compile claude` after fixing the index")
+        click.echo(
+            f"VERDICT: indexing failed: .roam/index.db was not created (roam exit {rc}); "
+            "rerun `compile claude` after fixing the index"
+        )
         return rc
     _mark_launch_indexed()
     return rc
@@ -1942,7 +1948,19 @@ def _baseline(paths: tuple[str, ...]) -> None:
     if rc != 0:
         raise SystemExit(rc)
     if status.strip():
-        click.echo("VERDICT: baseline refused — dirty tree. Fix: commit, stash, or rerun on a clean checkout.")
+        status_lines = status.strip().splitlines()
+        dirty_inputs = "; ".join(
+            "<credential-shaped path omitted>"
+            if re.search(r"(?:token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)", line, re.I)
+            else line.replace("\r", "\\r")
+            for line in status_lines[:8]
+        )
+        if len(status_lines) > 8:
+            dirty_inputs += "; ..."
+        click.echo(
+            f"VERDICT: baseline refused: dirty tree input ({dirty_inputs}). "
+            "Fix: commit, stash, or rerun on a clean checkout."
+        )
         raise SystemExit(1)
     raise SystemExit(_delegate("verify", "--report", "--baseline-write", *paths, timeout=BASELINE_TIMEOUT))
 
@@ -2179,7 +2197,10 @@ def _run(task: str, json_out: bool) -> None:
     contract — paste-ready as an agent prompt prefix.
     """
     if not task.strip():
-        click.echo('VERDICT: empty task — pass a navigation prompt, e.g. compile run "who calls handleSave?"')
+        click.echo(
+            "VERDICT: empty task: task argument is empty or whitespace. "
+            'Pass a navigation prompt, e.g. compile run "who calls handleSave?"'
+        )
         raise SystemExit(1)
     args = (["--json"] if json_out else []) + ["compile", task, "--artifact", "auto"]
     with _default_agent_mode("compile"):
@@ -2659,14 +2680,20 @@ def _discover_verify_targets(root: Path) -> list[str]:
 
 def _verification_scope_paths(targets: list[str]) -> list[str]:
     normalized: set[str] = set()
-    for path in targets:
+    for index, path in enumerate(targets):
         if not isinstance(path, str):
-            raise ValueError("scope_path_not_text")
-        value = _scope_path_separators(_require_utf8_scope_text(path))
+            raise ValueError(f"scope_path_not_text: target index {index}")
+        try:
+            value = _scope_path_separators(_require_utf8_scope_text(path))
+        except ValueError as exc:
+            raise ValueError(f"{exc}: target index {index}") from exc
         if not value:
-            raise ValueError("scope_path_empty")
+            raise ValueError(f"scope_path_empty: target index {index}")
         if any(ord(character) < 32 or ord(character) == 127 for character in value):
-            raise ValueError("scope_path_control_character")
+            escaped = repr(value)
+            if re.search(r"(?:token|secret|password|passwd|api[_-]?key|private[_-]?key|credential)", value, re.I):
+                escaped = "<credential-shaped path omitted>"
+            raise ValueError(f"scope_path_control_character: target index {index}, path {escaped}")
         parsed = PurePosixPath(value)
         if (
             parsed.is_absolute()
@@ -2674,7 +2701,7 @@ def _verification_scope_paths(targets: list[str]) -> list[str]:
             or any(part in {".", "..", ""} for part in parsed.parts)
             or parsed.as_posix() != value
         ):
-            raise ValueError("scope_path_not_canonical")
+            raise ValueError(f"scope_path_not_canonical: target index {index}, path {value!r}")
         normalized.add(value)
     return sorted(normalized)
 
@@ -3252,15 +3279,17 @@ def _render_verify_command(
 
 
 def _unsafe_scope_verdict(error: BaseException) -> str | None:
-    reason = str(error)
+    raw_reason = str(error)
+    reason, _, detail = raw_reason.partition(": ")
+    location = f" ({detail})" if detail else " (scope location unavailable)"
     if reason == "scope_path_control_character":
         return (
-            "VERDICT: verify refused — the scope contains a filename with an unsafe control character "
+            f"VERDICT: verify refused: scope path{location} contains an unsafe control character "
             "(including a newline). Rename that file and rerun `compile verify --changed`."
         )
     if reason == "scope_path_undecodable":
         return (
-            "VERDICT: verify refused — the scope contains a filename that is not representable as UTF-8. "
+            f"VERDICT: verify refused: scope path{location} is not representable as UTF-8. "
             "Rename that file and rerun `compile verify --changed`."
         )
     if reason == "verification_directory_limit":
@@ -3294,6 +3323,17 @@ def _unsafe_scope_verdict(error: BaseException) -> str | None:
             "bounded traversal. Stabilize the directory or pass explicit file paths."
         )
     return None
+
+
+def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: list[str]) -> str:
+    """Describe a rejected receipt without replaying untrusted tool output."""
+    reason = str(error).split(":", 1)[0] or "unknown_validation_error"
+    indices = ",".join(str(index) for index in range(len(targets))) or "none"
+    return (
+        f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+        f"scope target indices {indices}; executable `{executable}` did not return one complete, bound Verify "
+        f'receipt v3. Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
+    )
 
 
 @cli.command("verify")
@@ -3350,11 +3390,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         root, bound_targets, expected_receipt, verify_env = _prepare_verify_request(files)
     except (UnicodeError, ValueError) as exc:
         click.echo(
-            _unsafe_scope_verdict(exc)
-            or (
-                f"VERDICT: verifier protocol failure — the exact Verify scope could not be bound. "
-                f'Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
-            )
+            _unsafe_scope_verdict(exc) or (_verify_protocol_verdict(exc, executable=str(executable), targets=targets))
         )
         raise SystemExit(EXIT_TOOLCHAIN)
 
@@ -3391,10 +3427,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     except (UnicodeError, ValueError) as exc:
         click.echo(
             _unsafe_scope_verdict(exc)
-            or (
-                f"VERDICT: verifier protocol failure — `{executable}` did not return one complete, bound Verify "
-                f'receipt v3. Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
-            )
+            or (_verify_protocol_verdict(exc, executable=str(executable), targets=bound_targets))
         )
         raise SystemExit(EXIT_TOOLCHAIN)
     rendered = _render_verify_envelope(envelope)

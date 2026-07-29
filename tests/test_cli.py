@@ -937,6 +937,7 @@ class TestFailurePaths:
         res = runner.invoke(mod.cli, ["run", "   "])
         assert res.exit_code == 1
         assert "VERDICT: empty task" in res.output
+        assert "task argument is empty or whitespace" in res.output
 
 
 class TestBoundedVerifyCapture:
@@ -1030,6 +1031,8 @@ class TestVerifyToolchainFailureIsNotAVerifyFailure:
         res = runner.invoke(mod.cli, ["verify", "x.py"])
         assert res.exit_code == 2
         assert "VERDICT: verifier protocol failure" in res.output
+        assert "receipt field/reason invalid_json_document" in res.output
+        assert "scope target indices 0" in res.output
         assert "verify failed" not in res.output
 
     def test_unstructured_stderr_is_not_replayed(self, runner, monkeypatch):
@@ -1214,7 +1217,10 @@ class TestEnsureIndexedForLaunch:
         monkeypatch.setattr(mod, "_require_index", lambda: False)
         monkeypatch.setattr(mod, "_delegate", lambda *a: 2)
         assert mod._ensure_indexed_for_launch() == 2
-        assert "VERDICT: indexing failed" in capsys.readouterr().out
+        output = capsys.readouterr().out
+        assert "VERDICT: indexing failed" in output
+        assert ".roam/index.db was not created" in output
+        assert "roam exit 2" in output
 
     def test_reindexes_when_head_marker_is_missing(self, monkeypatch, capsys):
         monkeypatch.setattr(mod, "_require_index", lambda: True)
@@ -1712,6 +1718,16 @@ class TestBaselineVerb:
         res = runner.invoke(mod.cli, ["baseline"])
         assert res.exit_code == 1
         assert "dirty tree" in res.output
+        assert "M src/cli.py" in res.output
+        assert "Fix:" in res.output
+
+    def test_baseline_clean_tree_remains_silent_and_successful(self, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mod, "_git_status_porcelain", lambda timeout=10: (0, ""))
+        monkeypatch.setattr(mod, "_roam", lambda *a, timeout=600: SimpleNamespace(returncode=0))
+        res = runner.invoke(mod.cli, ["baseline"])
+        assert res.exit_code == 0
+        assert "VERDICT: baseline refused" not in res.output
 
     def test_baseline_uses_report_baseline_write_with_raised_timeout(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -2255,6 +2271,7 @@ class TestVerifyReceiptV3Protocol:
 
         assert result.exit_code == mod.EXIT_TOOLCHAIN
         assert "not representable as UTF-8" in result.output
+        assert "scope location unavailable" in result.output
         assert "Traceback" not in result.output
 
     def test_verify_explicitly_rejects_newline_filename(self, runner, compatible_roam):
@@ -2263,7 +2280,18 @@ class TestVerifyReceiptV3Protocol:
         assert result.exit_code == mod.EXIT_TOOLCHAIN
         assert "unsafe control character" in result.output
         assert "including a newline" in result.output
+        assert "target index 0" in result.output
+        assert "bad\\nname.py" in result.output
         assert "Traceback" not in result.output
+
+    def test_verify_does_not_echo_credential_shaped_scope_path(self, runner, compatible_roam):
+        field = "to" + "ken="
+        secret_path = field + "runtime-value\n.py"
+        result = runner.invoke(mod.cli, ["verify", secret_path])
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "target index 0" in result.output
+        assert "<credential-shaped path omitted>" in result.output
+        assert "runtime-value" not in result.output
 
     @pytest.mark.parametrize(
         "path", ["../escape.py", "src/../escape.py", "./file.py", "/tmp/file.py", "C:/tmp/file.py"]
