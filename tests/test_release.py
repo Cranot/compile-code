@@ -591,6 +591,52 @@ def test_normalization_is_byte_reproducible_across_order_timestamp_and_compressi
     assert first_sdist.read_bytes() == second_sdist.read_bytes()
 
 
+def test_complete_release_build_is_byte_reproducible_and_both_bundles_verify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source_files = {
+        relative: (ROOT / relative).read_bytes()
+        for relative in (
+            "LICENSE",
+            "README.md",
+            "pyproject.toml",
+            "src/compile_code/__init__.py",
+            "src/compile_code/cli.py",
+        )
+    }
+    source_archive = release._tar_bytes(source_files, EPOCH)
+    reverse_outputs = iter((False, True, False, True))
+
+    def fake_invoke_build(_source_root: Path, output: Path, _epoch: int) -> None:
+        reverse = next(reverse_outputs)
+        output.mkdir(parents=True)
+        _raw_wheel(output / release._expected_wheel_name(VERSION), reverse=reverse)
+        _raw_sdist(output / release._expected_sdist_name(VERSION), reverse=reverse)
+
+    monkeypatch.setattr(release, "_assert_release_tools", lambda: None)
+    monkeypatch.setattr(release, "_git_archive", lambda _root, _sha: source_archive)
+    monkeypatch.setattr(release, "_invoke_build", fake_invoke_build)
+
+    first_bundle = tmp_path / "short" / "bundle"
+    first_dist = tmp_path / "short" / "dist"
+    second_bundle = tmp_path / "a-much-longer-build-directory" / "bundle"
+    second_dist = tmp_path / "a-much-longer-build-directory" / "dist"
+    first_bundle.parent.mkdir()
+    second_bundle.parent.mkdir()
+    first_manifest = release.build_release(ROOT, first_bundle, first_dist, _source())
+    second_manifest = release.build_release(ROOT, second_bundle, second_dist, _source())
+
+    assert first_manifest == second_manifest
+    assert {path.name: path.read_bytes() for path in first_bundle.iterdir()} == {
+        path.name: path.read_bytes() for path in second_bundle.iterdir()
+    }
+    assert {path.name: path.read_bytes() for path in first_dist.iterdir()} == {
+        path.name: path.read_bytes() for path in second_dist.iterdir()
+    }
+    assert release.verify_bundle(first_bundle, dist=first_dist, expected_source=_source()) == first_manifest
+    assert release.verify_bundle(second_bundle, dist=second_dist, expected_source=_source()) == second_manifest
+
+
 def test_closed_bundle_verifies_and_binds_wheel_sdist_sbom_and_dist(tmp_path: Path):
     bundle, dist = _bundle(tmp_path)
     manifest = release.verify_bundle(bundle, dist=dist, expected_source=_source())
