@@ -176,7 +176,13 @@ def _environment_precondition_failures(*, network_probe: Callable[[], str | None
 
     encoding = locale.getpreferredencoding(False).replace("-", "").upper()
     if encoding != "UTF8":
-        failures.append(f"UTF-8 locale is required by text gates; active encoding is {encoding or '<empty>'}")
+        # Name the remedy, not just the fault. A Windows console defaults to a
+        # legacy code page (this repo's dev machine reports CP1253), and an
+        # operator who only sees "UTF-8 is required" has to go and find out how.
+        # PYTHONUTF8=1 makes the interpreter report UTF-8 without touching
+        # system locale settings.
+        remedy = " — set PYTHONUTF8=1" if os.name == "nt" else " — set LC_ALL/LANG to a .UTF-8 locale"
+        failures.append(f"UTF-8 locale is required by text gates; active encoding is {encoding or '<empty>'}{remedy}")
 
     try:
         wall = time.time()
