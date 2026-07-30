@@ -16,14 +16,20 @@ import importlib
 import importlib.metadata as importlib_metadata
 import importlib.util
 import json
+import locale
 import math
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
 import sysconfig
 import tempfile
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 try:
@@ -78,11 +84,135 @@ ZIZMOR_TRUST_SCHEMA = "compile-code.release-tool-artifacts.v1"
 ZIZMOR_TRUST_MANIFEST = ROOT / "release" / "zizmor-artifact-trust.json"
 ZIZMOR_TRUST_MANIFEST_SHA256 = "c5f5d33c91bbf4f56bb30f629edd4978c22d11503b9db42a5dff62c6d6260763"
 ZIZMOR_AUDITOR_POLICY = ("--persona", "auditor", "--no-ignores", "--min-severity", "medium")
+OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
+QUALITY_TOOL_VERSIONS = {"ruff": "0.15.22", "pytest": "9.1.1"}
+TEST_DISTRIBUTION_VERSIONS = {"pypi-attestations": "0.0.29", "sigstore": "4.4.0"}
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 class ToolIdentityError(RuntimeError):
     """An installed release tool does not match its reviewed lock identity."""
+
+
+def _probe_osv_reachability() -> str | None:
+    """Return a diagnostic when the dependency-audit service cannot be reached."""
+    request = urllib.request.Request(OSV_QUERY_BATCH_URL, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read(1)
+    except urllib.error.HTTPError:
+        # Any HTTP response proves DNS, TCP, TLS, and the endpoint are reachable;
+        # the audit itself will report an unexpected status if POST is rejected.
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        return f"network reachability to {OSV_QUERY_BATCH_URL} failed: {exc}"
+    return None
+
+
+def _quality_tool_failures() -> list[str]:
+    failures: list[str] = []
+    for module, expected in QUALITY_TOOL_VERSIONS.items():
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", module, "--version"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"quality tool {module}=={expected} is not runnable ({exc})")
+            continue
+        output = (proc.stdout or proc.stderr).strip().splitlines()
+        version_line = output[0] if output else "<no version output>"
+        if proc.returncode != 0 or not re.search(rf"(?:^|\s){re.escape(expected)}(?:$|\s|\))", version_line):
+            failures.append(f"quality tool {module}=={expected} is required; active response was {version_line!r}")
+    return failures
+
+
+def _test_dependency_failures() -> list[str]:
+    failures: list[str] = []
+    for distribution, expected in TEST_DISTRIBUTION_VERSIONS.items():
+        try:
+            actual = importlib_metadata.version(distribution)
+        except importlib_metadata.PackageNotFoundError:
+            failures.append(
+                f"test dependency {distribution}=={expected} is required "
+                "(CI job: check installs release/tooling-requirements.lock)"
+            )
+            continue
+        if actual != expected:
+            failures.append(f"test dependency {distribution}=={expected} is required; active version is {actual}")
+    return failures
+
+
+def _environment_precondition_failures(*, network_probe: Callable[[], str | None] | None = None) -> list[str]:
+    """Check the environment needed before running the complete repository gate.
+
+    The full pytest suite includes a deliberate non-root product-behaviour test;
+    running it as root changes a correct refusal into a reported test failure.
+    The other checks make tool, filesystem, encoding, clock, and OSV assumptions
+    visible before any gate is attributed a code failure.
+    """
+    failures: list[str] = []
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        failures.append("test suite requires a non-root UID (CI job: check)")
+
+    try:
+        temp_root = Path(tempfile.gettempdir())
+        if not temp_root.is_dir():
+            failures.append(f"writable temporary directory is missing: {temp_root}")
+        else:
+            with tempfile.NamedTemporaryFile(dir=temp_root, prefix="compile-check-") as handle:
+                handle.write(b"precondition")
+                handle.flush()
+    except OSError as exc:
+        failures.append(f"writable temporary directory is required for gate output ({exc})")
+
+    git = shutil.which("git")
+    if not git:
+        failures.append("git executable is required by repository inventory and state gates (CI job: check)")
+
+    encoding = locale.getpreferredencoding(False).replace("-", "").upper()
+    if encoding != "UTF8":
+        failures.append(f"UTF-8 locale is required by text gates; active encoding is {encoding or '<empty>'}")
+
+    try:
+        wall = time.time()
+        monotonic_before = time.monotonic()
+        monotonic_after = time.monotonic()
+        if not math.isfinite(wall) or not math.isfinite(monotonic_before) or monotonic_after < monotonic_before:
+            raise ValueError("clock readings are not finite and monotonic")
+    except (OSError, OverflowError, ValueError) as exc:
+        failures.append(f"a finite, monotonic system clock is required by timed gates ({exc})")
+
+    failures.extend(_quality_tool_failures())
+    failures.extend(_test_dependency_failures())
+    try:
+        _verified_zizmor_path()
+    except ToolIdentityError as exc:
+        failures.append(
+            f"verified zizmor=={ZIZMOR_VERSION} is required ({exc}); "
+            f"CI job: check; repair with {sys.executable} scripts/check.py {ZIZMOR_BOOTSTRAP_ARGUMENT}"
+        )
+    probe = _probe_osv_reachability if network_probe is None else network_probe
+    network_failure = probe()
+    if network_failure:
+        failures.append(f"{network_failure} (CI job: check; retry when network access is restored)")
+    return failures
+
+
+def environment_preconditions(*, network_probe: Callable[[], str | None] | None = None) -> bool:
+    failures = _environment_precondition_failures(network_probe=network_probe)
+    if not failures:
+        print("[check] environment preconditions: PASS (CI check-job contract satisfied)")
+        return True
+    print("[check] environment preconditions: FAIL")
+    for failure in failures:
+        print(f"  environment precondition unmet: {failure}")
+    print("[check] BLOCKED — environment preconditions unmet: " + "; ".join(failures))
+    return False
 
 
 def _console_safe(value: str) -> str:
@@ -1106,6 +1236,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if bootstrap_zizmor() else 1
         print(f"usage: {Path(sys.argv[0]).name} [{ZIZMOR_BOOTSTRAP_ARGUMENT}]")
         return 2
+    if not environment_preconditions():
+        return 1
     results = [
         dependency_audit(),
         *ruff_gates(),

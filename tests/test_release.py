@@ -2840,3 +2840,62 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
 def test_builder_rejects_publication_credentials():
     with pytest.raises(release.ReleaseError, match="TWINE_PASSWORD"):
         release.assert_unprivileged_runner({"TWINE_PASSWORD": "not-a-real-secret"})
+
+
+def test_release_environment_preconditions_name_root_builder(monkeypatch):
+    monkeypatch.setattr(release.os, "geteuid", lambda: 0, raising=False)
+    failures = release._release_environment_precondition_failures(require_unprivileged=True)
+    assert any("non-root UID" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_missing_git(monkeypatch):
+    monkeypatch.setattr(release.shutil, "which", lambda name: None if name == "git" else "/bin/tool")
+    failures = release._release_environment_precondition_failures(require_git=True)
+    assert any("git executable" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_unwritable_temp(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        release,
+        "_validated_real_directory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(release.ReleaseError("read-only")),
+    )
+    failures = release._release_environment_precondition_failures(temp_root=tmp_path)
+    assert any("writable release temporary path" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_network_failure():
+    failures = release._release_environment_precondition_failures(
+        require_network=True,
+        network_probe=lambda: "network reachability to PyPI is required",
+    )
+    assert any("network reachability" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_missing_attestation_tools(monkeypatch):
+    def missing(name):
+        raise release.importlib_metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(release.importlib_metadata, "version", missing)
+    failures = release._release_environment_precondition_failures(require_attestation=True)
+    assert any("pypi-attestations==0.0.29" in failure for failure in failures)
+    assert any("sigstore==4.4.0" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_broken_clock(monkeypatch):
+    monkeypatch.setattr(release.time, "time", lambda: float("nan"))
+    failures = release._release_environment_precondition_failures()
+    assert any("finite, monotonic system clock" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_name_non_utf8_locale(monkeypatch):
+    monkeypatch.setattr(release.locale, "getpreferredencoding", lambda _do_setlocale: "ISO-8859-1")
+    failures = release._release_environment_precondition_failures()
+    assert any("UTF-8 locale" in failure for failure in failures)
+
+
+def test_release_environment_preconditions_healthy_control(monkeypatch):
+    # See tests/test_check.py: pin the encoding rather than inherit it.
+    monkeypatch.setattr(release.locale, "getpreferredencoding", lambda *_a: "UTF-8", raising=False)
+    monkeypatch.setattr(release.os, "geteuid", lambda: 1000, raising=False)
+    assert release._release_environment_precondition_failures(network_probe=lambda: None) == []

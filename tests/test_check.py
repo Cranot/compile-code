@@ -106,6 +106,114 @@ def test_gate_reports_a_missing_executable_without_traceback(monkeypatch, capsys
     assert "required executable not found" in output
 
 
+def test_environment_preconditions_name_root_uid(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("non-root UID" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_unwritable_temp(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+
+    def blocked(*args, **kwargs):
+        raise OSError("read-only temporary root")
+
+    monkeypatch.setattr(check.tempfile, "NamedTemporaryFile", blocked)
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("writable temporary directory" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_missing_git(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check.shutil, "which", lambda name: None if name == "git" else "/bin/tool")
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("git executable" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_non_utf8_locale(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check.locale, "getpreferredencoding", lambda _do_setlocale: "ISO-8859-1")
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("UTF-8 locale" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_broken_clock(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check.time, "time", lambda: float("nan"))
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("finite, monotonic system clock" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_quality_tool_drift(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: ["quality tool ruff==0.15.22 is required"])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("ruff==0.15.22" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_missing_sigstore_test_dependency(monkeypatch):
+    monkeypatch.setattr(
+        check,
+        "_test_dependency_failures",
+        lambda: ["test dependency sigstore==4.4.0 is required"],
+    )
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("sigstore==4.4.0" in failure for failure in failures)
+
+
+def test_environment_preconditions_name_network_failure(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    failures = check._environment_precondition_failures(
+        network_probe=lambda: "network reachability to https://api.osv.dev/v1/querybatch failed"
+    )
+    assert any("network reachability" in failure for failure in failures)
+
+
+def test_environment_preconditions_healthy_control(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    # Pin a UTF-8 locale instead of assuming one. On this repo's Windows dev
+    # machine the active encoding is CP1253, which the check correctly flags --
+    # so a control that assumes UTF-8 fails for the right reason in the wrong
+    # place. A control must establish its preconditions, not inherit them.
+    monkeypatch.setattr(check.locale, "getpreferredencoding", lambda *_a: "UTF-8")
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    monkeypatch.setattr(check, "_test_dependency_failures", lambda: [])
+    monkeypatch.setattr(check, "_verified_zizmor_path", lambda: pathlib.Path("/trusted/zizmor"))
+    assert check._environment_precondition_failures(network_probe=lambda: None) == []
+
+
+def test_check_main_healthy_control_preserves_success(monkeypatch, capsys):
+    monkeypatch.setattr(check, "environment_preconditions", lambda: True)
+    monkeypatch.setattr(check, "dependency_audit", lambda: True)
+    monkeypatch.setattr(check, "run", lambda *args, **kwargs: True)
+    monkeypatch.setattr(check, "zizmor_gates", lambda: [True, True, True])
+    monkeypatch.setattr(check, "leak_scan", lambda: True)
+    monkeypatch.setattr(check, "artifact_scan", lambda: True)
+    monkeypatch.setattr(check, "readme_sanity", lambda: True)
+    monkeypatch.setattr(check, "internal_index", lambda: True)
+    monkeypatch.setattr(check, "release_sanity", lambda: True)
+    assert check.main([]) == 0
+    assert capsys.readouterr().out.strip() == "[check] all gates passed — safe to push."
+
+
+def test_check_main_reports_environment_before_running_gates(monkeypatch, capsys):
+    def blocked():
+        print("[check] BLOCKED — environment preconditions unmet: non-root UID")
+        return False
+
+    monkeypatch.setattr(check, "environment_preconditions", blocked)
+    monkeypatch.setattr(check, "dependency_audit", lambda: (_ for _ in ()).throw(AssertionError("ran too soon")))
+    assert check.main([]) == 1
+    assert "environment preconditions" in capsys.readouterr().out
+
+
 def test_console_safe_escapes_characters_outside_the_active_encoding(monkeypatch):
     class NarrowStdout:
         encoding = "ascii"

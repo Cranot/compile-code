@@ -17,6 +17,7 @@ import gzip
 import hashlib
 import io
 import json
+import locale
 import math
 import os
 import platform
@@ -196,6 +197,113 @@ class ReleaseError(RuntimeError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ReleaseError(message)
+
+
+def _release_network_precondition() -> str | None:
+    """Check that the public package/release service boundary is reachable."""
+    for service in ("PyPI", "GitHub"):
+        url = "https://pypi.org/simple/" if service == "PyPI" else "https://github.com/"
+        request = urllib.request.Request(url, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read(1)
+        except urllib.error.HTTPError:
+            continue
+        except (urllib.error.URLError, OSError) as exc:
+            return f"network reachability to {service} is required ({exc})"
+    return None
+
+
+def _osv_network_precondition() -> str | None:
+    """Check the service used by the locked dependency audit."""
+    request = urllib.request.Request("https://api.osv.dev/v1/querybatch", method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read(1)
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError) as exc:
+        return f"network reachability to OSV is required ({exc})"
+    return None
+
+
+def _release_environment_precondition_failures(
+    *,
+    require_unprivileged: bool = False,
+    require_git: bool = False,
+    require_network: bool = False,
+    require_attestation: bool = False,
+    temp_root: Path | None = None,
+    output_paths: tuple[Path, ...] = (),
+    network_probe: Callable[[], str | None] | None = None,
+    network_job: str = "release.prepublish or release.install-smoke",
+) -> list[str]:
+    """Name release-command assumptions before work is attributed to code."""
+    failures: list[str] = []
+    if require_unprivileged and hasattr(os, "geteuid") and os.geteuid() == 0:
+        failures.append("release builder requires a non-root UID (CI job: release.build)")
+    if require_git and not shutil.which("git"):
+        failures.append("git executable is required (CI job: release.build)")
+
+    encoding = locale.getpreferredencoding(False).replace("-", "").upper()
+    if encoding != "UTF8":
+        failures.append(
+            f"UTF-8 locale is required by release text processing; active encoding is {encoding or '<empty>'}"
+        )
+
+    if temp_root is not None:
+        try:
+            _validated_real_directory(temp_root, label="release temporary root")
+            with tempfile.NamedTemporaryFile(dir=temp_root, prefix="compile-release-") as handle:
+                handle.write(b"precondition")
+                handle.flush()
+        except (OSError, ReleaseError) as exc:
+            failures.append(
+                f"writable release temporary path is required at {temp_root} (CI jobs provide RUNNER_TEMP; {exc})"
+            )
+
+    for path in output_paths:
+        parent = path.parent
+        try:
+            _validated_real_directory(parent, label=f"output parent for {path}")
+            with tempfile.NamedTemporaryFile(dir=parent, prefix="compile-release-output-") as handle:
+                handle.write(b"precondition")
+                handle.flush()
+        except (OSError, ReleaseError) as exc:
+            failures.append(f"writable output parent is required at {parent} ({exc})")
+
+    try:
+        before = time.monotonic()
+        after = time.monotonic()
+        if not math.isfinite(time.time()) or not math.isfinite(before) or after < before:
+            raise ValueError("clock readings are not finite and monotonic")
+    except (OSError, OverflowError, ValueError) as exc:
+        failures.append(f"a finite, monotonic system clock is required by release deadlines ({exc})")
+
+    if require_attestation:
+        for distribution, version in (("pypi-attestations", "0.0.29"), ("sigstore", "4.4.0")):
+            try:
+                actual = importlib_metadata.version(distribution)
+            except importlib_metadata.PackageNotFoundError:
+                failures.append(
+                    f"{distribution}=={version} is required for release attestation "
+                    "(CI job: release.prepublish installs release/attestation-requirements.lock)"
+                )
+            else:
+                if actual != version:
+                    failures.append(f"{distribution}=={version} is required; active version is {actual}")
+
+    if require_network:
+        probe = _release_network_precondition if network_probe is None else network_probe
+        network_failure = probe()
+        if network_failure:
+            failures.append(f"{network_failure} (CI job: {network_job})")
+    return failures
+
+
+def _require_release_environment(**kwargs: Any) -> None:
+    failures = _release_environment_precondition_failures(**kwargs)
+    _require(not failures, "release environment precondition unmet: " + "; ".join(failures))
 
 
 def _file_identity(value: os.stat_result) -> tuple[int, int]:
@@ -920,7 +1028,9 @@ def _assert_release_tools() -> None:
 def assert_unprivileged_runner(environ: dict[str, str] | None = None) -> None:
     env = os.environ if environ is None else environ
     if hasattr(os, "geteuid"):
-        _require(os.geteuid() != 0, "builder must not run as root")
+        _require(
+            os.geteuid() != 0, "environment precondition unmet: builder must not run as root (CI job: release.build)"
+        )
     for name in ("ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "TWINE_PASSWORD", "PYPI_API_TOKEN"):
         _require(not env.get(name), f"unprivileged builder unexpectedly received {name}")
 
@@ -3865,11 +3975,23 @@ def main(argv: list[str] | None = None) -> int:
             assert_unprivileged_runner()
             print("release runner: unprivileged and publication-credential-free")
         elif args.command == "install-github-cli":
+            runner_temp = os.environ.get("RUNNER_TEMP") or os.environ.get("TMPDIR")
+            _require(
+                bool(runner_temp),
+                "release environment precondition unmet: RUNNER_TEMP is required for the controlled GitHub CLI "
+                "(CI job: release.github_release_preflight provides it)",
+            )
+            _require_release_environment(
+                require_unprivileged=True,
+                require_network=True,
+                temp_root=Path(runner_temp) if runner_temp else None,
+            )
             executable = install_github_cli()
             print(f"GitHub CLI: verified {GITHUB_CLI_VERSION} at {executable}")
             if args.github_output:
                 _append_github_output([f"github_cli_path={executable}"])
         elif args.command == "source":
+            _require_release_environment(require_git=True)
             context = source_context_from_github(ROOT)
             print(json.dumps(context, sort_keys=True))
             if args.github_output:
@@ -3880,6 +4002,13 @@ def main(argv: list[str] | None = None) -> int:
                     ]
                 )
         elif args.command == "build":
+            runner_temp = os.environ.get("RUNNER_TEMP") or os.environ.get("TEMP") or os.environ.get("TMP")
+            _require_release_environment(
+                require_unprivileged=True,
+                require_git=True,
+                temp_root=Path(runner_temp) if runner_temp else Path(tempfile.gettempdir()),
+                output_paths=(Path(os.path.abspath(args.bundle)), Path(os.path.abspath(args.dist))),
+            )
             context = source_context_from_github(ROOT)
             manifest = build_release(
                 ROOT,
@@ -3889,6 +4018,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"release build: deterministic {manifest['tag']} at {manifest['source']['sha']}")
         elif args.command == "verify":
+            if args.github_source:
+                _require_release_environment(require_git=True)
             expected_source = source_context_from_github(ROOT, allow_untracked=True) if args.github_source else None
             manifest = verify_bundle(
                 Path(os.path.abspath(args.bundle)),
@@ -3900,10 +4031,20 @@ def main(argv: list[str] | None = None) -> int:
             twine_check(Path(os.path.abspath(args.bundle)))
             print("twine check: PASS")
         elif args.command == "audit-locks":
+            _require_release_environment(
+                require_network=True,
+                network_probe=_osv_network_precondition,
+                network_job="release.build",
+            )
             audited = audit_locked_requirements(ROOT)
             print(f"locked dependency audit: PASS ({audited} exact package versions; no resolution)")
         elif args.command == "pypi-state":
             _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
+            _require_release_environment(
+                require_git=args.github_source,
+                require_network=True,
+                require_attestation=True,
+            )
             expected_source = source_context_from_github(ROOT, allow_untracked=True) if args.github_source else None
             state = pypi_state(
                 Path(os.path.abspath(args.bundle)),
@@ -3916,6 +4057,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.github_output:
                 _write_github_output(state)
         elif args.command == "github-artifact-state":
+            _require_release_environment(require_git=True, require_network=True)
             context = source_context_from_github(ROOT)
             verify_github_workflow_artifact(
                 artifact_id=args.artifact_id,
@@ -3927,6 +4069,7 @@ def main(argv: list[str] | None = None) -> int:
                 _write_github_artifact_output(args.artifact_id, args.artifact_digest, context)
         elif args.command == "github-release-state":
             _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
+            _require_release_environment(require_git=True, require_network=True)
             context = source_context_from_github(ROOT, allow_untracked=True)
             details: dict[str, int | str] = {}
             state = github_release_state(
@@ -3941,6 +4084,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.github_output:
                 _write_github_release_output(state, details=details)
         elif args.command == "install-smoke":
+            _require_release_environment(
+                require_network=True,
+                require_git=args.mode == "resolve",
+                temp_root=Path(os.path.abspath(args.temp_root)),
+            )
             install_smoke(
                 Path(os.path.abspath(args.bundle)),
                 args.mode,
