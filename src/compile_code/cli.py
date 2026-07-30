@@ -27,6 +27,7 @@ import re
 import secrets
 import shlex
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -93,6 +94,9 @@ _VERSION_VALUE = re.compile(
     r"(?P<suffix>(?:(?:a|b|rc)\d+|\.?dev\d+|\.post\d+)?(?:\+[A-Za-z0-9.-]+)?)$",
     re.IGNORECASE,
 )
+_GIT_HEAD_VALUE = re.compile(r"(?:ref: refs/\S+|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_MAX_GIT_CONTROL_FILE_BYTES = 4096
 
 # The hook script the roam-code dependency installs into a Claude settings
 # file; its presence is how we detect that compile is wired in. Kept as a
@@ -174,6 +178,87 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _read_git_control_file(path: Path) -> str | None:
+    """Read one small regular Git control file without trusting its contents."""
+    try:
+        state = path.stat()
+        if not stat.S_ISREG(state.st_mode) or state.st_size > _MAX_GIT_CONTROL_FILE_BYTES:
+            return None
+        contents = path.read_bytes()
+        if len(contents) > _MAX_GIT_CONTROL_FILE_BYTES:
+            return None
+        return contents.decode("utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+
+
+def _git_directory_has_evidence(git_dir: Path) -> bool:
+    """Return whether a Git metadata directory has a credible minimal structure."""
+    try:
+        if not git_dir.is_dir():
+            return False
+        head = _read_git_control_file(git_dir / "HEAD")
+        if head is None or _GIT_HEAD_VALUE.fullmatch(head) is None:
+            return False
+
+        common_dir = git_dir
+        common_pointer = git_dir / "commondir"
+        if common_pointer.exists():
+            common_value = _read_git_control_file(common_pointer)
+            if not common_value:
+                return False
+            common_dir = Path(common_value)
+            if not common_dir.is_absolute():
+                common_dir = git_dir / common_dir
+            common_dir = common_dir.resolve(strict=True)
+        return (common_dir / "objects").is_dir() and (common_dir / "refs").is_dir()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _git_marker_has_evidence(candidate: Path) -> bool:
+    """Return whether *candidate/.git* describes a real repository or worktree."""
+    marker = candidate / ".git"
+    if marker.is_dir():
+        return _git_directory_has_evidence(marker)
+    pointer = _read_git_control_file(marker)
+    if pointer is None or not pointer.startswith("gitdir: "):
+        return False
+    git_dir_value = pointer.removeprefix("gitdir: ").strip()
+    if not git_dir_value:
+        return False
+    try:
+        git_dir = Path(git_dir_value)
+        if not git_dir.is_absolute():
+            git_dir = candidate / git_dir
+        return _git_directory_has_evidence(git_dir.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _roam_index_has_evidence(candidate: Path) -> bool:
+    """Return whether *candidate* has a readable SQLite roam index."""
+    index = candidate / ".roam" / "index.db"
+    try:
+        state = index.stat()
+        if not stat.S_ISREG(state.st_mode) or state.st_size < len(_SQLITE_HEADER):
+            return False
+        with index.open("rb") as stream:
+            if stream.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER:
+                return False
+        uri = index.resolve(strict=True).as_uri() + "?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True, timeout=0) as connection:
+            connection.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+        return True
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _candidate_has_trust_root_evidence(candidate: Path) -> bool:
+    """Return whether *candidate* contains credible Git or roam trust-root state."""
+    return _git_marker_has_evidence(candidate) or _roam_index_has_evidence(candidate)
+
+
 def _workspace_trust_roots() -> tuple[Path, ...]:
     """Return local roots whose PATH entries must never authorize an agent.
 
@@ -187,7 +272,7 @@ def _workspace_trust_roots() -> tuple[Path, ...]:
         current = Path.cwd().absolute()
     roots = [current]
     for candidate in (current, *current.parents):
-        if (candidate / ".git").exists() or (candidate / ".roam" / "index.db").exists():
+        if _candidate_has_trust_root_evidence(candidate):
             roots.append(candidate)
             break
     return tuple(dict.fromkeys(roots))

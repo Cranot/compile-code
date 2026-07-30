@@ -13,6 +13,7 @@ import json
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -2761,6 +2762,47 @@ class TestClaudeStructuralReadiness:
 
         assert ready is False
         assert reason == "settings_path_unsafe"
+
+    @pytest.mark.parametrize("marker_kind", ["empty_git", "empty_index", "non_sqlite_index"])
+    def test_workspace_trust_roots_ignore_unsubstantiated_repository_markers(self, monkeypatch, tmp_path, marker_kind):
+        workspace = tmp_path / "workspace"
+        nested = workspace / "src" / "package"
+        nested.mkdir(parents=True)
+        if marker_kind == "empty_git":
+            (workspace / ".git").mkdir()
+        else:
+            roam_dir = workspace / ".roam"
+            roam_dir.mkdir()
+            contents = b"" if marker_kind == "empty_index" else b"not a SQLite database"
+            (roam_dir / "index.db").write_bytes(contents)
+        monkeypatch.chdir(nested)
+
+        roots = mod._workspace_trust_roots()
+
+        assert roots[0] == nested.resolve()
+        assert workspace.resolve() not in roots
+
+    def test_workspace_trust_roots_accept_real_git_repository(self, monkeypatch, tmp_path):
+        repository = tmp_path / "repository"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+        nested = repository / "src" / "package"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+
+        assert mod._workspace_trust_roots() == (nested.resolve(), repository.resolve())
+
+    def test_workspace_trust_roots_accept_valid_sqlite_index(self, monkeypatch, tmp_path):
+        workspace = tmp_path / "workspace"
+        roam_dir = workspace / ".roam"
+        roam_dir.mkdir(parents=True)
+        with sqlite3.connect(roam_dir / "index.db") as connection:
+            connection.execute("CREATE TABLE indexed_files(path TEXT PRIMARY KEY)")
+        nested = workspace / "src" / "package"
+        nested.mkdir(parents=True)
+        monkeypatch.chdir(nested)
+
+        assert mod._workspace_trust_roots() == (nested.resolve(), workspace.resolve())
 
     def test_trusted_resolver_rejects_workspace_path_injection(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
