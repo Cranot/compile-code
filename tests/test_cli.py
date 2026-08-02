@@ -340,6 +340,148 @@ class TestSurface:
         assert "--diff-only" in res.output
 
 
+# The exact bytes a stub toolchain emits for `compile run --json`. Deliberately
+# NOT a captured roam sample: a golden blob rots the moment roam adds a field,
+# and the property under test is *fidelity*, not the current field list. The
+# payload carries the two contract blocks a consumer must not lose plus one
+# field this CLI has never heard of, so an enumerate-and-rebuild refactor fails
+# even if the author remembered every field that existed on the day they wrote it.
+_ENVELOPE_UNKNOWN_FIELD = "a_block_this_cli_has_never_heard_of"
+_STUB_ENVELOPE = json.dumps(
+    {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.0",
+        "command": "compile",
+        "orchestration_contract": {
+            "schema_version": "1.0",
+            "review_policy": "risk_gated",
+            "obligations": [
+                "1b. CRITIQUE the plan independently: before implementing, have a SEPARATE model attack the plan.",
+                "4b. VERDICT before done: a SEPARATE model reviews the finished diff against the frozen criteria.",
+            ],
+            "criteria_templates": {
+                "1b_plan_critique": "plan-critique-v1",
+                "4b_done_verdict": "done-verdict-v1",
+            },
+        },
+        "execution_contract": [
+            "1. PLAN first",
+            "2. IMPLEMENT in phases",
+            "3. PROVE it",
+            "4. RECHECK",
+            "5. Done means run for real",
+        ],
+        _ENVELOPE_UNKNOWN_FIELD: {"nested": [1, 2, {"deep": True}]},
+    },
+    sort_keys=True,
+).encode("utf-8")
+
+_CLI_BOOTSTRAP = "import sys; from compile_code.cli import cli; sys.exit(cli())"
+
+
+class TestCompileEnvelopePassthrough:
+    """`compile run` must FORWARD the toolchain envelope, never rebuild it.
+
+    The whole product value of this verb is that the agent receives roam's
+    compiled envelope. That envelope grows: the review obligations
+    (``orchestration_contract``) and the phased ``execution_contract`` were
+    both added after this CLI shipped. A consumer that re-emits the envelope
+    field-by-field looks correct on the day it is written and silently drops
+    every block added afterwards -- the exact defect already found and fixed
+    once in the Claude Code hook. These tests run the real process boundary
+    (file descriptors, not a CliRunner string buffer) because that inheritance
+    IS the forwarding mechanism.
+    """
+
+    def _make_trust_root(self, work: Path) -> None:
+        """Anchor the workspace trust scan at *work* itself.
+
+        ``_resolve_trusted_executable(reject_workspace=True)`` refuses a
+        toolchain found inside the invoking checkout, and it walks parents
+        until it finds Git/roam evidence. Giving the working directory its own
+        credible ``.git`` stops that walk here, so the sibling stub directory
+        is never swept into the rejected set by whatever happens to sit above
+        the temporary path.
+        """
+        git = work / ".git"
+        (git / "objects").mkdir(parents=True)
+        (git / "refs").mkdir(parents=True)
+        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+    def _make_roam_stub(self, bindir: Path, payload: bytes) -> None:
+        """Install a `roam` on PATH that writes *payload* to stdout verbatim."""
+        bindir.mkdir(parents=True, exist_ok=True)
+        emitter = bindir / "roam_stub.py"
+        emitter.write_text(
+            f"import sys\nsys.stdout.buffer.write({payload!r})\nsys.stdout.buffer.flush()\n",
+            encoding="utf-8",
+        )
+        if mod.os.name == "nt":
+            shim = bindir / "roam.cmd"
+            shim.write_text(f'@echo off\r\n"{sys.executable}" "{emitter}"\r\n', encoding="utf-8")
+        else:
+            shim = bindir / "roam"
+            shim.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{emitter}"\n', encoding="utf-8")
+            shim.chmod(0o755)
+
+    def _compiled_stdout(self, tmp_path: Path) -> bytes:
+        """Raw stdout of `compile run --json` against the stub toolchain."""
+        work = tmp_path / "work"
+        work.mkdir()
+        self._make_trust_root(work)
+        bindir = tmp_path / "bin"
+        self._make_roam_stub(bindir, _STUB_ENVELOPE)
+
+        env = mod.os.environ.copy()
+        env["PATH"] = str(bindir) + mod.os.pathsep + env.get("PATH", "")
+        env["PYTHONPATH"] = str(ROOT / "src")
+        proc = subprocess.run(
+            [sys.executable, "-c", _CLI_BOOTSTRAP, "run", "--json", "fix the empty-payload bug in src/app.py"],
+            cwd=work,
+            env=env,
+            capture_output=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+        return proc.stdout
+
+    def test_envelope_reaches_stdout_byte_for_byte(self, tmp_path):
+        # Byte equality is the strongest statement of the forwarding contract:
+        # nothing was parsed, re-serialized, reordered, wrapped, or truncated.
+        assert self._compiled_stdout(tmp_path) == _STUB_ENVELOPE
+
+    def test_review_obligations_survive_end_to_end(self, tmp_path):
+        emitted = json.loads(_STUB_ENVELOPE)
+        received = json.loads(self._compiled_stdout(tmp_path))
+
+        contract = received.get("orchestration_contract")
+        assert isinstance(contract, dict), "orchestration_contract was dropped by the consumer"
+        # Assert the contract's shape, not a frozen wording: the obligations
+        # are prose roam owns and will reword.
+        assert set(contract) >= {"schema_version", "review_policy", "obligations", "criteria_templates"}
+        assert contract["obligations"] == emitted["orchestration_contract"]["obligations"]
+        assert contract["criteria_templates"] == emitted["orchestration_contract"]["criteria_templates"]
+        assert set(contract["criteria_templates"]) == {"1b_plan_critique", "4b_done_verdict"}
+        assert received.get("execution_contract") == emitted["execution_contract"]
+
+    def test_a_field_this_cli_does_not_know_about_still_arrives(self, tmp_path):
+        # The anti-enumeration guard. A passing suite that only covers today's
+        # field list is not evidence of forwarding -- this is.
+        received = json.loads(self._compiled_stdout(tmp_path))
+        assert received.get(_ENVELOPE_UNKNOWN_FIELD) == {"nested": [1, 2, {"deep": True}]}
+        assert set(received) == set(json.loads(_STUB_ENVELOPE))
+
+    def test_run_never_reads_the_envelope_it_forwards(self):
+        # A structural companion to the behavioral tests above: the forwarding
+        # path must not acquire a capture step, because capturing is the first
+        # move of every rebuild. `_delegate` streams; `_delegate_capturing`
+        # does not, and belongs to the verify protocol only.
+        source = inspect.getsource(mod._run.callback)
+        assert "_delegate_capturing" not in source
+        assert "json.loads" not in source
+        assert "_strict_json_document" not in source
+
+
 class TestVersionReporting:
     """A reported version that lies is worse than none: it silently
     invalidates every bug report and deploy verification that quotes it.
