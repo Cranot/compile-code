@@ -41,8 +41,33 @@ range: one `diff-tree --stdin` call for changed paths + blob oids, one
 Total git subprocess count is O(1) in the number of commits (a small
 constant), not O(commits) or O(files).
 
-Exit codes: 0 = clean. 2 = leak(s) found. 1 = usage error or a git command
-needed to resolve the range failed (fail closed -- never silently pass).
+SIZE IS NOT A REASON TO REPORT CLEAN: a blob too large to scan is
+UNANALYZABLE, which is a third state, not a synonym for "no findings". This
+script used to floor an over-large blob to an empty list of text views, and
+an empty list makes the scan loop iterate zero times -- so the blob's bytes
+were rendered as `clean` and the push was authorised. One byte either side of
+the threshold decided whether a credential was caught (4,194,304 -> BLOCKED;
+4,194,305 -> clean), which means padding defeated the gate. Every blob is now
+scanned regardless of size, in bounded line batches; the only remaining cap
+is an absolute ceiling that is a LOUD REFUSAL (exit 3), never a silent skip.
+Every invocation publishes its denominator -- blobs scanned, bytes scanned,
+blobs skipped, blobs unanalyzable -- so "0 findings" can be checked against
+how much was actually read.
+
+POSITIVE CONTROL: a scanner that reports clean while reading nothing is
+indistinguishable from a clean repository unless it is asked to find
+something it planted itself. Every invocation runs a sentinel blob carrying
+one credential per catalogue through the same `_read_blob`/`_scan_text` path
+the real blobs take (placed past the first line batch, so a batching bug that
+drops the tail is caught too). If either planted credential is not found, the
+scanner reports BROKEN and exits 4 rather than reporting 0 findings.
+
+Exit codes: 0 = clean. 2 = leak(s) found. 3 = at least one blob was
+unanalyzable ("I could not check this" is a failure of the gate, not a pass).
+4 = the scanner's own positive control failed -- it is broken, and its
+verdict means nothing. 1 = usage error or a git command needed to resolve
+the range failed (fail closed -- never silently pass). When more than one
+applies the precedence is 4 > 2 > 3, and every applicable section is printed.
 """
 
 from __future__ import annotations
@@ -50,7 +75,9 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -61,10 +88,65 @@ import inventory  # noqa: E402
 import prepush_refs  # noqa: E402
 import secret_scan  # noqa: E402
 
-# Defensive bound on a single blob's size before it is decoded and scanned.
-# Neither catalogue defines one; a pathological huge tracked blob (e.g. a
-# vendored data file) should be skipped, not decoded wholesale into memory.
-_MAX_BLOB_BYTES = 4 * 1024 * 1024
+# How many lines of one text view are handed to the catalogues at a time.
+# Scanning is line-oriented in both catalogues (``secret_scan.scan_text``
+# iterates ``splitlines()``; every ``LEAK_PATTERNS`` entry is confined to one
+# line), so cutting on line boundaries cannot split a match -- no overlap
+# window is needed and no finding or line number changes. Two things get
+# strictly better, both measured on this repository's own toolchain:
+#
+#   * Peak decoded memory stops tracking blob size. A 16 MiB blob of ordinary
+#     text peaked at +23.0 MiB scanned whole and +0.5 MiB scanned in batches.
+#   * ``check._leak_pattern_hits`` resolves a match to a line number with
+#     ``text.count("\n", 0, m.start())``, which is O(text) PER MATCH -- i.e.
+#     quadratic in a blob with many matches. Batching bounds the ``text`` in
+#     that expression: a 4.9 MiB match-dense blob went from 50.9s to 5.7s.
+_SCAN_BATCH_LINES = 512
+
+# Absolute ceiling on a single blob, and the ONLY cap left. Crossing it is a
+# refusal (exit 3), not a skip -- see the module docstring. The number is not
+# load-bearing for correctness: at any ceiling, over-size blocks rather than
+# passes. It is a TIME budget, chosen from measurement rather than the memory
+# guess the old 4 MiB cap was justified by (a guess that was already false --
+# ``_batch_blobs_and_messages`` has the whole blob resident in memory before
+# anything here sees it, so skipping the decode saved no allocation at all).
+# Measured end-to-end throughput of the two catalogues on this machine is
+# ~1 MiB/s for line-dense text and ~4 MiB/s for minified single-line text, so
+# 16 MiB bounds one pathological blob at roughly 16 seconds. For scale, the
+# largest blob anywhere in this repository's history is 191 KB.
+_SCAN_CEILING_BYTES = 16 * 1024 * 1024
+
+# The three dispositions a blob can have. Explicitly three-valued: the defect
+# this replaced used list-emptiness as its only channel, which collapsed
+# "nothing found in it" and "never looked at it" into the same answer.
+_SCANNED = "scanned"
+_SKIPPED_BINARY = "skipped-binary"
+_UNANALYZABLE = "unanalyzable"
+
+Finding = tuple[str, int, str, str]  # (label, line_no, kind, detail)
+
+
+@dataclass
+class _Ledger:
+    """The denominator behind the verdict: what was read, and what was not.
+
+    Printed on every invocation, clean or not. "0 findings" is only meaningful
+    next to how many blobs and bytes produced it -- this scanner has already
+    demonstrated once that it can report clean having decoded nothing.
+    """
+
+    blobs_scanned: int = 0
+    bytes_scanned: int = 0
+    path_filtered: int = 0
+    binary_skipped: list[tuple[str, int]] = field(default_factory=list)
+    unanalyzable: list[tuple[str, int, str]] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"blobs: {self.blobs_scanned} scanned / {self.bytes_scanned} bytes, "
+            f"{len(self.binary_skipped)} binary-skipped, {self.path_filtered} path-filtered, "
+            f"{len(self.unanalyzable)} unanalyzable"
+        )
 
 
 def _git_bytes(repo_root: str, args: list[str], *, operation: str, input_bytes: bytes | None = None) -> bytes:
@@ -110,8 +192,25 @@ def _is_utf16_text(data: bytes) -> bool:
     return not any(ch < " " and ch not in _TEXT_CONTROL_CHARS for ch in text)
 
 
-def _decode_views(data: bytes) -> list[str]:
-    """Every text reading of a historical blob; empty means 'skip'.
+class _Reading(NamedTuple):
+    """What this scanner did with one blob, said out loud.
+
+    ``disposition`` is one of ``_SCANNED`` / ``_SKIPPED_BINARY`` /
+    ``_UNANALYZABLE``. It is a separate field from ``views`` on purpose: the
+    predecessor of this type was a bare ``list[str]`` whose emptiness meant
+    "skip", and a caller that iterates an empty list zero times cannot tell
+    that apart from having scanned the content and found nothing. That is
+    exactly how a 4 MiB+ blob carrying a live credential was rendered as
+    ``clean`` with exit 0.
+    """
+
+    disposition: str
+    views: list[str]
+    reason: str
+
+
+def _read_blob(data: bytes) -> _Reading:
+    """Every text reading of a historical blob, plus what was NOT read and why.
 
     ``check._scan_views`` is the landed working-tree rule (f84025f); routing
     pushed history through it is what closes the gap that commit recorded as
@@ -121,13 +220,66 @@ def _decode_views(data: bytes) -> list[str]:
     push does not un-publish it. Windows PowerShell's ``>`` and ``Out-File``
     emit UTF-16LE by default, which is how such a file gets committed at all.
 
-    Genuine binary is still skipped, and over-large blobs still are too.
+    Size is no longer a reason to read nothing: blobs of ANY size up to the
+    absolute ceiling are scanned, in bounded batches, and crossing the ceiling
+    is a refusal the caller must surface, not a quiet ``[]``.
+
+    Genuine binary is still not pattern-matched — the conservation rule from
+    the UTF-16 fix, since a gate buried in noise from every committed object
+    file is a gate that gets bypassed — but it is now DISCLOSED in the
+    denominator rather than silently dropped. It stays non-fatal because the
+    bytes were read and classified: that is a decision about this content, not
+    an admission that the scanner could not look.
     """
-    if len(data) > _MAX_BLOB_BYTES:
-        return []
+    if len(data) > _SCAN_CEILING_BYTES:
+        return _Reading(_UNANALYZABLE, [], f"exceeds the {_SCAN_CEILING_BYTES}-byte scan ceiling")
     if b"\x00" in data and not _is_utf16_text(data):
-        return []
-    return check._scan_views(data)
+        return _Reading(_SKIPPED_BINARY, [], "binary content (NUL bytes, not UTF-16 text)")
+    return _Reading(_SCANNED, check._scan_views(data), "")
+
+
+def _line_batches(text: str):
+    """Yield ``(first_line_no, batch_text)`` covering *text* exactly once.
+
+    Every batch ends on a line boundary (or at the end of *text*), so a match
+    can never straddle two batches and no overlap window is required: both
+    catalogues match within a single line by construction. ``first_line_no``
+    is the 1-based line number of the batch's first line in the whole text, so
+    a hit reported at local line ``n`` sits at ``first_line_no + n - 1``.
+
+    A blob with no newlines at all — a minified bundle, say — yields one batch
+    holding the whole text, which is correct rather than merely tolerated: it
+    is one line, and there is no boundary to cut on.
+    """
+    start, line_no, size = 0, 1, len(text)
+    while start < size:
+        end, newlines = start, 0
+        while newlines < _SCAN_BATCH_LINES:
+            nl = text.find("\n", end)
+            if nl == -1:
+                end = size
+                break
+            end = nl + 1
+            newlines += 1
+        yield line_no, text[start:end]
+        start = end
+        line_no += newlines
+
+
+def _scan_text(label: str, text: str) -> list[Finding]:
+    """Apply BOTH catalogues to *text* in bounded line batches.
+
+    Single entry point for every surface this script inspects — commit
+    identity, commit message, and blob content — so the positive control
+    exercises the same code every real finding travels through.
+    """
+    findings: list[Finding] = []
+    for first_line, batch in _line_batches(text):
+        for line_no, kind in check._leak_pattern_hits(batch):
+            findings.append((label, first_line + line_no - 1, kind, "redacted match"))
+        for hit in secret_scan.scan_text(label, batch):
+            findings.append((label, first_line + hit["line"] - 1, hit["pattern_name"], hit["matched_text"]))
+    return findings
 
 
 def _should_scan_path(path: str) -> bool:
@@ -267,16 +419,18 @@ def _batch_blobs_and_messages(
     return commit_objs, blobs
 
 
-Finding = tuple[str, int, str, str]  # (label, line_no, kind, detail)
-
-
-def _scan_range(repo_root: str, shas: list[str]) -> list[Finding]:
+def _scan_range(repo_root: str, shas: list[str]) -> tuple[list[Finding], _Ledger]:
     """Scan every commit's message and the full new content of every path it
     touches. Full-blob content (not just the commit's own diff) matters
     because a pure rename or a change elsewhere in the file can leave a
     leaked line present without it ever appearing as an added line in that
-    commit's own patch."""
+    commit's own patch.
+
+    Returns the findings AND the ledger of what was read to produce them, so
+    the caller can publish the denominator and refuse to call an unanalyzable
+    blob clean."""
     findings: list[Finding] = []
+    ledger = _Ledger()
 
     changed = _batch_changed_paths(repo_root, shas)
 
@@ -284,6 +438,7 @@ def _scan_range(repo_root: str, shas: list[str]) -> list[Finding]:
     per_commit_paths: dict[str, list[tuple[str, str]]] = {}
     for sha in shas:
         keep = [(path, oid) for path, oid in changed.get(sha, []) if _should_scan_path(path)]
+        ledger.path_filtered += len(changed.get(sha, [])) - len(keep)
         per_commit_paths[sha] = keep
         for path, oid in keep:
             wanted_paths[oid] = path
@@ -306,30 +461,27 @@ def _scan_range(repo_root: str, shas: list[str]) -> list[Finding]:
         # personal address, or an employer domain left in user.name /
         # user.email travels to the remote in these two lines.
         identity = "\n".join(line for line in header.splitlines() if line.startswith(("author ", "committer ")))
-        ident_label = f"{short} (commit identity)"
-        for line_no, label in check._leak_pattern_hits(identity):
-            findings.append((ident_label, line_no, label, "redacted match"))
-        for f in secret_scan.scan_text(ident_label, identity):
-            findings.append((ident_label, f["line"], f["pattern_name"], f["matched_text"]))
-
-        msg_label = f"{short} (commit message)"
-        for line_no, label in check._leak_pattern_hits(message):
-            findings.append((msg_label, line_no, label, "redacted match"))
-        for f in secret_scan.scan_text(msg_label, message):
-            findings.append((msg_label, f["line"], f["pattern_name"], f["matched_text"]))
+        findings += _scan_text(f"{short} (commit identity)", identity)
+        findings += _scan_text(f"{short} (commit message)", message)
 
         for path, oid in per_commit_paths.get(sha, []):
             path_label = f"{short}:{path}"
             raw = blobs.get(oid)
             if raw is None:
                 continue
-            for text in _decode_views(raw):
-                for line_no, label in check._leak_pattern_hits(text):
-                    findings.append((path_label, line_no, label, "redacted match"))
-                for f in secret_scan.scan_text(path_label, text):
-                    findings.append((path_label, f["line"], f["pattern_name"], f["matched_text"]))
+            reading = _read_blob(raw)
+            if reading.disposition == _UNANALYZABLE:
+                ledger.unanalyzable.append((path_label, len(raw), reading.reason))
+                continue
+            if reading.disposition == _SKIPPED_BINARY:
+                ledger.binary_skipped.append((path_label, len(raw)))
+                continue
+            ledger.blobs_scanned += 1
+            ledger.bytes_scanned += len(raw)
+            for text in reading.views:
+                findings += _scan_text(path_label, text)
 
-    return findings
+    return findings, ledger
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
@@ -355,6 +507,71 @@ def _print_report(findings: list[Finding]) -> None:
         "    scripts/check.py.\n"
         "  - Deliberate one-off bypass (rare, discouraged): git push --no-verify\n"
     )
+
+
+def _print_unscannable(ledger: _Ledger) -> None:
+    sys.stderr.write(
+        f"\nUNSCANNABLE: {len(ledger.unanalyzable)} blob(s) in the commits about to be pushed could not be scanned:\n"
+    )
+    for label, size, reason in ledger.unanalyzable:
+        sys.stderr.write(f"  {label}  {size} bytes  [{reason}]\n")
+    sys.stderr.write(
+        "\n"
+        "This is NOT a pass. Content this gate did not read is content it\n"
+        "cannot call clean, and a blob that publishes unread publishes\n"
+        "permanently. Options:\n"
+        "  - Do not publish the blob: drop it from the range, or move it out\n"
+        "    of git (release asset, LFS, generated at build time).\n"
+        "  - Prove it by hand, then bypass this one push deliberately:\n"
+        "    git push --no-verify\n"
+        "  - Raising the ceiling in scripts/prepush_leak_scan.py is a\n"
+        "    performance decision, not a fix: the point is that over-size\n"
+        "    refuses instead of passing, at whatever the ceiling is.\n"
+    )
+
+
+# --- positive control -------------------------------------------------------
+# Assembled by concatenation so this file's own source text never contains a
+# contiguous match: the whole-tree gates (scripts/check.py's leak_scan and
+# CI's scripts/secret_scan.py) read this file like any other, and only
+# tests/test_secret_scan.py is path-exempt. Real credentials do not arrive
+# pre-split, so this costs the catalogues nothing.
+_CONTROL_LABEL = "<scanner positive control>"
+_CONTROL_EXPECTED = ("AWS access key", "Anthropic OAuth Token")
+_CONTROL_AWS = "AK" + "IA" + "S" * 16
+_CONTROL_ANTHROPIC = "sk-" + "ant-" + "oat" + "01-" + "Aa9_-" * 12
+
+
+def _control_blob() -> bytes:
+    """A sentinel blob planting one credential per catalogue, past a batch edge.
+
+    The filler runs one line beyond ``_SCAN_BATCH_LINES`` so the planted
+    credentials land in the SECOND batch: a batching bug that scans only the
+    first batch, or that drops the tail, fails this control instead of
+    reporting a clean repository.
+    """
+    filler = "# positive control filler\n" * (_SCAN_BATCH_LINES + 1)
+    return f'{filler}aws = "{_CONTROL_AWS}"\nkey = "{_CONTROL_ANTHROPIC}"\n'.encode()
+
+
+def _self_test_failures() -> list[str]:
+    """Empty iff the scanner can still find something it planted itself.
+
+    A scanner that reads nothing reports exactly what a clean repository
+    reports. This one has already demonstrated it can do that -- an over-size
+    blob decoded to an empty view list and every downstream loop ran zero
+    times, printing ``clean``. So "0 findings" and "the scanner stopped
+    working" must stop being the same output, and the only way to tell them
+    apart is to require a known-positive on every run, through the same
+    ``_read_blob``/``_scan_text`` path a real blob takes.
+    """
+    reading = _read_blob(_control_blob())
+    if reading.disposition != _SCANNED:
+        return [f"control blob was not scanned (disposition={reading.disposition!r}: {reading.reason})"]
+    if not reading.views:
+        return ["control blob decoded to zero text views"]
+    kinds = {kind for view in reading.views for _, _, kind, _ in _scan_text(_CONTROL_LABEL, view)}
+    return [f"planted control credential not detected: {name}" for name in _CONTROL_EXPECTED if name not in kinds]
 
 
 def _resolve_commits(repo_root: str, args: argparse.Namespace) -> list[str]:
@@ -419,6 +636,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--remote-url", default=None, help="git's $2 (informational)")
     args = parser.parse_args(argv)
 
+    # Positive control FIRST, on every invocation including the ones that go
+    # on to fail for other reasons: a broken scanner must not be able to
+    # produce any verdict at all, not merely be caught on the happy path.
+    broken = _self_test_failures()
+    if broken:
+        sys.stderr.write("\nBROKEN: prepush_leak_scan's own positive control failed:\n")
+        for problem in broken:
+            sys.stderr.write(f"  {problem}\n")
+        sys.stderr.write(
+            "\nThis scanner cannot find a credential it planted itself, so it\n"
+            "cannot be trusted to report on the commits about to be pushed.\n"
+            "Its '0 findings' would mean nothing. Fix the scanner; do not push.\n"
+        )
+        return 4
+
     repo_root = _repo_root()
     try:
         commits = _resolve_commits(repo_root, args)
@@ -431,17 +663,27 @@ def main(argv: list[str]) -> int:
         return 0
 
     try:
-        findings = _dedupe(_scan_range(repo_root, commits))
+        raw_findings, ledger = _scan_range(repo_root, commits)
     except prepush_refs.PrePushGitError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 1
+    findings = _dedupe(raw_findings)
 
-    if not findings:
-        print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings)")
+    # The denominator publishes on EVERY path, clean or blocked. Without it
+    # "0 findings" is unfalsifiable: it is what a working scan of a clean
+    # range prints and also what a scan that read nothing prints.
+    if not findings and not ledger.unanalyzable:
+        print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
+        for label, size in ledger.binary_skipped:
+            print(f"  skipped (binary, not pattern-matched): {label}  {size} bytes")
         return 0
 
-    _print_report(findings)
-    return 2
+    sys.stderr.write(f"prepush_leak_scan: {len(commits)} commit(s) scanned; {ledger.summary()}\n")
+    if findings:
+        _print_report(findings)
+    if ledger.unanalyzable:
+        _print_unscannable(ledger)
+    return 2 if findings else 3
 
 
 if __name__ == "__main__":

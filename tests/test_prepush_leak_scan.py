@@ -372,3 +372,210 @@ def test_binary_blobs_are_still_skipped(repo: Path) -> None:
     result = _run(repo, "--range", f"{base}..{tip}")
 
     assert result.returncode == 0, f"binary blobs produced findings:\n{result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Size must never be a reason to report clean.
+#
+# The defect: _decode_views returned [] for any blob over a 4 MiB cap, using
+# list-emptiness as its ONLY channel. _scan_range then iterated zero times and
+# main() rendered the UNSCANNED blob as `clean`, exit 0 -- which .githooks/
+# pre-push consumes as permission to push. Measured before the fix, scanning
+# only the commit that added the blob so range selection is not a confound:
+#
+#     4,194,304 bytes -> exit 2  BLOCKED
+#     4,194,305 bytes -> exit 0  clean
+#
+# One byte across the threshold hid a real-shaped GitHub token. This is not
+# adversarial-only: a legitimately large asset -- a generated dataset, a
+# minified vendor bundle -- with a credential anywhere in it pushed clean.
+# ---------------------------------------------------------------------------
+
+_HISTORICAL_CAP_BYTES = 4 * 1024 * 1024
+
+
+def _github_token() -> str:
+    """A real-SHAPED, never-issued GitHub token, split so this test file's own
+    source text carries no contiguous match (the gates read it like any other
+    file; only tests/test_secret_scan.py is path-exempt)."""
+    return "gh" + "p_" + "A1b2C3d4E5f6" + "G7h8I9j0K1l2" + "M3n4O5p6Q7r8"
+
+
+def _padded_credential_blob(total_bytes: int) -> bytes:
+    """`total_bytes` of blob whose LAST line is a credential.
+
+    The padding is one long line rather than many short ones purely for test
+    speed; the credential's own line is what has to be found either way.
+    """
+    tail = f"TOKEN = {_github_token()}\n".encode()
+    pad = total_bytes - len(tail) - 1
+    assert pad > 0
+    return b"x" * pad + b"\n" + tail
+
+
+@pytest.mark.parametrize("total_bytes", [_HISTORICAL_CAP_BYTES, _HISTORICAL_CAP_BYTES + 1])
+def test_padding_across_the_old_size_cap_no_longer_hides_a_credential(repo: Path, total_bytes: int) -> None:
+    """THE regression for the reported defect: the same credential either side
+    of the historical 4 MiB cap, both caught.
+
+    Before the fix, `_HISTORICAL_CAP_BYTES` exited 2 and `+ 1` exited 0 --
+    padding a blob by a single byte bought the credential a free ride to the
+    remote. Parametrised over both sides on purpose: asserting only the large
+    case would also pass a scanner that had simply become unable to report
+    clean at all.
+    """
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit_bytes(repo, "dataset.txt", _padded_credential_blob(total_bytes), "add a large generated asset")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, (
+        f"a {total_bytes}-byte blob carrying a credential was not blocked "
+        f"(exit {result.returncode}):\n{result.stdout}\n{result.stderr}"
+    )
+    assert "GitHub" in result.stderr, result.stderr
+    assert "dataset.txt" in result.stderr, result.stderr
+
+
+def test_a_genuinely_clean_large_blob_still_passes(repo: Path) -> None:
+    """NEGATIVE CONTROL. "Block everything over 4 MiB" would satisfy the test
+    above while making the gate useless, so a clean blob comfortably past the
+    historical cap has to keep exiting 0 -- and has to be reported as SCANNED,
+    not merely as producing no findings."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    size = _HISTORICAL_CAP_BYTES + 4096
+    body = b"lorem ipsum dolor sit amet, tokens and keys discussed only in prose\n" * (size // 68)
+    tip = _commit_bytes(repo, "dataset.txt", body, "add a large but entirely clean generated asset")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, f"a clean large blob was blocked:\n{result.stdout}\n{result.stderr}"
+    assert "clean" in result.stdout
+    assert f"{len(body)} bytes" in result.stdout, (
+        f"the clean verdict does not disclose that the large blob was actually read:\n{result.stdout}"
+    )
+
+
+def test_a_blob_over_the_ceiling_is_unscannable_never_clean(repo: Path) -> None:
+    """The one remaining cap is a LOUD REFUSAL, not a silent skip.
+
+    The blob here carries no credential at all, which is the point: "I could
+    not check this" has to block on its own, without a finding to justify it.
+    Exit 3 and the word `clean` must not appear.
+    """
+    from scripts import prepush_leak_scan
+
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    oversize = prepush_leak_scan._SCAN_CEILING_BYTES + 1
+    tip = _commit_bytes(repo, "huge.txt", b"y" * oversize, "add a blob past the scan ceiling")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 3, (
+        f"an unscannable blob did not block (exit {result.returncode}):\n{result.stdout}\n{result.stderr}"
+    )
+    assert "clean" not in result.stdout, f"an unread blob was rendered as clean:\n{result.stdout}"
+    assert "UNSCANNABLE" in result.stderr, result.stderr
+    assert "huge.txt" in result.stderr, "the refusal does not name the blob it refused"
+    assert str(oversize) in result.stderr, "the refusal does not publish the blob's size"
+
+
+def test_clean_verdict_publishes_its_denominator(repo: Path) -> None:
+    """`0 findings` is unfalsifiable on its own -- it is what a working scan of
+    a clean range prints and also what a scan that read nothing prints. The
+    counts of blobs and bytes actually read must ride along with the verdict."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit(repo, "notes.txt", "nothing interesting\n", "clean follow-up commit")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, result.stderr
+    assert "blobs: 1 scanned" in result.stdout, result.stdout
+    assert "0 unanalyzable" in result.stdout, result.stdout
+    assert "bytes" in result.stdout, result.stdout
+
+
+def test_binary_skips_are_disclosed_not_invisible(repo: Path) -> None:
+    """Binary stays non-fatal (see the conservation test above), but it stops
+    being invisible: a reader of the clean verdict can see that some content
+    was classified rather than pattern-matched."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit_bytes(repo, "object.dat", b"\x7fELF\x02\x01\x01" + bytes(range(256)) * 8, "add an object blob")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 0, result.stderr
+    assert "1 binary-skipped" in result.stdout, result.stdout
+    assert "object.dat" in result.stdout, "a skipped blob is not named anywhere in the verdict"
+
+
+def test_credential_past_the_first_line_batch_is_found_with_a_true_line_number(repo: Path) -> None:
+    """Blobs are scanned in bounded line batches. A batching bug that scans
+    only the first batch, or that restarts line numbering per batch, would
+    still pass every small-blob test in this file."""
+    from scripts import prepush_leak_scan
+
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    leading = prepush_leak_scan._SCAN_BATCH_LINES * 3 + 7
+    body = "# filler\n" * leading + f"TOKEN = {_github_token()}\n"
+    tip = _commit(repo, "late.txt", body, "credential well past the first batch boundary")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"a credential past the batch boundary was missed:\n{result.stdout}"
+    assert f"late.txt:{leading + 1}" in result.stderr, (
+        f"expected the true line number {leading + 1}, got:\n{result.stderr}"
+    )
+
+
+def test_line_batches_cover_the_text_exactly_once_with_correct_line_numbers() -> None:
+    """Property pinning the batching primitive itself: concatenating the
+    batches reproduces the input byte for byte (nothing dropped, nothing
+    double-scanned), and each batch's reported first line is its real one."""
+    from scripts import prepush_leak_scan
+
+    for text in (
+        "",
+        "no trailing newline",
+        "one\n",
+        "".join(f"line {i}\n" for i in range(prepush_leak_scan._SCAN_BATCH_LINES * 2 + 3)),
+        "".join(f"line {i}\n" for i in range(prepush_leak_scan._SCAN_BATCH_LINES * 2)) + "tail without newline",
+        "x" * 100_000,  # a single enormous line: no boundary to cut on
+    ):
+        batches = list(prepush_leak_scan._line_batches(text))
+        assert "".join(chunk for _, chunk in batches) == text
+        for first_line, chunk in batches:
+            assert text.splitlines()[first_line - 1 : first_line - 1 + len(chunk.splitlines())] == chunk.splitlines()
+
+
+def test_scanner_that_finds_nothing_reports_broken_not_clean(repo: Path, monkeypatch) -> None:
+    """ "0 findings" and "the scanner stopped working" must stop being the same
+    output. Neutering the scan makes the planted positive control disappear,
+    which has to surface as BROKEN and a non-zero exit -- not as a clean
+    range."""
+    from scripts import prepush_leak_scan
+
+    _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    assert prepush_leak_scan._self_test_failures() == [], "the positive control does not pass on healthy code"
+
+    monkeypatch.setattr(prepush_leak_scan, "_scan_text", lambda label, text: [])
+    assert prepush_leak_scan._self_test_failures(), "a scanner that reads nothing passed its own positive control"
+
+    monkeypatch.chdir(repo)
+    assert prepush_leak_scan.main(["--range", "HEAD"]) == 4
+
+
+def test_positive_control_covers_both_catalogues(monkeypatch) -> None:
+    """One planted credential per catalogue, not one overall: roam-code's
+    first gate against this defect self-tested with a GitHub token, passed,
+    and let a real Anthropic token through untouched. Breaking EITHER
+    catalogue must fail the control."""
+    from scripts import prepush_leak_scan
+
+    for target, attribute in (
+        (prepush_leak_scan.check, "_leak_pattern_hits"),
+        (prepush_leak_scan.secret_scan, "scan_text"),
+    ):
+        monkeypatch.setattr(target, attribute, lambda *args, **kwargs: [])
+        assert prepush_leak_scan._self_test_failures(), f"neutering {attribute} did not fail the positive control"
+        monkeypatch.undo()
