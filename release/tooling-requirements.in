@@ -1,12 +1,14 @@
 # Direct release/CI tools. Transitive dependencies and hashes are resolved into
-# tooling-requirements.lock with uv 0.11.15 in universal Python 3.10+ mode.
+# tooling-requirements.lock with uv 0.11.15 in universal Python 3.10+ mode,
+# against release/shared-constraints.txt so every distribution this graph shares
+# with another release lock resolves to one agreed version.
 build==1.5.0
 packaging==26.2
 pip==26.1.2
 pyasn1==0.6.4
 # tests/test_release.py drives the REAL pypi_attestations verification path
-# (see the sigstore entry below for the paired rationale). Pinned to the same
-# version release/attestation-requirements.lock already carries.
+# (see the sigstore entry below for the paired rationale). The version is owned
+# by release/shared-constraints.txt, which the attestation graph also consumes.
 pypi-attestations==0.0.29
 pyproject-hooks==1.2.0
 pytest==9.1.1
@@ -15,11 +17,14 @@ ruff==0.15.22
 setuptools==83.0.0
 # tests/test_release.py drives the REAL sigstore-python verification path
 # (only its network calls are stubbed), together with pypi-attestations above,
-# to prove identity and digest binding against a forged SAN. Pinned to the
-# same version release/attestation-requirements.lock already carries, so the
-# two locks cannot disagree.
+# to prove identity and digest binding against a forged SAN. The version is
+# owned by release/shared-constraints.txt, so this graph and the attestation
+# graph are constrained to one row instead of being hand-matched afterwards.
 sigstore==4.4.0
 tomli==2.4.1 ; python_version < "3.11"
 twine==6.2.0
 wheel==0.47.0
-zizmor==1.27.0
+# 1.27.0 is YANKED on PyPI: GHSA-f42p-wjw5-97qh, a logging defect that printed
+# configured GitHub credentials into zizmor's cleartext logs. Only 1.27.0 was
+# affected; 1.29.0 is the newest release that is not yanked.
+zizmor==1.29.0

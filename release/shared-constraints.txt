@@ -1,0 +1,63 @@
+# One source of truth for every distribution that more than one release lock
+# graph resolves. All four `.in` graphs are compiled against this file, so the
+# locks cannot disagree about a shared distribution: they are constrained to the
+# same row rather than being pinned twice and hand-matched afterwards.
+#
+# Reciprocal `==` pins across two locks are what drifted before: certifi reached
+# 2026.6.17 in tooling and 2026.7.22 in attestation, which made the combined
+# `pip install --require-hashes` in release.yml a ResolutionImpossible. A third
+# hand-matched pin would only queue up the next divergence.
+#
+# Rules enforced by `release_artifacts.py audit-locks`:
+#   * every distribution present in two or more release locks appears here;
+#   * every row here matches the version those locks resolved;
+#   * no release lock resolves one distribution at two different versions;
+#   * every exact root in a `.in` graph agrees with its row here.
+#
+# Editing a row here moves that distribution in every lock at once. Regenerate
+# with the exact command recorded in each lock header afterwards.
+annotated-types==0.8.0
+certifi==2026.7.22
+cffi==2.1.0
+charset-normalizer==3.4.9
+colorama==0.4.6
+# cryptography 49.0.0 carries PYSEC-2026-3552 / CVE-2026-69247: PKCS#7
+# EnvelopedData decryption exposes a Bleichenbacher oracle through
+# distinguishable errors and timing. Introduced 44.0.0, fixed 50.0.0.
+cryptography==50.0.0
+dnspython==2.8.0
+email-validator==2.3.0
+id==1.6.1
+idna==3.18
+importlib-resources==5.13.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+packaging==26.2
+pip==26.1.2
+platformdirs==4.11.0
+pyasn1==0.6.4
+pycparser==3.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+pygments==2.20.0
+pyjwt==2.13.0
+# pyopenssl 26.3.0 caps `cryptography<50`, so the PYSEC-2026-3552 fix above is
+# unreachable without moving pyopenssl too. 26.4.0 widens that to
+# `cryptography<51` and changes nothing else this repository uses.
+pyopenssl==26.4.0
+pypi-attestations==0.0.29
+requests==2.34.2
+rfc3161-client==1.0.7
+rfc3986==2.0.0
+rfc8785==0.1.4
+rich==15.0.0
+securesystemslib==1.4.0
+setuptools==83.0.0
+sigstore==4.4.0
+sigstore-models==0.0.6
+sigstore-rekor-types==0.0.18
+tuf==7.0.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+urllib3==2.7.0
+wheel==0.47.0

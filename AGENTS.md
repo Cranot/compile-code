@@ -28,7 +28,7 @@ python -m pip install --isolated --no-cache-dir --no-compile --require-hashes --
 ```
 
 If only zizmor is absent or damaged, `python scripts/check.py
---bootstrap-zizmor` extracts its exact `1.27.0` stanza from that same lock,
+--bootstrap-zizmor` extracts its exact `1.29.0` stanza from that same lock,
 installs no dependencies, and verifies the installed script location, wheel
 RECORD SHA-256/size, file identity, and reported version. The normal gate uses
 only that verified interpreter-local executable; it never falls back to PATH

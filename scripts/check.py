@@ -75,14 +75,14 @@ MAX_CHECK_OUTPUT_BYTES = 16 * 1024 * 1024
 MAX_ZIZMOR_BYTES = 64 * 1024 * 1024
 MAX_ZIZMOR_TRUST_BYTES = 64 * 1024
 ZIZMOR_DISTRIBUTION = "zizmor"
-ZIZMOR_VERSION = "1.27.0"
+ZIZMOR_VERSION = "1.29.0"
 ZIZMOR_BOOTSTRAP_ARGUMENT = "--bootstrap-zizmor"
-ZIZMOR_LOCK_STANZA_SHA256 = "12d59686b33400defcea1970cb2b8a876d88aba0c556e5c2b14762a60b4f7480"
+ZIZMOR_LOCK_STANZA_SHA256 = "f4572c3b2368b998333d0ba07594ad4296fb7b1c55d078536ca4ab756880eaf7"
 ZIZMOR_LOCK_ARTIFACT_HASH_COUNT = 11
 ZIZMOR_BINARY_WHEEL_COUNT = 10
 ZIZMOR_TRUST_SCHEMA = "compile-code.release-tool-artifacts.v1"
 ZIZMOR_TRUST_MANIFEST = ROOT / "release" / "zizmor-artifact-trust.json"
-ZIZMOR_TRUST_MANIFEST_SHA256 = "c5f5d33c91bbf4f56bb30f629edd4978c22d11503b9db42a5dff62c6d6260763"
+ZIZMOR_TRUST_MANIFEST_SHA256 = "6670054b158209a2d37b75f5fb96d74ce03a409348a3a9eb841e582e1167ea7f"
 ZIZMOR_AUDITOR_POLICY = ("--persona", "auditor", "--no-ignores", "--min-severity", "medium")
 OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 QUALITY_TOOL_VERSIONS = {"ruff": "0.15.22", "pytest": "9.1.1"}
@@ -1122,7 +1122,7 @@ def release_sanity() -> bool:
         "setuptools==83.0.0",
         "twine==6.2.0",
         "wheel==0.47.0",
-        "zizmor==1.27.0",
+        "zizmor==1.29.0",
     ):
         if not re.search(rf"(?m)^{re.escape(exact_tool)}(?:\s|$)", tooling_lock):
             problems.append(f"tooling lock: required exact tool missing: {exact_tool}")

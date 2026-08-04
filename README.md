@@ -523,7 +523,7 @@ python scripts/check.py
 ```
 
 If the environment already has every other tool, `python scripts/check.py
---bootstrap-zizmor` installs only the exact hash-locked `zizmor==1.27.0` wheel.
+--bootstrap-zizmor` installs only the exact hash-locked `zizmor==1.29.0` wheel.
 The gate resolves zizmor from the active interpreter's configured scripts
 directory and verifies its executable against a semantic-digest-pinned trust
 manifest derived from every exact lock-listed wheel. It independently checks

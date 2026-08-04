@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import zipfile
 from pathlib import Path
@@ -60,7 +61,7 @@ def _metadata() -> bytes:
         'Requires-Dist: pytest==9.1.1; extra == "dev"\n'
         'Requires-Dist: PyYAML==6.0.3; extra == "dev"\n'
         'Requires-Dist: ruff==0.15.22; extra == "dev"\n'
-        'Requires-Dist: zizmor==1.27.0; extra == "dev"\n'
+        'Requires-Dist: zizmor==1.29.0; extra == "dev"\n'
         "\n"
     ).encode()
 
@@ -424,6 +425,10 @@ def _copy_release_locks(tmp_path: Path) -> Path:
     for input_name, lock_name in release.LOCK_GRAPHS:
         shutil.copyfile(ROOT / "release" / input_name, release_dir / input_name)
         shutil.copyfile(ROOT / "release" / lock_name, release_dir / lock_name)
+    shutil.copyfile(
+        ROOT / "release" / release.RELEASE_CONSTRAINTS_NAME,
+        release_dir / release.RELEASE_CONSTRAINTS_NAME,
+    )
     return root
 
 
@@ -1854,7 +1859,7 @@ def test_locked_graph_audit_is_stable_complete_and_never_resolves_roam_code():
     queries, provenance = release.locked_requirement_queries(ROOT)
     package_versions = [(query["package"]["name"], query["version"]) for query in queries]
     assert package_versions == sorted(package_versions)
-    assert len(package_versions) == release.EXPECTED_LOCKED_VERSION_COUNT == 67
+    assert len(package_versions) == release.EXPECTED_LOCKED_VERSION_COUNT == 66
     assert len(package_versions) == len(set(package_versions))
     assert all(query["package"]["ecosystem"] == "PyPI" for query in queries)
     assert "roam-code" not in {name for name, _version in package_versions}
@@ -1933,7 +1938,65 @@ def test_locked_graph_exact_query_count_rejects_a_silent_transitive_omission(tmp
     )
     assert substitutions == 1
     lock.write_text(mutated, encoding="utf-8")
-    with pytest.raises(release.ReleaseError, match="query count must remain exactly 67; got 66"):
+    with pytest.raises(release.ReleaseError, match="query count must remain exactly 66; got 65"):
+        release.locked_requirement_queries(root)
+
+
+def _rewrite(path: Path, old: str, new: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"{path.name}: expected exactly one {old!r}"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def test_shared_constraints_hold_the_release_graphs_to_one_agreed_version(tmp_path: Path):
+    assert release.shared_constraint_failures(_copy_release_locks(tmp_path)) == []
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        pytest.param(
+            lambda release_dir: _rewrite(
+                release_dir / "attestation-requirements.lock", "\ncertifi==2026.7.22 ", "\ncertifi==2026.6.17 "
+            ),
+            "certifi is resolved at two versions across the release locks",
+            id="lock-drifts-from-its-sibling",
+        ),
+        pytest.param(
+            lambda release_dir: _rewrite(release_dir / "shared-constraints.txt", "\ncertifi==2026.7.22\n", "\n"),
+            "certifi==2026.7.22 is shared by .* but is absent from shared-constraints.txt",
+            id="new-shared-row-escapes-the-constraints-file",
+        ),
+        pytest.param(
+            lambda release_dir: _rewrite(
+                release_dir / "shared-constraints.txt", "\nurllib3==2.7.0\n", "\nurllib3==2.6.0\n"
+            ),
+            "shared-constraints.txt pins urllib3==2.6.0 but .* resolved urllib3==2.7.0",
+            id="constraints-file-stops-describing-the-locks",
+        ),
+        pytest.param(
+            lambda release_dir: _rewrite(
+                release_dir / "shared-constraints.txt", "\nrich==15.0.0\n", "\nrich==15.0.0\nchardet==5.2.0\n"
+            ),
+            "shared-constraints.txt pins chardet==5.2.0, which no release lock resolves",
+            id="constraints-file-accumulates-a-dead-row",
+        ),
+        pytest.param(
+            lambda release_dir: _rewrite(
+                release_dir / "shared-constraints.txt", "\nsigstore==4.4.0\n", "\nsigstore==4.5.0\n"
+            ),
+            "tooling-requirements.in declares sigstore==4.4.0 but shared-constraints.txt pins sigstore==4.5.0",
+            id="root-pin-and-constraint-disagree",
+        ),
+    ],
+)
+def test_shared_constraints_name_every_way_the_graphs_can_diverge(tmp_path: Path, mutate, message: str):
+    """Each mutation leaves every individual lock valid and only their union broken."""
+    root = _copy_release_locks(tmp_path)
+    mutate(root / "release")
+    failures = release.shared_constraint_failures(root)
+    assert any(re.search(message, failure) for failure in failures), failures
+    with pytest.raises(release.ReleaseError, match="release locks disagree about a shared distribution"):
         release.locked_requirement_queries(root)
 
 
@@ -2899,3 +2962,71 @@ def test_release_environment_preconditions_healthy_control(monkeypatch):
     monkeypatch.setattr(release.locale, "getpreferredencoding", lambda *_a: "UTF-8", raising=False)
     monkeypatch.setattr(release.os, "geteuid", lambda: 1000, raising=False)
     assert release._release_environment_precondition_failures(network_probe=lambda: None) == []
+
+
+def _release_yml_combined_install_command() -> list[str]:
+    """Recover the exact pip invocation release.yml hands the build job.
+
+    Read from the workflow rather than restated here: a test that restates the
+    command proves only that two copies agree, which is the same hand-matching
+    failure that let the certifi divergence reach main in the first place.
+    """
+    jobs = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))["jobs"]
+    steps = [
+        step for step in jobs["build"]["steps"] if isinstance(step.get("run"), str) and "-m pip install" in step["run"]
+    ]
+    assert len(steps) == 1, "release.yml's build job must contain exactly one pip install step"
+    command = steps[0]["run"].split()
+    assert command[:3] == ["python", "-m", "pip"], command[:3]
+    return command
+
+
+def test_release_yml_combined_install_covers_every_lock_the_gate_guards():
+    command = _release_yml_combined_install_command()
+    requested = [command[index + 1] for index, token in enumerate(command) if token == "-r"]
+    assert len(requested) == len(set(requested))
+    assert sorted(requested) == [f"release/{name}" for name in sorted(release.COMBINED_INSTALL_LOCKS)]
+    assert "--require-hashes" in command
+    assert "--only-binary=:all:" in command
+
+
+def test_release_yml_combined_install_requirement_set_is_jointly_satisfiable():
+    """One pip install of three locks is unsatisfiable if any name is pinned twice.
+
+    Every per-lock check passes while this fails: each lock is internally
+    consistent and only their union is contradictory. On the tree that shipped
+    certifi==2026.6.17 in tooling and certifi==2026.7.22 in attestation this
+    assertion reports the exact pair pip rejects with ResolutionImpossible.
+    """
+    command = _release_yml_combined_install_command()
+    requested = [command[index + 1] for index, token in enumerate(command) if token == "-r"]
+    pinned: dict[str, dict[str, list[str]]] = {}
+    for relative in requested:
+        for name, version in re.findall(
+            r"(?m)^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)", (ROOT / relative).read_text(encoding="utf-8")
+        ):
+            pinned.setdefault(release._canonical_name(name), {}).setdefault(version, []).append(relative)
+    conflicts = {name: versions for name, versions in pinned.items() if len(versions) > 1}
+    assert not conflicts, f"pip cannot install these locks together: {conflicts}"
+    assert release.shared_constraint_failures(ROOT) == []
+
+
+@pytest.mark.skipif(
+    release._release_network_precondition() is not None,
+    reason="the combined release install resolves against PyPI; no reachable index",
+)
+def test_release_yml_combined_install_resolves_against_pypi():
+    """Run release.yml's own command, so a real resolver — not a parser — rules."""
+    command = _release_yml_combined_install_command()
+    environment = dict(os.environ)
+    environment.update({"PIP_CONFIG_FILE": os.devnull, "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1"})
+    completed = subprocess.run(
+        [sys.executable, *command[1:], "--dry-run", "--quiet"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert completed.returncode == 0, (completed.stdout + completed.stderr)[-4000:]

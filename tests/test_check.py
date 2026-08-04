@@ -348,12 +348,12 @@ def test_zizmor_artifact_trust_manifest_covers_every_locked_artifact():
     identities = check._trusted_zizmor_executables()
 
     assert len(identities) == check.ZIZMOR_BINARY_WHEEL_COUNT
-    assert ("93fdad7a072eecccfb328f97476074c0dca94bb077296a6033c3783bc218b6fa", 23491584) in identities
+    assert ("942d65eff4e76dfb277dcf66c60c217aa3a6d92d3df04b746c80561d8277b6cc", 24175104) in identities
 
 
 def test_zizmor_artifact_trust_manifest_rejects_semantic_tampering(monkeypatch, tmp_path):
     tampered = tmp_path / "zizmor-artifact-trust.json"
-    payload = check.ZIZMOR_TRUST_MANIFEST.read_bytes().replace(b'"version": "1.27.0"', b'"version": "1.26.0"')
+    payload = check.ZIZMOR_TRUST_MANIFEST.read_bytes().replace(b'"version": "1.29.0"', b'"version": "1.26.0"')
     tampered.write_bytes(payload)
     monkeypatch.setattr(check, "ZIZMOR_TRUST_MANIFEST", tampered)
 
