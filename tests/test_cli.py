@@ -188,6 +188,31 @@ def _verify_envelope(
     }
 
 
+def _no_changes_envelope(receipt: dict[str, object]) -> dict[str, object]:
+    """The canonical 'nothing to verify' transaction roam emits for an empty scope."""
+    envelope = _verify_envelope(receipt=receipt)
+    summary = envelope["summary"]
+    summary.update(
+        verdict="PASS",
+        score=100,
+        files_checked=0,
+        violation_count=0,
+        checks_run=[],
+        state="no_changes",
+    )
+    for key in ("targets_checked", "verification_receipt", "quality_band", "index_refresh"):
+        summary.pop(key)
+    envelope["categories"] = {
+        name: (
+            {"score": 100, "violations": [], "available": True}
+            if name == "verification"
+            else {"score": 100, "violations": []}
+        )
+        for name in mod._VERIFY_NO_CHANGES_CATEGORY_NAMES
+    }
+    return envelope
+
+
 @pytest.fixture
 def compatible_roam(monkeypatch):
     """Keep CLI tests independent of whichever roam shim the host PATH selects."""
@@ -1852,6 +1877,81 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify", "a.py", "b.py"])
         assert "scope down" not in res.output
 
+    def _newer_producer(self, monkeypatch, rc, verdict):
+        """Stub the toolchain as a roam one minor ahead of this build."""
+        fake, captured = self._capture(verdict, rc)
+
+        def newer(*args, timeout=600, executable="roam", env=None):
+            proc = fake(*args, timeout=timeout, executable=executable, env=env)
+            envelope = json.loads(proc.stdout)
+            envelope["schema_version"] = "1.2.0"
+            envelope["orchestration_contract"] = {"review_policy": "cross_family"}
+            envelope["summary"]["residual_wave_note"] = "future"
+            proc.stdout = json.dumps(envelope)
+            return proc
+
+        monkeypatch.setattr(mod, "_roam_capture", newer)
+        return captured
+
+    def test_verify_accepts_a_newer_producer_and_says_what_it_ignored(self, runner, monkeypatch):
+        """An upstream envelope addition must not become a local verify outage."""
+        self._newer_producer(monkeypatch, 0, "VERDICT: PASS (score 100/100) -- no issues\n")
+
+        res = runner.invoke(mod.cli, ["verify", "changed.py"])
+
+        assert res.exit_code == 0
+        assert "protocol failure" not in res.output
+        assert "VERDICT: PASS" in res.output
+        assert "1.2.0" in res.output
+        assert "orchestration_contract" in res.output
+        assert "summary.residual_wave_note" in res.output
+
+    def test_a_newer_producer_does_not_soften_a_real_gate_failure(self, runner, monkeypatch):
+        self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
+
+        res = runner.invoke(mod.cli, ["verify", "src/bad.py"])
+
+        assert res.exit_code == 5
+        assert "VERDICT: FAIL" in res.output
+        assert "orchestration_contract" in res.output
+        assert "cause   : naming violation + syntax error" in res.output
+
+    def test_verify_still_refuses_an_envelope_missing_a_field_it_depends_on(self, runner, monkeypatch):
+        fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def truncated(*args, timeout=600, executable="roam", env=None):
+            proc = fake(*args, timeout=timeout, executable=executable, env=env)
+            envelope = json.loads(proc.stdout)
+            envelope.pop("categories")
+            proc.stdout = json.dumps(envelope)
+            return proc
+
+        monkeypatch.setattr(mod, "_roam_capture", truncated)
+
+        res = runner.invoke(mod.cli, ["verify", "changed.py"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "receipt field/reason envelope_contract" in res.output
+        assert "VERDICT: PASS" not in res.output
+
+    def test_verify_refuses_an_envelope_major_this_build_cannot_read(self, runner, monkeypatch):
+        fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def breaking(*args, timeout=600, executable="roam", env=None):
+            proc = fake(*args, timeout=timeout, executable=executable, env=env)
+            envelope = json.loads(proc.stdout)
+            envelope["schema_version"] = "2.0.0"
+            proc.stdout = json.dumps(envelope)
+            return proc
+
+        monkeypatch.setattr(mod, "_roam_capture", breaking)
+
+        res = runner.invoke(mod.cli, ["verify", "changed.py"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert "receipt field/reason envelope_schema_incompatible" in res.output
+        assert "upgrade compile-code" in res.output
+
 
 class TestBaselineVerb:
     def test_baseline_refuses_dirty_tree(self, runner, monkeypatch, tmp_path):
@@ -1954,28 +2054,7 @@ class TestVerifyReceiptV3Protocol:
 
     def test_accepts_canonical_complete_no_changes_transaction(self):
         expected = _bound_verify_receipt(target_file_count=0)
-        envelope = _verify_envelope(receipt=expected)
-        summary = envelope["summary"]
-        summary.update(
-            verdict="PASS",
-            score=100,
-            files_checked=0,
-            violation_count=0,
-            checks_run=[],
-            state="no_changes",
-        )
-        summary.pop("targets_checked")
-        summary.pop("verification_receipt")
-        summary.pop("quality_band")
-        summary.pop("index_refresh")
-        envelope["categories"] = {
-            name: (
-                {"score": 100, "violations": [], "available": True}
-                if name == "verification"
-                else {"score": 100, "violations": []}
-            )
-            for name in mod._VERIFY_NO_CHANGES_CATEGORY_NAMES
-        }
+        envelope = _no_changes_envelope(expected)
         assert self._validate(json.dumps(envelope), expected=expected) == envelope
 
     @pytest.mark.parametrize(
@@ -1993,28 +2072,7 @@ class TestVerifyReceiptV3Protocol:
     )
     def test_rejects_noncanonical_no_changes_categories(self, mutate):
         expected = _bound_verify_receipt(target_file_count=0)
-        envelope = _verify_envelope(receipt=expected)
-        summary = envelope["summary"]
-        summary.update(
-            verdict="PASS",
-            score=100,
-            files_checked=0,
-            violation_count=0,
-            checks_run=[],
-            state="no_changes",
-        )
-        summary.pop("targets_checked")
-        summary.pop("verification_receipt")
-        summary.pop("quality_band")
-        summary.pop("index_refresh")
-        envelope["categories"] = {
-            name: (
-                {"score": 100, "violations": [], "available": True}
-                if name == "verification"
-                else {"score": 100, "violations": []}
-            )
-            for name in mod._VERIFY_NO_CHANGES_CATEGORY_NAMES
-        }
+        envelope = _no_changes_envelope(expected)
         mutate(envelope)
         with pytest.raises(ValueError):
             self._validate(json.dumps(envelope), expected=expected)
@@ -2043,9 +2101,9 @@ class TestVerifyReceiptV3Protocol:
     @pytest.mark.parametrize(
         "mutate",
         [
-            lambda envelope: envelope.update(extra="not closed"),
+            lambda envelope: envelope.pop("project"),
             lambda envelope: envelope.update(schema="roam-envelope-v2"),
-            lambda envelope: envelope.update(schema_version="1.2.0"),
+            lambda envelope: envelope.update(skipped=True),
             lambda envelope: envelope.update(command="preflight"),
             lambda envelope: envelope["summary"].update(verdict="SKIPPED"),
             lambda envelope: envelope["summary"].update(verification_complete=False),
@@ -2083,9 +2141,9 @@ class TestVerifyReceiptV3Protocol:
             lambda envelope: envelope["summary"]["verification_receipt"].update(extra="not closed"),
         ],
         ids=[
-            "envelope-extra-key",
+            "envelope-missing-required-key",
             "envelope-schema",
-            "envelope-version",
+            "envelope-unknown-incompleteness-signal",
             "command",
             "skipped",
             "incomplete",
@@ -2124,6 +2182,128 @@ class TestVerifyReceiptV3Protocol:
         mutate(envelope)
         with pytest.raises(ValueError):
             self._validate(json.dumps(envelope))
+
+    # --- forward compatibility ------------------------------------------------
+    # Roam adds envelope fields every release. A receiver that fails on "the
+    # producer is newer than me" turns each upstream ship into a local outage
+    # on envelopes that are valid and strictly richer -- so an unknown extra
+    # field must be tolerated and disclosed, while a missing required field
+    # stays a refusal. The two events must not share a verdict.
+
+    @pytest.mark.parametrize("version", ["1.0.0", "1.1.0", "1.2.0", "1.9.4", "1.20.0"])
+    def test_accepts_any_same_major_envelope_version(self, version):
+        envelope = _verify_envelope()
+        envelope["schema_version"] = version
+        assert self._validate(json.dumps(envelope)) == envelope
+
+    @pytest.mark.parametrize(
+        "version",
+        ["2.0.0", "0.9.0", "1.1", "1.1.0.0", "v1.1.0", "1.1.0-rc1", "", " 1.1.0", 110],
+        ids=["major-bump", "major-zero", "two-part", "four-part", "prefixed", "suffixed", "empty", "padded", "int"],
+    )
+    def test_refuses_an_envelope_version_this_build_cannot_read(self, version):
+        envelope = _verify_envelope()
+        envelope["schema_version"] = version
+        with pytest.raises(ValueError, match="envelope_schema_incompatible"):
+            self._validate(json.dumps(envelope))
+
+    def test_refuses_an_envelope_that_declares_no_version_at_all(self):
+        envelope = _verify_envelope()
+        envelope.pop("schema_version")
+        with pytest.raises(ValueError, match="envelope_schema_incompatible"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_newer_producers_unknown_fields_are_accepted_and_disclosed(self):
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "1.2.0"
+        envelope["orchestration_contract"] = {"review_policy": "cross_family"}
+        envelope["summary"]["residual_wave_note"] = "future"
+        envelope["categories"]["syntax"]["future_counter"] = 3
+
+        assert self._validate(json.dumps(envelope)) == envelope
+
+        rendered = mod._render_verify_envelope(envelope)
+        assert "1.2.0" in rendered
+        assert "orchestration_contract" in rendered
+        assert "summary.residual_wave_note" in rendered
+        assert "categories.syntax.future_counter" in rendered
+        assert "does not read" in rendered
+
+    @pytest.mark.parametrize("name", sorted(mod._VERIFY_ENVELOPE_KEYS - {"schema_version"}))
+    def test_a_missing_required_field_still_fails_closed(self, name):
+        envelope = _verify_envelope()
+        envelope.pop(name)
+        with pytest.raises(ValueError, match="envelope_contract"):
+            self._validate(json.dumps(envelope))
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            lambda envelope: envelope.update(not_run=True),
+            lambda envelope: envelope["summary"].update(degraded=True),
+            lambda envelope: envelope["categories"]["syntax"].update(skipped_reason="index missing"),
+        ],
+        ids=["envelope", "summary", "category"],
+    )
+    def test_an_unknown_field_that_asserts_incompleteness_is_never_tolerated(self, mutate):
+        """Tolerance is for unknown AND neutral. A rename must not buy a pass."""
+        envelope = _verify_envelope()
+        mutate(envelope)
+        with pytest.raises(ValueError, match="unknown_incompleteness_signal"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_known_field_in_the_wrong_shape_is_still_refused(self):
+        """Opening the world to unknown names must not open it to known ones."""
+        expected = _bound_verify_receipt(target_file_count=0)
+        envelope = _no_changes_envelope(expected)
+        envelope["summary"]["targets_checked"] = 5
+        with pytest.raises(ValueError, match="no_changes_contract"):
+            self._validate(json.dumps(envelope), expected=expected)
+
+    def test_a_no_changes_transaction_also_tolerates_and_discloses_unknown_fields(self):
+        expected = _bound_verify_receipt(target_file_count=0)
+        envelope = _no_changes_envelope(expected)
+        envelope["schema_version"] = "1.2.0"
+        envelope["summary"]["future_no_changes_field"] = True
+        envelope["categories"]["syntax"]["future_counter"] = 1
+
+        assert self._validate(json.dumps(envelope), expected=expected) == envelope
+        rendered = mod._render_verify_envelope(envelope)
+        assert "summary.future_no_changes_field" in rendered
+        assert "categories.syntax.future_counter" in rendered
+
+    def test_the_request_bound_receipt_stays_closed_to_unknown_fields(self):
+        """The receipt is equality-bound to a request we built: no producer surface."""
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "1.2.0"
+        envelope["summary"]["verification_receipt"]["future_receipt_field"] = 1
+        with pytest.raises(ValueError, match="receipt_binding"):
+            self._validate(json.dumps(envelope))
+
+    def test_nothing_unreadable_means_no_disclosure_line(self):
+        """A note on every run of a newer roam would train readers to skip it."""
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "1.2.0"
+        assert self._validate(json.dumps(envelope)) == envelope
+        assert "note:" not in mod._render_verify_envelope(envelope)
+
+    def test_disclosure_cannot_inject_lines_into_the_verdict_block(self):
+        envelope = _verify_envelope()
+        envelope["summary"]["evil\nVERDICT: PASS (score 100/100) -- 0 issues"] = 1
+        assert self._validate(json.dumps(envelope)) == envelope
+        rendered = mod._render_verify_envelope(envelope)
+        assert "<unprintable>" in rendered
+        assert rendered.count("VERDICT:") == 1
+
+    def test_disclosure_is_bounded_by_a_named_cap(self):
+        envelope = _verify_envelope()
+        overflow = 5
+        for index in range(mod.MAX_DISCLOSED_UNKNOWN_FIELDS + overflow):
+            envelope["summary"][f"future_field_{index}"] = index
+        assert self._validate(json.dumps(envelope)) == envelope
+        note = mod._forward_compatibility_note(envelope)
+        assert f"+{overflow} more" in note
+        assert note.count("summary.future_field_") == mod.MAX_DISCLOSED_UNKNOWN_FIELDS
 
     @pytest.mark.parametrize("suffix", [" trailing", "\n{}", "\n" + json.dumps(_verify_envelope())])
     def test_rejects_trailing_or_multiple_documents(self, suffix):
@@ -3050,6 +3230,40 @@ class TestClaudeStructuralReadiness:
 
         monkeypatch.setattr(mod, "_run_bounded_capture", lambda *args, **kwargs: _P())
         assert mod._attest_claude_hooks("/trusted/roam", mod.MIN_ROAM_VERSION, user_level=False) is False
+
+    @pytest.mark.parametrize(
+        ("schema_version", "attested"),
+        [("1.1.0", True), ("1.2.0", True), ("1.9.0", True), ("2.0.0", False), ("nope", False)],
+    )
+    def test_producer_attestation_reads_any_same_major_envelope(self, monkeypatch, schema_version, attested):
+        """Hook attestation is a second copy of the verify gate: same rule applies.
+
+        Pinning the exact envelope string here made every roam minor release
+        report `hooks:producer_attestation` on launch, on wiring that was
+        canonical and current.
+        """
+
+        class _P:
+            returncode = 0
+            stdout = json.dumps(
+                {
+                    "schema": mod.VERIFY_ENVELOPE_SCHEMA,
+                    "schema_version": schema_version,
+                    "command": "hooks",
+                    "version": mod.MIN_ROAM_VERSION,
+                    "summary": {
+                        "verdict": "hooks",
+                        "already_installed": True,
+                        "foreign_bodies": [],
+                        "hook_body_version": mod.MIN_CLAUDE_HOOK_VERSION,
+                        "body_states": {filename: "current" for filename in mod.HOOK_FILENAMES},
+                    },
+                }
+            ).encode("utf-8")
+            stderr = b""
+
+        monkeypatch.setattr(mod, "_run_bounded_capture", lambda *args, **kwargs: _P())
+        assert mod._attest_claude_hooks("/trusted/roam", mod.MIN_ROAM_VERSION, user_level=False) is attested
 
     def test_cached_index_and_head_marker_cannot_bypass_roam_reinspection(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)

@@ -85,6 +85,11 @@ _ATOMIC_WRITE_LOCK_MAGIC = b"compile-code-owner-lock-v1\n"
 _ATOMIC_WRITE_LOCK_TIMEOUT_SECONDS = 10.0
 MIN_CLAUDE_HOOK_VERSION = 10
 VERIFY_ENVELOPE_SCHEMA = "roam-envelope-v1"
+# The envelope shape this build was WRITTEN AGAINST -- not a pin. Roam's
+# envelope versioning is semantic: a minor bump only adds optional fields, so
+# any same-major envelope is interpretable by this build. A different major is
+# a breaking redefinition we cannot read, and is refused. See
+# `_envelope_schema_compatible`.
 VERIFY_ENVELOPE_SCHEMA_VERSION = "1.1.0"
 VERIFY_RECEIPT_SCHEMA = "roam.verify.receipt.v3"
 
@@ -94,6 +99,12 @@ _VERSION_VALUE = re.compile(
     r"(?P<suffix>(?:(?:a|b|rc)\d+|\.?dev\d+|\.post\d+)?(?:\+[A-Za-z0-9.-]+)?)$",
     re.IGNORECASE,
 )
+_ENVELOPE_SCHEMA_VERSION_VALUE = re.compile(r"^(\d{1,4})\.(\d{1,4})\.(\d{1,4})$")
+# Unrecognised field names are producer-supplied text echoed into the verdict
+# block, so only plain identifiers print verbatim and the list is capped:
+# a disclosure must not be a place to inject lines or flood the block.
+_SAFE_FIELD_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
+MAX_DISCLOSED_UNKNOWN_FIELDS = 8
 _GIT_HEAD_VALUE = re.compile(r"(?:ref: refs/\S+|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _MAX_GIT_CONTROL_FILE_BYTES = 4096
@@ -415,6 +426,36 @@ def _version_meets_minimum(raw: str, minimum: str = MIN_ROAM_VERSION) -> bool:
     if prerelease != floor_prerelease:
         return floor_prerelease
     return True
+
+
+def _parse_envelope_schema_version(raw: object) -> tuple[int, int, int] | None:
+    """Parse a declared ``schema_version`` into a comparable release triple."""
+    if not isinstance(raw, str):
+        return None
+    match = _ENVELOPE_SCHEMA_VERSION_VALUE.fullmatch(raw)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    except (OverflowError, ValueError):
+        return None
+
+
+def _envelope_schema_compatible(raw: object) -> bool:
+    """Whether a declared envelope version is one this build can still read.
+
+    Roam versions its envelope semantically: a minor bump adds optional fields
+    and leaves every existing field meaning what it meant. So compatibility is
+    a MAJOR-version question, not a string-equality question. Pinning the exact
+    string turned every upstream minor release into a local verify outage on
+    envelopes that were valid and strictly richer -- a gate that fails on the
+    producer shipping, not on anything being wrong. An unparseable or
+    absent version stays a refusal: an unidentifiable producer is not a
+    compatible one.
+    """
+    declared = _parse_envelope_schema_version(raw)
+    baseline = _parse_envelope_schema_version(VERIFY_ENVELOPE_SCHEMA_VERSION)
+    return declared is not None and baseline is not None and declared[0] == baseline[0]
 
 
 def _extract_roam_version(output: str) -> str | None:
@@ -1705,7 +1746,7 @@ def _attest_claude_hooks(executable: str, expected_version: str, *, user_level: 
         return False
     if (
         envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
-        or envelope.get("schema_version") != VERIFY_ENVELOPE_SCHEMA_VERSION
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
         or envelope.get("command") != "hooks"
         or envelope.get("version") != expected_version
     ):
@@ -2449,6 +2490,10 @@ _VERIFY_SUMMARY_KEYS = frozenset(
         "shown_count",
         "total_count",
         "incomplete_reasons",
+        # Known and gated below (`truncated is True` is a summary_binding
+        # failure); listed so the gate is reachable rather than pre-empted by
+        # the shape check.
+        "truncated",
     }
 )
 _VERIFY_CATEGORY_KEYS = frozenset(
@@ -2467,6 +2512,55 @@ _VERIFY_CATEGORY_KEYS = frozenset(
         "tests_failed",
         "tests_total_impacted",
         "no_impacted_tests",
+    }
+)
+# Forward tolerance is for fields that are unknown AND neutral. A field this
+# build has never heard of whose *name* asserts that something did not fully
+# run is not neutral: ignoring it would let a producer downgrade its own
+# verification behind a rename and have this gate report a clean pass. Any of
+# these names appearing where this build has no interpretation for it is
+# refused rather than disclosed. Names already in a level's vocabulary keep
+# their existing precise handling (`timed_out: False` stays legal on a
+# category, `truncated: True` stays a summary_binding failure) -- this set only
+# bites where the field would otherwise be silently dropped.
+_VERIFY_INCOMPLETENESS_NAMES = frozenset(
+    {
+        "aborted",
+        "approximate",
+        "available",
+        "best_effort",
+        "canceled",
+        "cancelled",
+        "capped",
+        "degraded",
+        "did_not_run",
+        "error",
+        "errors",
+        "failed",
+        "failure",
+        "fallback",
+        "incomplete",
+        # Roam envelope fields that mean payload was dropped or a fallback
+        # fired; this build asks for an unbudgeted envelope precisely so they
+        # cannot appear, and their arrival is news, not noise.
+        "list_counts",
+        "not_run",
+        "parse_failures",
+        "partial",
+        "redactions",
+        "skip",
+        "skip_reason",
+        "skipped",
+        "skipped_reason",
+        "stale",
+        "timed_out",
+        "timeout",
+        "truncated",
+        "unavailable",
+        "unavailable_reason",
+        "unsupported",
+        "unverified",
+        "warnings",
     }
 )
 _VERIFY_CATEGORY_REQUIRED_KEYS = frozenset({"score", "violation_count", "violations"})
@@ -3013,6 +3107,82 @@ def _validate_finding(finding: object, *, expected_root: Path | None = None) -> 
     return finding
 
 
+def _require_known_shape(
+    mapping: Mapping[str, object],
+    *,
+    required: frozenset[str],
+    allowed: frozenset[str],
+    vocabulary: frozenset[str],
+    reason: str,
+) -> None:
+    """Gate the known vocabulary exactly; let an unknown name through to disclosure.
+
+    A missing key and an unknown extra key are different events and must not
+    share a verdict. A missing required key means the producer withheld
+    something this build depends on: fail closed. An unknown extra key means
+    the producer is NEWER than this build -- nothing depended-on is absent, so
+    the transaction is still readable, and the right answer is to proceed and
+    say what was ignored (`_unrecognised_envelope_fields` feeds the rendered
+    disclosure). Every name this build has heard of is still placement-checked
+    against *allowed*, so opening the world costs no existing gate: only names
+    with no meaning here at all are tolerated.
+    """
+    present = frozenset(mapping)
+    if not required <= present or not (present & vocabulary) <= allowed:
+        raise ValueError(reason)
+    if (present - vocabulary) & _VERIFY_INCOMPLETENESS_NAMES:
+        raise ValueError("unknown_incompleteness_signal")
+
+
+def _disclosable_field_name(name: object) -> str:
+    """Render one producer-supplied field name safely inside a verdict block."""
+    return name if isinstance(name, str) and _SAFE_FIELD_NAME.fullmatch(name) else "<unprintable>"
+
+
+def _unrecognised_envelope_fields(envelope: Mapping[str, object]) -> tuple[str, ...]:
+    """Dotted paths of every validated-envelope field this build could not read.
+
+    Deliberately does not walk `verification_receipt`: that mapping is bound by
+    exact equality to the request this process constructed, so it has no
+    forward-compatibility surface to disclose.
+    """
+    unknown = {_disclosable_field_name(name) for name in frozenset(envelope) - _VERIFY_ENVELOPE_KEYS}
+    summary = envelope.get("summary")
+    if isinstance(summary, Mapping):
+        unknown.update(f"summary.{_disclosable_field_name(name)}" for name in frozenset(summary) - _VERIFY_SUMMARY_KEYS)
+    categories = envelope.get("categories")
+    if isinstance(categories, Mapping):
+        for category_name, result in categories.items():
+            if isinstance(result, Mapping):
+                unknown.update(
+                    f"categories.{_disclosable_field_name(category_name)}.{_disclosable_field_name(name)}"
+                    for name in frozenset(result) - _VERIFY_CATEGORY_KEYS
+                )
+    return tuple(sorted(unknown))
+
+
+def _forward_compatibility_note(envelope: Mapping[str, object]) -> str | None:
+    """Disclose what a newer producer sent that this build ignored, or nothing.
+
+    Silence when nothing was ignored is the point: a note on every run of a
+    newer roam would train readers to skip the line that matters. The note
+    fires on observed unreadable content, never on the version number alone.
+    """
+    unknown = _unrecognised_envelope_fields(envelope)
+    if not unknown:
+        return None
+    shown = list(unknown[:MAX_DISCLOSED_UNKNOWN_FIELDS])
+    if len(unknown) > len(shown):
+        shown.append(f"+{len(unknown) - len(shown)} more")
+    declared = envelope.get("schema_version")
+    version = declared if isinstance(declared, str) and _ENVELOPE_SCHEMA_VERSION_VALUE.fullmatch(declared) else "?"
+    return (
+        f"note: roam envelope schema {version} carried {len(unknown)} "
+        f"field{'s' if len(unknown) != 1 else ''} this build does not read; "
+        f"gate applied to the rest. Ignored: {', '.join(shown)}"
+    )
+
+
 def _finding_fingerprint(finding: dict) -> str:
     """Return one canonical, multiplicity-preserving evidence identity."""
     try:
@@ -3068,10 +3238,17 @@ def _validate_verify_protocol(
     envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
     if not isinstance(envelope, dict):
         raise ValueError("envelope_shape")
+    if not _envelope_schema_compatible(envelope.get("schema_version")):
+        raise ValueError("envelope_schema_incompatible")
+    _require_known_shape(
+        envelope,
+        required=_VERIFY_ENVELOPE_KEYS,
+        allowed=_VERIFY_ENVELOPE_KEYS,
+        vocabulary=_VERIFY_ENVELOPE_KEYS,
+        reason="envelope_contract",
+    )
     if (
-        set(envelope) != _VERIFY_ENVELOPE_KEYS
-        or envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
-        or envelope.get("schema_version") != VERIFY_ENVELOPE_SCHEMA_VERSION
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
         or envelope.get("command") != "verify"
         or envelope.get("version") != expected_roam_version
         or not isinstance(envelope.get("project"), str)
@@ -3085,8 +3262,13 @@ def _validate_verify_protocol(
     violations = envelope.get("violations")
     if not isinstance(summary, dict) or not isinstance(categories, dict) or not isinstance(violations, list):
         raise ValueError("verify_shape")
-    if not set(summary) <= _VERIFY_SUMMARY_KEYS:
-        raise ValueError("summary_schema")
+    _require_known_shape(
+        summary,
+        required=frozenset(),
+        allowed=_VERIFY_SUMMARY_KEYS,
+        vocabulary=_VERIFY_SUMMARY_KEYS,
+        reason="summary_schema",
+    )
     verdict = summary.get("verdict")
     if verdict not in _VERIFY_VERDICTS:
         raise ValueError("verdict_enum")
@@ -3108,9 +3290,15 @@ def _validate_verify_protocol(
         raise ValueError("verification_incomplete")
 
     if expected_count == 0:
+        _require_known_shape(
+            summary,
+            required=_VERIFY_NO_CHANGES_SUMMARY_KEYS,
+            allowed=_VERIFY_NO_CHANGES_SUMMARY_KEYS,
+            vocabulary=_VERIFY_SUMMARY_KEYS,
+            reason="no_changes_contract",
+        )
         if (
-            set(summary) != _VERIFY_NO_CHANGES_SUMMARY_KEYS
-            or returncode != 0
+            returncode != 0
             or verdict != "PASS"
             or score != 100
             or files_checked != 0
@@ -3128,12 +3316,17 @@ def _validate_verify_protocol(
                 if category_name == "verification"
                 else _VERIFY_NO_CHANGES_CATEGORY_KEYS
             )
+            if not isinstance(category_name, str) or not category_name or not isinstance(result, dict):
+                raise ValueError("no_changes_category")
+            _require_known_shape(
+                result,
+                required=expected_keys,
+                allowed=expected_keys,
+                vocabulary=_VERIFY_CATEGORY_KEYS,
+                reason="no_changes_category",
+            )
             if (
-                not isinstance(category_name, str)
-                or not category_name
-                or not isinstance(result, dict)
-                or set(result) != expected_keys
-                or result.get("score") != 100
+                result.get("score") != 100
                 or result.get("violations") != []
                 or (category_name == "verification" and result.get("available") is not True)
             ):
@@ -3143,10 +3336,17 @@ def _validate_verify_protocol(
     if set(categories) != _VERIFY_CATEGORY_NAMES:
         raise ValueError("category_enum")
     verification_category = categories.get("verification")
+    if not isinstance(verification_category, dict):
+        raise ValueError("verification_category")
+    _require_known_shape(
+        verification_category,
+        required=_VERIFY_CATEGORY_REQUIRED_KEYS,
+        allowed=_VERIFY_CATEGORY_REQUIRED_KEYS,
+        vocabulary=_VERIFY_CATEGORY_KEYS,
+        reason="verification_category",
+    )
     if (
-        not isinstance(verification_category, dict)
-        or set(verification_category) != _VERIFY_CATEGORY_REQUIRED_KEYS
-        or verification_category.get("score") != 100
+        verification_category.get("score") != 100
         or verification_category.get("violation_count") != 0
         or verification_category.get("violations") != []
     ):
@@ -3154,14 +3354,15 @@ def _validate_verify_protocol(
     top_level_findings = [_validate_finding(finding, expected_root=expected_root) for finding in violations]
     category_findings: list[dict] = []
     for category_name, result in categories.items():
-        if (
-            not isinstance(category_name, str)
-            or not category_name
-            or not isinstance(result, dict)
-            or not _VERIFY_CATEGORY_REQUIRED_KEYS <= set(result)
-            or not set(result) <= _VERIFY_CATEGORY_KEYS
-        ):
+        if not isinstance(category_name, str) or not category_name or not isinstance(result, dict):
             raise ValueError("category_shape")
+        _require_known_shape(
+            result,
+            required=_VERIFY_CATEGORY_REQUIRED_KEYS,
+            allowed=_VERIFY_CATEGORY_KEYS,
+            vocabulary=_VERIFY_CATEGORY_KEYS,
+            reason="category_shape",
+        )
         _plain_int(result.get("score"), maximum=100)
         nested = result.get("violations", [])
         if not isinstance(nested, list):
@@ -3253,6 +3454,9 @@ def _render_verify_envelope(envelope: dict) -> str:
         f"{issue_count} issue{'s' if issue_count != 1 else ''} in "
         f"{targets_checked} changed file{'s' if targets_checked != 1 else ''}"
     ]
+    note = _forward_compatibility_note(envelope)
+    if note:
+        lines.append(note)
     checks = summary.get("checks_run") or []
     if checks:
         lines.append(f"checks: {', '.join(checks)}")
@@ -3414,6 +3618,15 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
     """Describe a rejected receipt without replaying untrusted tool output."""
     reason = str(error).split(":", 1)[0] or "unknown_validation_error"
     indices = ",".join(str(index) for index in range(len(targets))) or "none"
+    if reason == "envelope_schema_incompatible":
+        # An incompatible MAJOR envelope means this build is too old to read
+        # what the producer emits, so upgrading the producer cannot help.
+        return (
+            f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+            f"scope target indices {indices}; executable `{executable}` declared an envelope schema this build "
+            f"cannot read (reads {VERIFY_ENVELOPE_SCHEMA} {VERIFY_ENVELOPE_SCHEMA_VERSION} and later same-major "
+            "shapes). Fix: python -m pip install --upgrade compile-code"
+        )
     return (
         f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
         f"scope target indices {indices}; executable `{executable}` did not return one complete, bound Verify "
