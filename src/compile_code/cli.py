@@ -36,7 +36,7 @@ import threading
 import time
 from bisect import bisect_left
 from collections import Counter, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Container, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Iterator
@@ -73,10 +73,19 @@ MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 # gitignore `.roam/` hands roam its own live SQLite index (index.db, -wal, -shm,
 # index.lock, index.state) as changed work. That scope can never verify: the WAL
 # moves while roam reads it, the run reports itself incomplete, and the refusal
-# blames the roam version for a scope defect no upgrade can fix. Bounded
-# directory descent already refuses to enter these; discovery has to agree, or
-# the two disagree about what source is.
+# blames the roam version for a scope defect no upgrade can fix.
+#
+# The name alone is NOT the discriminator -- see _partition_non_source_scope.
+# Discovery narrows only UNTRACKED paths under these names, because the argument
+# above is about a live untracked index and reaches no path the project has
+# committed. Bounded directory descent (_expand_verify_targets) has no status
+# oracle and still prunes by name; that asymmetry is deliberate and bounded --
+# an explicit file argument bypasses both.
 NON_SOURCE_SCOPE_DIRECTORIES = frozenset({".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"})
+# git porcelain v1 status for a path git has never been told about. It is the
+# only trackedness signal `git status` already hands us, so using it costs no
+# extra subprocess.
+GIT_STATUS_UNTRACKED = "??"
 MAX_STRICT_JSON_DEPTH = 128
 _VERIFY_CAPTURE_CHUNK_BYTES = 64 * 1024
 _VERIFY_TERMINATION_GRACE_SECONDS = 1.0
@@ -2672,7 +2681,7 @@ def _changed_files() -> list[str]:
     if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
         return []
     try:
-        return _parse_verify_status_paths(proc.stdout or b"")
+        return [path for _status, path in _parse_verify_status_records(proc.stdout or b"")]
     except ValueError:
         return []
 
@@ -2817,11 +2826,18 @@ def _validated_verify_directory_state(directory: Path, root: Path) -> os.stat_re
     return state
 
 
-def _parse_verify_status_paths(raw: bytes) -> list[str]:
+def _parse_verify_status_records(raw: bytes) -> list[tuple[str, str]]:
+    """Parse NUL-delimited porcelain v1 into ``(two-char status, path)`` records.
+
+    The status column is the cheap trackedness oracle git already put in the
+    output. Discarding it -- as this parser used to -- forces every later scope
+    decision onto the path NAME, which cannot tell a live untracked index from
+    tracked source that happens to live under a directory called ``venv``.
+    """
     if raw and not raw.endswith(b"\0"):
         raise ValueError("changed_file_discovery_malformed")
     records = raw.split(b"\0")
-    paths: list[str] = []
+    found: dict[str, str] = {}
     index = 0
     while index < len(records):
         raw_record = records[index]
@@ -2834,19 +2850,25 @@ def _parse_verify_status_paths(raw: bytes) -> list[str]:
         status = record[:2]
         path = record[3:]
         if path:
-            paths.append(path)
+            found.setdefault(path, status)
         if "R" in status or "C" in status:
             if index >= len(records) or not records[index]:
                 raise ValueError("changed_file_discovery_malformed")
             source = _decode_verify_status_path(records[index])
             index += 1
             if "R" in status and source:
-                paths.append(source)
-    return list(dict.fromkeys(paths))
+                # A rename source is in HEAD by construction, so it carries the
+                # rename's own status and is never mistaken for untracked.
+                found.setdefault(source, status)
+    return [(status, path) for path, status in found.items()]
 
 
-def _discover_verify_targets(root: Path) -> list[str]:
-    """Resolve the complete worktree scope; discovery failure loses evidence."""
+def _discover_verify_targets(root: Path) -> list[tuple[str, str]]:
+    """Resolve the complete worktree scope; discovery failure loses evidence.
+
+    Returns ``(status, path)`` records, not bare paths: the caller narrows on
+    trackedness and cannot recover the status column afterwards.
+    """
     git_path, _reason = _resolve_trusted_executable("git", reject_workspace=True)
     if not git_path:
         raise ValueError("changed_file_discovery_failed")
@@ -2864,57 +2886,92 @@ def _discover_verify_targets(root: Path) -> list[str]:
         raise ValueError("changed_file_discovery_failed") from exc
     if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
         raise ValueError("changed_file_discovery_failed")
-    return _parse_verify_status_paths(proc.stdout or b"")
+    return _parse_verify_status_records(proc.stdout or b"")
 
 
-def _partition_non_source_scope(paths: list[str]) -> tuple[list[str], list[str]]:
+def _partition_non_source_scope(paths: list[str], *, untracked: Container[str]) -> tuple[list[str], list[str]]:
     """Split discovered paths into source and tool state, preserving order.
 
-    A path is tool state when any of its DIRECTORY components is one of
-    ``NON_SOURCE_SCOPE_DIRECTORIES``; the final component is deliberately
-    exempt, so a tracked file named ``venv`` or ``.roamignore`` stays in scope.
+    A path is tool state when it is UNTRACKED **and** any of its DIRECTORY
+    components is one of ``NON_SOURCE_SCOPE_DIRECTORIES``; the final component is
+    deliberately exempt, so a tracked file named ``venv`` or ``.roamignore``
+    stays in scope.
+
+    Trackedness is the discriminator, not the name. The concern that produced
+    this narrowing is a LIVE, MOVING, UNTRACKED index -- roam's own
+    ``.roam/index.db-wal``, reported file by file by ``git status -uall``, which
+    no scope can bind because it changes while it is read. That argument does
+    not reach a path the project has committed: ``git add`` is the project
+    declaring this is source, the bytes are not moving under the reader, and
+    dropping it removes real code from ``--changed`` coverage. CPython itself
+    ships ``Lib/venv/__init__.py``; a directory name is not a measurement.
+
+    ``untracked`` is a required argument, not an optional one, because the
+    unsafe default is the silent one: assume-untracked drops tracked source with
+    no error, while assume-tracked can only ever fail loudly at bind time.
     """
     source: list[str] = []
     tool_state: list[str] = []
     for path in paths:
         parents = PurePosixPath(path).parts[:-1]
-        if any(part in NON_SOURCE_SCOPE_DIRECTORIES for part in parents):
+        if path in untracked and any(part in NON_SOURCE_SCOPE_DIRECTORIES for part in parents):
             tool_state.append(path)
         else:
             source.append(path)
     return source, tool_state
 
 
-def _narrowed_scope_notice(excluded: list[str]) -> str:
-    """Name what discovery dropped, so a narrowed scope is never silent.
+def _narrowed_scope_directories(excluded: Sequence[str]) -> list[str]:
+    """The directory names responsible for a narrowing, sorted.
 
-    Only directory names from ``NON_SOURCE_SCOPE_DIRECTORIES`` are printed --
-    never the discovered paths themselves, which are producer-supplied text this
-    surface does not replay.
+    Only names from ``NON_SOURCE_SCOPE_DIRECTORIES`` are ever returned -- never
+    the discovered paths themselves, which are filesystem-supplied text this
+    surface does not replay into a verdict block.
     """
-    matched = sorted(
+    return sorted(
         {part for path in excluded for part in PurePosixPath(path).parts[:-1] if part in NON_SOURCE_SCOPE_DIRECTORIES}
     )
-    names = ", ".join(matched) or "tool-state directories"
+
+
+def _narrowed_scope_suffix(excluded: Sequence[str]) -> str:
+    """Render the narrowing as a clause the VERDICT line itself carries.
+
+    A note printed *above* a verdict is a separate line a reader can take the
+    PASS without: the verdict then publishes a denominator ("N changed files")
+    that silently excludes what discovery dropped. Attaching the clause to the
+    verdict makes the reduced denominator unreadable-around.
+    """
+    if not excluded:
+        return ""
+    names = ", ".join(_narrowed_scope_directories(excluded)) or "tool-state directories"
+    return f"; scope narrowed: {len(excluded)} untracked path(s) under {names} excluded"
+
+
+def _narrowed_scope_notice(excluded: Sequence[str]) -> str:
+    """Name what discovery dropped on the paths that never reach a verdict line."""
+    names = ", ".join(_narrowed_scope_directories(excluded)) or "tool-state directories"
     return (
-        f"note: {len(excluded)} changed path(s) under {names} are tool state, not source, "
+        f"note: {len(excluded)} untracked path(s) under {names} are tool state, not source, "
         "and were excluded from the verification scope."
     )
 
 
-def _unignored_tool_state_note(excluded: list[str]) -> str:
+def _unignored_tool_state_note(excluded: Sequence[str]) -> str:
     """Explain the one failure this narrowing cannot repair, with a real remedy.
 
     With no source path left, verify has nothing to bind and delegates
     ``--changed`` to roam, which re-discovers the same tool state under its own
     rules. When roam does not ignore it either, the run cannot bind its scope --
     and no roam version fixes that, because the project is asking both tools to
-    verify a live index. Ignoring it is the remedy that works.
+    verify a live index.
+
+    The ``.gitignore`` remedy is true *because* narrowing is untracked-only:
+    every path in ``excluded`` is one git has never been told about, so ignoring
+    it removes it from ``git status -uall`` and from the next discovery. It was
+    false while narrowing keyed on the directory name, since ``.gitignore``
+    does not untrack an already-tracked path.
     """
-    matched = sorted(
-        {part for path in excluded for part in PurePosixPath(path).parts[:-1] if part in NON_SOURCE_SCOPE_DIRECTORIES}
-    )
-    names = " ".join(f"{name}/" for name in matched) or "those directories"
+    names = " ".join(f"{name}/" for name in _narrowed_scope_directories(excluded)) or "those directories"
     return (
         "note: no source path changed, so `roam verify --changed` rediscovered the excluded tool state itself. "
         f"Add {names} to .gitignore and rerun `compile verify --changed`."
@@ -2922,8 +2979,16 @@ def _unignored_tool_state_note(excluded: list[str]) -> str:
 
 
 def _discovered_scope(root: Path) -> tuple[list[str], list[str]]:
-    """Discover the changed scope and split it once, for every caller alike."""
-    return _partition_non_source_scope(_verification_scope_paths(_discover_verify_targets(root)))
+    """Discover the changed scope and split it once, for every caller alike.
+
+    Every discovered path is validated before any of it is dropped, so an
+    unsafe path under a tool-state directory still refuses the run instead of
+    being narrowed away unexamined.
+    """
+    records = _discover_verify_targets(root)
+    validated = _verification_scope_paths([path for _status, path in records])
+    untracked = {path for status, path in records if status == GIT_STATUS_UNTRACKED}
+    return _partition_non_source_scope(validated, untracked=untracked)
 
 
 def _verification_scope_paths(targets: list[str]) -> list[str]:
@@ -3526,8 +3591,14 @@ def _validate_verify_protocol(
     return envelope
 
 
-def _render_verify_envelope(envelope: dict) -> str:
-    """Render validated structured evidence without replaying raw subprocess text."""
+def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> str:
+    """Render validated structured evidence without replaying raw subprocess text.
+
+    ``excluded`` is what discovery narrowed away. It rides on the VERDICT line
+    rather than above it: the denominator that line publishes is the scope roam
+    was actually given, and a PASS over a reduced scope must say so in the same
+    sentence as the PASS.
+    """
     summary = envelope["summary"]
     issue_count = summary["violation_count"]
     files_checked = summary["files_checked"]
@@ -3536,6 +3607,7 @@ def _render_verify_envelope(envelope: dict) -> str:
         f"VERDICT: {summary['verdict']} (score {summary['score']}/100) -- "
         f"{issue_count} issue{'s' if issue_count != 1 else ''} in "
         f"{targets_checked} changed file{'s' if targets_checked != 1 else ''}"
+        f"{_narrowed_scope_suffix(excluded)}"
     ]
     note = _forward_compatibility_note(envelope)
     if note:
@@ -3784,8 +3856,6 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             _unsafe_scope_verdict(exc) or (_verify_protocol_verdict(exc, executable=str(executable), targets=targets))
         )
         raise SystemExit(EXIT_TOOLCHAIN)
-    if excluded:
-        click.echo(_narrowed_scope_notice(excluded))
 
     argv = ["--json", "verify"]
     if new_only:
@@ -3800,6 +3870,10 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         argv.append("--changed")
     rc, output = _delegate_capturing(*argv, executable=executable, env=verify_env)
     if output is None:
+        # No envelope means no VERDICT line to carry the narrowing, so it gets
+        # its own line here rather than going unsaid.
+        if excluded:
+            click.echo(_narrowed_scope_notice(excluded))
         raise SystemExit(rc)
     try:
         envelope = _validate_verify_protocol(
@@ -3823,10 +3897,12 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             _unsafe_scope_verdict(exc)
             or (_verify_protocol_verdict(exc, executable=str(executable), targets=bound_targets))
         )
+        if excluded:
+            click.echo(_narrowed_scope_notice(excluded))
         if excluded and not bound_targets:
             click.echo(_unignored_tool_state_note(excluded))
         raise SystemExit(EXIT_TOOLCHAIN)
-    rendered = _render_verify_envelope(envelope)
+    rendered = _render_verify_envelope(envelope, excluded=excluded)
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every

@@ -1483,7 +1483,7 @@ class TestVerifyFailureFormatting:
 
     @pytest.fixture(autouse=True)
     def _stable_changed_scope(self, monkeypatch):
-        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: ["changed.py"])
+        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: [(" M", "changed.py")])
 
     def _capture(self, output, rc, *, effective_threshold=70, findings=None):
         """Stub _roam_capture to return a CompletedProcess-shaped object."""
@@ -2327,6 +2327,36 @@ class TestVerifyReceiptV3Protocol:
         assert self._validate(json.dumps(envelope)) == envelope
         assert "note:" not in mod._render_verify_envelope(envelope)
 
+    def test_a_narrowed_scope_rides_on_the_verdict_line_not_above_it(self):
+        # The verdict publishes a denominator ("N changed files") that is the
+        # scope roam was actually given. A note printed above it is a separate
+        # line a reader can take the PASS without; the reduced denominator must
+        # be unreadable-around.
+        envelope = _verify_envelope()
+        excluded = [".roam/index.db", ".roam/index.db-wal"]
+
+        rendered = mod._render_verify_envelope(envelope, excluded=excluded)
+
+        verdict_line = rendered.splitlines()[0]
+        assert verdict_line.startswith("VERDICT: PASS")
+        assert "scope narrowed: 2 untracked path(s) under .roam excluded" in verdict_line
+
+    def test_an_unnarrowed_scope_adds_no_clause_to_the_verdict(self):
+        # A clause on every run would train readers to skip it.
+        assert "scope narrowed" not in mod._render_verify_envelope(_verify_envelope())
+        assert "scope narrowed" not in mod._render_verify_envelope(_verify_envelope(), excluded=[])
+
+    def test_the_narrowing_clause_names_only_fixed_directory_names(self):
+        # Discovered paths are filesystem-supplied text; only names drawn from
+        # NON_SOURCE_SCOPE_DIRECTORIES may reach a verdict block.
+        excluded = [".roam/evil\nVERDICT: PASS (score 100/100) -- 0 issues"]
+
+        rendered = mod._render_verify_envelope(_verify_envelope(), excluded=excluded)
+
+        assert rendered.count("VERDICT:") == 1
+        assert "evil" not in rendered
+        assert "scope narrowed: 1 untracked path(s) under .roam excluded" in rendered.splitlines()[0]
+
     def test_disclosure_cannot_inject_lines_into_the_verdict_block(self):
         envelope = _verify_envelope()
         envelope["summary"]["evil\nVERDICT: PASS (score 100/100) -- 0 issues"] = 1
@@ -2580,12 +2610,22 @@ class TestVerifyReceiptV3Protocol:
         assert mod._verification_scope_paths([literal_backslash]) == [expected]
 
     def test_git_status_parser_preserves_leading_space_filename(self):
-        assert mod._parse_verify_status_paths(b"??  leading.py\0") == [" leading.py"]
+        assert mod._parse_verify_status_records(b"??  leading.py\0") == [("??", " leading.py")]
+
+    def test_git_status_parser_keeps_the_status_column_that_narrowing_depends_on(self):
+        # Dropping the status column is what forced narrowing onto the path name.
+        raw = b" M venv/mypkg/mod.py\0?? .roam/index.db-wal\0R  new.py\0old.py\0"
+        assert mod._parse_verify_status_records(raw) == [
+            (" M", "venv/mypkg/mod.py"),
+            ("??", ".roam/index.db-wal"),
+            ("R ", "new.py"),
+            ("R ", "old.py"),
+        ]
 
     @pytest.mark.skipif(mod.os.name == "nt", reason="POSIX surrogateescape regression")
     def test_git_status_parser_explicitly_rejects_undecodable_filename_bytes(self):
         with pytest.raises(ValueError, match="scope_path_undecodable"):
-            mod._parse_verify_status_paths(b"?? bad-\xff.py\0")
+            mod._parse_verify_status_records(b"?? bad-\xff.py\0")
 
     def test_changed_file_discovery_uses_bounded_binary_capture(self, monkeypatch, tmp_path):
         captured = {}
@@ -2603,7 +2643,7 @@ class TestVerifyReceiptV3Protocol:
         monkeypatch.setattr(mod, "_resolve_trusted_executable", lambda *args, **kwargs: ("/trusted/git", None))
         monkeypatch.setattr(mod, "_run_bounded_capture", fake_capture)
 
-        assert mod._discover_verify_targets(tmp_path) == [" leading.py"]
+        assert mod._discover_verify_targets(tmp_path) == [("??", " leading.py")]
         assert captured["kwargs"]["cwd"] == str(tmp_path)
         assert captured["kwargs"]["stdout_limit"] == mod.MAX_VERIFY_GIT_STATUS_BYTES
         assert captured["kwargs"]["stderr_limit"] == mod.MAX_VERIFY_STDERR_BYTES
@@ -2612,20 +2652,19 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError):
             mod._verification_scope_paths(["safe.py", "bad\nname.py"])
 
-    def test_tool_state_directories_are_not_source_for_discovery(self):
-        kept, excluded = mod._partition_non_source_scope(
-            [
-                ".roam/index.db",
-                ".roam/index.db-wal",
-                "src/a.py",
-                "node_modules/pkg/index.js",
-                "__pycache__/cli.cpython-313.pyc",
-                "app/.venv/lib/site.py",
-                ".roamignore",
-                "venv",
-                "tools/venvsetup.py",
-            ]
-        )
+    def test_untracked_tool_state_directories_are_not_source_for_discovery(self):
+        paths = [
+            ".roam/index.db",
+            ".roam/index.db-wal",
+            "src/a.py",
+            "node_modules/pkg/index.js",
+            "__pycache__/cli.cpython-313.pyc",
+            "app/.venv/lib/site.py",
+            ".roamignore",
+            "venv",
+            "tools/venvsetup.py",
+        ]
+        kept, excluded = mod._partition_non_source_scope(paths, untracked=set(paths))
 
         assert kept == [
             "src/a.py",
@@ -2640,6 +2679,29 @@ class TestVerifyReceiptV3Protocol:
             "__pycache__/cli.cpython-313.pyc",
             "app/.venv/lib/site.py",
         ]
+
+    def test_tracked_source_under_a_tool_state_directory_stays_in_scope(self):
+        # `git add` is the project declaring a path is source. The narrowing
+        # exists for a live UNTRACKED index that moves while roam reads it; that
+        # argument does not reach a committed file, and dropping it removed real
+        # code from --changed coverage behind a PASS. CPython ships
+        # Lib/venv/__init__.py -- the name is not a measurement.
+        paths = [
+            "venv/mypkg/mod.py",
+            "node_modules/pkg/index.js",
+            ".roam/index.db-wal",
+            "src/a.py",
+        ]
+        kept, excluded = mod._partition_non_source_scope(paths, untracked={".roam/index.db-wal"})
+
+        assert kept == ["venv/mypkg/mod.py", "node_modules/pkg/index.js", "src/a.py"]
+        assert excluded == [".roam/index.db-wal"]
+
+    def test_partition_has_no_trackedness_default_because_the_silent_answer_is_wrong(self):
+        # Assume-untracked drops tracked source with no error; assume-tracked can
+        # only fail loudly at bind time. Neither is a safe default, so there is none.
+        with pytest.raises(TypeError):
+            mod._partition_non_source_scope(["venv/mypkg/mod.py"])
 
     def test_descent_and_discovery_share_one_non_source_directory_set(self):
         # Two sets would be free to drift, and the drift is invisible: descent
@@ -2666,7 +2728,11 @@ class TestVerifyReceiptV3Protocol:
             ".roam/index.state",
             "alpha.py",
         ]
-        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: list(discovered))
+        monkeypatch.setattr(
+            mod,
+            "_discover_verify_targets",
+            lambda _root: [("??", path) for path in discovered[:5]] + [(" M", "alpha.py")],
+        )
 
         _root, targets, receipt, env, excluded = mod._prepare_verify_request(())
 
@@ -2674,6 +2740,51 @@ class TestVerifyReceiptV3Protocol:
         assert env["ROAM_VERIFY_SCOPE_COUNT"] == "1"
         assert receipt["target_file_count"] == 1
         assert sorted(excluded) == sorted(discovered[:5])
+
+    def test_a_tracked_index_is_the_projects_own_declaration_and_is_verified(self, monkeypatch, tmp_path):
+        # The counterpart to the test above: the same paths, committed. Nothing
+        # is narrowed, because narrowing them would silently drop what the
+        # project chose to track. The residual is disclosed, not hidden -- a
+        # project that commits its live index gets it bound as a target.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "venv" / "mypkg").mkdir(parents=True)
+        (tmp_path / "venv" / "mypkg" / "mod.py").write_bytes(b"def helper():\n    return 1\n")
+        (tmp_path / "alpha.py").write_bytes(b"print('a')\n")
+        monkeypatch.setattr(
+            mod,
+            "_discover_verify_targets",
+            lambda _root: [(" M", "venv/mypkg/mod.py"), (" M", "alpha.py")],
+        )
+
+        _root, targets, receipt, env, excluded = mod._prepare_verify_request(())
+
+        assert targets == ["alpha.py", "venv/mypkg/mod.py"]
+        assert env["ROAM_VERIFY_SCOPE_COUNT"] == "2"
+        assert receipt["target_file_count"] == 2
+        assert excluded == []
+
+    def test_every_narrowed_path_is_untracked_so_the_gitignore_remedy_can_apply(self, monkeypatch, tmp_path):
+        # The remedy printed to the operator is "add these to .gitignore".
+        # .gitignore does not untrack, so that sentence is only true while every
+        # excluded path is one git has never been told about. Pin the property,
+        # not the sentence.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "alpha.py").write_bytes(b"print('a')\n")
+        records = [
+            ("??", ".roam/index.db-wal"),
+            (" M", "venv/mypkg/mod.py"),
+            ("??", "node_modules/pkg/index.js"),
+            (" M", "alpha.py"),
+        ]
+        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: list(records))
+        untracked = {path for status, path in records if status == mod.GIT_STATUS_UNTRACKED}
+
+        _source, excluded = mod._discovered_scope(tmp_path)
+
+        assert excluded  # the narrowing still happens
+        assert set(excluded) <= untracked
 
     def test_explicit_targets_are_never_silently_dropped(self, monkeypatch, tmp_path):
         # Discovery guesses at scope, so it may filter; an explicit path is the
@@ -2695,15 +2806,57 @@ class TestVerifyReceiptV3Protocol:
         monkeypatch.setattr(
             mod,
             "_discover_verify_targets",
-            lambda _root: [".roam/index.db", "node_modules/pkg/index.js", "alpha.py"],
+            lambda _root: [("??", ".roam/index.db"), ("??", "node_modules/pkg/index.js"), (" M", "alpha.py")],
         )
         monkeypatch.setattr(mod, "_delegate_capturing", lambda *args, **kwargs: (0, None))
 
         result = runner.invoke(mod.cli, ["verify", "--changed"])
 
-        assert "2 changed path(s)" in result.output
+        # No envelope came back, so there is no VERDICT line to carry the
+        # narrowing: it gets its own line rather than going unsaid.
+        assert "2 untracked path(s)" in result.output
         assert "node_modules" in result.output
         assert ".roam" in result.output
+        assert "Traceback" not in result.output
+
+    def test_a_pass_over_a_narrowed_scope_says_so_in_the_same_sentence(
+        self, runner, monkeypatch, compatible_roam, tmp_path
+    ):
+        # End to end: tracked source under venv/ is verified, the untracked
+        # index is not, and the PASS carries its own reduced denominator.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "alpha.py").write_bytes(b"print('a')\n")
+        (tmp_path / "venv" / "mypkg").mkdir(parents=True)
+        (tmp_path / "venv" / "mypkg" / "mod.py").write_bytes(b"def helper():\n    return 1\n")
+        monkeypatch.setattr(
+            mod,
+            "_discover_verify_targets",
+            lambda _root: [(" M", "alpha.py"), (" M", "venv/mypkg/mod.py"), ("??", ".roam/index.db-wal")],
+        )
+        seen: dict[str, object] = {}
+
+        def fake_delegate(*argv, executable, env):
+            seen["argv"] = list(argv)
+            receipt = _bound_verify_receipt(target_file_count=int(env["ROAM_VERIFY_SCOPE_COUNT"]))
+            receipt.update(
+                request_nonce=env["ROAM_VERIFY_REQUEST_NONCE"],
+                scope_sha256=env["ROAM_VERIFY_SCOPE_SHA256"],
+                content_sha256=env["ROAM_VERIFY_CONTENT_SHA256"],
+                content_sha256_before=env["ROAM_VERIFY_CONTENT_SHA256"],
+                content_sha256_after=env["ROAM_VERIFY_CONTENT_SHA256"],
+            )
+            return 0, json.dumps(_verify_envelope(receipt=receipt))
+
+        monkeypatch.setattr(mod, "_delegate_capturing", fake_delegate)
+
+        result = runner.invoke(mod.cli, ["verify", "--changed"])
+
+        assert result.exit_code == 0
+        assert seen["argv"] == ["--json", "verify", "--", "alpha.py", "venv/mypkg/mod.py"]
+        verdict_line = next(line for line in result.output.splitlines() if line.startswith("VERDICT:"))
+        assert "2 changed files" in verdict_line
+        assert "scope narrowed: 1 untracked path(s) under .roam excluded" in verdict_line
         assert "Traceback" not in result.output
 
     def test_tool_state_only_change_names_the_remedy_that_works(self, runner, monkeypatch, compatible_roam, tmp_path):
@@ -2711,13 +2864,19 @@ class TestVerifyReceiptV3Protocol:
         # rediscovers the same tool state. .gitignore is the only real fix.
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".git").mkdir()
-        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: [".roam/index.db", ".roam/index.db-wal"])
+        monkeypatch.setattr(
+            mod,
+            "_discover_verify_targets",
+            lambda _root: [("??", ".roam/index.db"), ("??", ".roam/index.db-wal")],
+        )
         monkeypatch.setattr(mod, "_delegate_capturing", lambda *args, **kwargs: (5, "{}"))
 
         result = runner.invoke(mod.cli, ["verify", "--changed"])
 
         assert result.exit_code == mod.EXIT_TOOLCHAIN
         assert "no source path changed" in result.output
+        # True only because narrowing is untracked-only: .gitignore removes an
+        # untracked path from `git status -uall`, and cannot untrack a tracked one.
         assert "Add .roam/ to .gitignore" in result.output
         assert "Traceback" not in result.output
 
