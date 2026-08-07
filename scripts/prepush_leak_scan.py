@@ -161,21 +161,18 @@ class _Ledger:
     credential blob rode out on. ``considered`` and ``opened`` remain, but only
     to say in the refusal whether the whole range or part of it went unread.
 
-    ``heuristics_suppressed`` is not an unread bucket at all: those blobs WERE
-    opened, decoded and scanned, and they are counted in ``blobs_scanned``. It
-    records only that a narrower catalogue ran on them -- one named, reviewed
-    path (``secret_scan._HEURISTIC_EXEMPT_FILES``) where the seven heuristic
-    shapes are suppressed and every vendor shape still runs. It used to be a
-    ``corpus_exempt`` bucket that removed the path from the range entirely,
+    THERE IS NO SUPPRESSION BUCKET. This carried ``heuristics_suppressed``
+    for the one path on which a narrower catalogue ran, and before that a
+    ``corpus_exempt`` bucket that removed the path from the range entirely --
     which meant a contiguous live-format credential committed there published
-    with the push under the word "clean".
+    with the push under the word "clean". Both are gone with the path rule
+    that fed them: every blob in the range meets the whole catalogue.
     """
 
     blobs_scanned: int = 0
     bytes_scanned: int = 0
     considered: int = 0
     path_filtered: list[str] = field(default_factory=list)
-    heuristics_suppressed: list[str] = field(default_factory=list)
     binary_skipped: list[tuple[str, int]] = field(default_factory=list)
     unanalyzable: list[tuple[str, int, str]] = field(default_factory=list)
 
@@ -188,7 +185,7 @@ class _Ledger:
         return (
             f"blobs: {self.blobs_scanned} scanned / {self.bytes_scanned} bytes, "
             f"{len(self.binary_skipped)} binary-skipped, {len(self.path_filtered)} path-filtered, "
-            f"{len(self.heuristics_suppressed)} heuristics-suppressed, {len(self.unanalyzable)} unanalyzable"
+            f"{len(self.unanalyzable)} unanalyzable"
         )
 
 
@@ -289,25 +286,23 @@ def _line_batches(text: str):
         line_no += newlines
 
 
-def _scan_text(label: str, text: str, *, skip_heuristics: bool = False) -> list[Finding]:
+def _scan_text(label: str, text: str) -> list[Finding]:
     """Apply BOTH catalogues to *text* in bounded line batches.
 
     Single entry point for every surface this script inspects — commit
     identity, commit message, and blob content — so the positive control
     exercises the same code every real finding travels through.
 
-    ``skip_heuristics`` drops ``secret_scan``'s seven heuristic shapes and
-    nothing else, for the one named path in
-    ``secret_scan._HEURISTIC_EXEMPT_FILES``. ``check.LEAK_PATTERNS`` is never
-    narrowed: it honours no exemption at all, which is the redundancy that
-    kept 4 of 15 provider families covered while the whole-file version of
-    this exemption was in force.
+    ``label`` names the surface for the report and decides nothing else. No
+    path narrows either catalogue here any more: the parameter that did,
+    ``skip_heuristics``, is gone with the path rule behind it, and the same
+    blob content is judged the same way wherever it was committed.
     """
     findings: list[Finding] = []
     for first_line, batch in _line_batches(text):
         for line_no, kind in check._leak_pattern_hits(batch):
             findings.append((label, first_line + line_no - 1, kind, "redacted match"))
-        for hit in secret_scan.scan_text(label, batch, skip_heuristics=skip_heuristics):
+        for hit in secret_scan.scan_text(label, batch):
             findings.append((label, first_line + hit["line"] - 1, hit["pattern_name"], hit["matched_text"]))
     return findings
 
@@ -518,11 +513,8 @@ def _scan_range(repo_root: str, shas: list[str]) -> tuple[list[Finding], _Ledger
                 continue
             ledger.blobs_scanned += 1
             ledger.bytes_scanned += len(raw)
-            skip_heuristics = secret_scan._is_heuristic_exempt(path)
-            if skip_heuristics:
-                ledger.heuristics_suppressed.append(path_label)
             for text in reading.views:
-                findings += _scan_text(path_label, text, skip_heuristics=skip_heuristics)
+                findings += _scan_text(path_label, text)
 
     return findings, ledger
 
@@ -770,8 +762,6 @@ def main(argv: list[str]) -> int:
     unread_paths = bool(ledger.path_filtered) or bool(ledger.binary_skipped)
     if not findings and not ledger.unanalyzable and not unread_paths:
         print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
-        for label in ledger.heuristics_suppressed:
-            print(f"  read and vendor-scanned; heuristic shapes suppressed: {label}")
         return 0
 
     sys.stderr.write(f"prepush_leak_scan: {len(commits)} commit(s) scanned; {ledger.summary()}\n")

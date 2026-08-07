@@ -175,11 +175,11 @@ def test_mask_secret_never_returns_the_full_value() -> None:
 
 
 # --- name-vs-value discrimination -------------------------------------------
-# These test cases use plain contiguous literals because they exercise the
-# HEURISTIC half of the catalogue (Generic Secret Assignment), which is the
-# only half suppressed on this path -- see secret_scan._HEURISTIC_EXEMPT_FILES.
-# A VENDOR shape must still be split here like anywhere else: this file is
-# read and vendor-scanned like every other candidate.
+# The probe lines below carry a per-line ``# secretsallow`` marker where they
+# would otherwise be findings. Nothing about this path is special any more:
+# this file is scanned by all 34 patterns like every other candidate, so the
+# marker is the only thing standing between a fixture and a refusal, and it is
+# visible on the line it exempts.
 
 
 def test_screaming_snake_identifier_value_is_not_flagged() -> None:
@@ -216,41 +216,104 @@ def test_unresolved_template_placeholder_value_is_not_flagged() -> None:
     assert not _detect("API_KEY = '%(secret)s'")
 
 
-# --- no file is exempt from the VENDOR catalogue -----------------------------
+# --- NO PATH NARROWS THE CATALOGUE -------------------------------------------
 #
-# This file used to be skipped WHOLE, on the argument that a secret scanner
-# cannot be tested without secret-shaped strings. Measured, that argument
-# covered 1 line out of 538 -- every other fixture is already split across
-# string-literal concatenations by this file's own documented discipline --
-# while the blanket removed the file from 2 of the 3 catalogues that read the
-# tree. 11 of 15 provider families had ZERO coverage inside it.
+# This file was once skipped WHOLE ("a secret scanner cannot be tested without
+# secret-shaped strings"), then narrowed to a suppression of the seven
+# HEURISTIC shapes on this one path. Both were measured and both served
+# nothing: 0 lines of the fixture required any of the seven, and the 2 lines
+# that ever tripped one already carried the per-line marker. What the rule DID
+# do was measurable -- all seven shapes, planted here, passed every gate arm in
+# this repository, while the same seven lines at any other path were refused by
+# two of three.
 #
-# What survives is a suppression of the seven HEURISTIC shapes on this one
-# path, which is as far as the argument actually reaches: a fixture that trips
-# "Generic Secret Assignment" is doing its job, and nothing legitimate here
-# produces an sk-ant-oat01- or an AKIA.
+# The rule is gone. The tests below are its inverse: the same line must be
+# judged the same way wherever it lives.
 
 
-def test_only_heuristic_shapes_are_suppressed_and_only_on_one_path() -> None:
-    """The exemption is a CATALOGUE narrowing, not a skip, on one named path."""
-    assert secret_scan._HEURISTIC_EXEMPT_FILES == frozenset({"tests/test_secret_scan.py"})
-    assert secret_scan._is_heuristic_exempt("tests/test_secret_scan.py")
-    assert secret_scan._is_heuristic_exempt("tests\\test_secret_scan.py")
-    assert not secret_scan._is_heuristic_exempt("tests/test_secret_scan_other.py")
-    assert not secret_scan._is_heuristic_exempt("tests/test_prepush_leak_scan.py")
-    assert not secret_scan._is_heuristic_exempt("scripts/secret_scan.py")
+def _line(name: str, value: str) -> str:
+    """``name = "value"`` built at runtime, so this file's source text does not
+    itself carry the assignment shape the probes are about."""
+    return f'{name} = "{value}"'
 
 
-def test_every_suppressed_name_is_a_real_catalogue_entry() -> None:
-    """A rename in ``SECRET_PATTERN_DEFS`` must not silently widen or empty the
-    suppressed half. The two lists live apart so the catalogue stays a verbatim
-    port, which is exactly the drift this pins."""
+# One live probe per shape the path rule used to suppress. These are what
+# passed unnoticed here.
+HEURISTIC_PROBES = {
+    "Generic Password Assignment": _line("password", "hunter2hunter2"),
+    "Generic Secret Assignment": _line("api_secret", "aB3xQ7zRt9LmZp2w"),
+    "Generic Bearer Token": "Authorization: Bearer " + "Zz9" * 8,
+    "JWT Token": "eyJ" + "hbGciOiJIUzI1NiJ9" + "." + "eyJ" + "zdWIiOiIxMjM0NSJ9" + "." + "Kx7Qw2Lm9Pz4Rt6",
+    "Base64 Encoded Secret": _line("secret_base64", "Ab7" * 20),
+    "Database Connection String": "postgres" + "://user:pw@db.example:5432/app",
+    "High Entropy String": _line("key", "Qw7zX2mNp9Vk4Rt6Ls1B"),
+}
+
+
+def test_the_probe_set_covers_every_shape_the_path_rule_used_to_suppress() -> None:
+    assert set(HEURISTIC_PROBES) == set(secret_scan.HEURISTIC_PATTERN_NAMES)
+
+
+@pytest.mark.parametrize(("shape", "probe"), sorted(HEURISTIC_PROBES.items()))
+def test_no_path_narrows_the_catalogue(tmp_path, shape: str, probe: str) -> None:
+    """The regression test for the hole the path rule left.
+
+    Measured before its removal: each of these seven lines, committed at
+    tests/test_secret_scan.py, was reported clean by the tree scan, by
+    check.leak_scan and by the range scan -- while the same line at any other
+    path was refused by two of the three. A scanner whose verdict depends on
+    the file NAME is telling you about the name.
+
+    Routed through ``scan_repo``, not ``scan_text``: the suppression lived in
+    the repository loop, so a unit test against ``scan_text`` would have
+    passed before the removal and proved nothing.
+    """
+    root = _repo_with(
+        tmp_path,
+        {
+            "tests/test_secret_scan.py": (probe + "\n").encode(),
+            "src/elsewhere.py": (probe + "\n").encode(),
+        },
+    )
+
+    flagged = {f["file"] for f in secret_scan.scan_repo(root) if f["pattern_name"] == shape}
+
+    assert flagged == {"tests/test_secret_scan.py", "src/elsewhere.py"}, f"{shape}: {sorted(flagged)}"
+
+
+@pytest.mark.parametrize(("shape", "probe"), sorted(HEURISTIC_PROBES.items()))
+def test_the_per_line_marker_is_the_only_suppression_left(tmp_path, shape: str, probe: str) -> None:
+    """And it is sufficient: verified on all seven shapes, at both paths."""
+    marked = probe + "  # secretsallow\n"
+    root = _repo_with(
+        tmp_path,
+        {"tests/test_secret_scan.py": marked.encode(), "src/elsewhere.py": marked.encode()},
+    )
+
+    assert secret_scan.scan_repo(root) == []
+
+
+def test_scan_text_takes_no_path_conditional_argument() -> None:
+    """``skip_heuristics`` is gone, not defaulted to False. A parameter that
+    narrows the catalogue by path is a parameter someone can pass again."""
+    import inspect
+
+    assert list(inspect.signature(secret_scan.scan_text).parameters) == ["rel_path", "text"]
+    assert not hasattr(secret_scan, "_HEURISTIC_EXEMPT_FILES")
+    assert not hasattr(secret_scan, "_is_heuristic_exempt")
+    assert "heuristics_suppressed" not in secret_scan.RepoScan._fields
+
+
+def test_every_heuristic_name_is_a_real_catalogue_entry() -> None:
+    """A rename in ``SECRET_PATTERN_DEFS`` must not silently empty the
+    vendor/heuristic split. The two lists live apart so the catalogue stays a
+    verbatim port, which is exactly the drift this pins."""
     catalogue = {d["name"] for d in secret_scan.SECRET_PATTERN_DEFS}
 
     assert secret_scan.HEURISTIC_PATTERN_NAMES <= catalogue
     vendor = catalogue - secret_scan.HEURISTIC_PATTERN_NAMES
     # Every provider family in the reproduction matrix has to be on the vendor
-    # side, or suppressing "heuristics" would still hide a real credential.
+    # side: the split still drives severity and the marker's usage guidance.
     for name in (
         "Anthropic OAuth Token",
         "Anthropic API Key",
@@ -265,23 +328,7 @@ def test_every_suppressed_name_is_a_real_catalogue_entry() -> None:
         "PyPI Token",
         "Private Key",
     ):
-        assert name in vendor, f"{name} would be suppressed on the exempt path"
-
-
-def test_heuristic_shapes_are_still_suppressed_on_the_exempt_path() -> None:
-    """Conservation: the half of the argument that was always sound.
-
-    A fixture line asserting that ``SECRET = "<value>"`` fires the generic rule
-    is doing its job. Suppressed only where the exemption applies -- the same
-    line anywhere else is a finding.
-    """
-    line = 'API_SECRET = "aB3xQ7zRt9LmZp2w"'  # secretsallow
-
-    exempt = secret_scan.scan_text("tests/test_secret_scan.py", line, skip_heuristics=True)
-    elsewhere = secret_scan.scan_text("tests/test_secret_scan.py", line)
-
-    assert exempt == []
-    assert [f["pattern_name"] for f in elsewhere] == ["Generic Secret Assignment"]
+        assert name in vendor, f"{name} is a vendor shape filed on the heuristic side"
 
 
 def test_a_live_credential_in_this_scanners_own_test_file_is_refused(tmp_path, monkeypatch, capsys) -> None:
@@ -388,7 +435,9 @@ def test_clean_secret_scan_reports_established_and_examined_counts(tmp_path, mon
     assert secret_scan.main([]) == 0
     assert (
         "established 2 candidate paths; examined 2 text files; 0 binary-skipped; "
-        "0 path-skipped; 0 absent; 0 unscannable; 0 heuristics-suppressed; 0 findings" in capsys.readouterr().out
+        "0 path-skipped; 0 absent; 0 unscannable; "
+        f"all {len(secret_scan._COMPILED_PATTERNS)} patterns on every examined file; 0 findings"
+        in capsys.readouterr().out
     )
 
 
@@ -645,12 +694,12 @@ def test_every_candidate_path_lands_in_exactly_one_bucket(tmp_path) -> None:
 
     scan = secret_scan._scan_repo(root)
 
-    # The scanner's own test file is now READ like any other candidate, so it
-    # lands in ``files_examined``. ``heuristics_suppressed`` is a disclosure
-    # about WHICH catalogue ran there, not a bucket outside the denominator.
+    # The scanner's own test file is READ like any other candidate and meets
+    # the whole catalogue there, so it lands in ``files_examined`` and in no
+    # bucket of its own. There is no suppression field left to hide in.
     assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (4, 2, 1)
     assert scan.path_skipped == ("build/generated.py",)
-    assert scan.heuristics_suppressed == ("tests/test_secret_scan.py",)
+    assert "heuristics_suppressed" not in scan._fields
     assert scan.unaccounted == 0
 
 

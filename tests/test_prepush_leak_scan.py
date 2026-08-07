@@ -201,18 +201,19 @@ def test_no_mode_and_no_upstream_fails_closed_instead_of_scanning_nothing(repo: 
     assert "no --range or --pre-push-updates" in result.stderr
 
 
-def test_heuristic_suppression_covers_the_exempt_path_across_its_whole_history(repo: Path) -> None:
-    """Reproduces compile-code's own real false-positive shape: a commit adds
-    tests/test_secret_scan.py's f-string template line un-annotated, and a
-    LATER commit adds a '# secretsallow' marker to the tip version. Because
-    the range scan reads every commit's own full blob, the marker at the tip
-    does not retroactively clean the earlier commit.
+def test_an_unresolved_template_placeholder_is_clean_in_every_blob_that_carries_it(repo: Path) -> None:
+    """A range scan reads every commit's own blob, so a marker added at the tip
+    cannot clean an earlier commit. This exercises the shape that does not need
+    one: an un-interpolated ``{secret}`` is template SYNTAX, and the placeholder
+    rule -- not any path exemption -- is what keeps it clean in both blobs.
 
-    This is the measured reason the heuristic half of the exemption survives
-    as a PATH rule rather than becoming per-line markers: three blobs in this
-    repository's own pending push carry the unmarked fixture line, so dropping
-    the path rule outright would refuse a push over a test fixture. The vendor
-    half is not suppressed anywhere -- see the test below."""
+    THE CLAIM THIS TEST USED TO MAKE WAS FALSE. It was named for the per-path
+    heuristic exemption and its docstring said "three blobs in this
+    repository's own pending push carry the unmarked fixture line", offered as
+    the measured reason that exemption had to survive. Re-measured: the pending
+    push carries none, and this scenario passes with the exemption removed
+    because it never depended on it. The exemption is gone; the scenario is
+    still worth pinning, under a name that says what it actually proves."""
     base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
     _commit(
         repo,
@@ -224,7 +225,7 @@ def test_heuristic_suppression_covers_the_exempt_path_across_its_whole_history(r
         repo,
         "tests/test_secret_scan.py",
         "hits = _detect(f\"API_KEY = '{secret}'\")  # f-string template  # secretsallow\n",
-        "suppress the gate's own test-helper false positive",
+        "annotate the gate's own test-helper line",
     )
 
     result = _run(repo, "--range", f"{base}..{tip}")
@@ -232,21 +233,42 @@ def test_heuristic_suppression_covers_the_exempt_path_across_its_whole_history(r
     assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
 
 
-def test_heuristic_suppression_is_one_file_not_a_directory(repo: Path) -> None:
-    """The allowlist must not silently widen into 'tests/ is exempt' -- a
-    DIFFERENT file under tests/ carrying a real credential-shaped secret must
-    still be caught."""
+def test_no_path_is_exempt_from_the_catalogue(repo: Path) -> None:
+    """The inverse of a measured exposure, pinned at the range arm.
+
+    Measured before the per-path rule was removed: all seven heuristic shapes,
+    committed at ``tests/test_secret_scan.py``, were reported clean by this
+    scanner with exit 0, while the same lines at any other path exited 2. The
+    path decided the verdict. It no longer does -- and an unrelated file under
+    ``tests/`` was never exempt either, which is the half that already worked.
+    """
     base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
-    leak_secret = "AKIA" + "W" * 16
-    tip = _commit(
+    heuristic = "api" + "_secret = " + '"aB3xQ7zRt9LmZp2w"'
+    vendor = "AKIA" + "W" * 16
+
+    at_the_old_exempt_path = _commit(
+        repo, "tests/test_secret_scan.py", heuristic + "\n", "commit a heuristic shape at the former exempt path"
+    )
+    result = _run(repo, "--range", f"{base}..{at_the_old_exempt_path}")
+    assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stderr}"
+    assert "Generic Secret Assignment" in result.stderr
+
+    marked = _commit(
+        repo,
+        "tests/test_secret_scan.py",
+        heuristic + "  # secretsallow\n",
+        "annotate it per line, which is the only suppression left",
+    )
+    result = _run(repo, "--range", f"{at_the_old_exempt_path}..{marked}")
+    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stderr}"
+
+    elsewhere = _commit(
         repo,
         "tests/test_something_else.py",
-        f'AWS_KEY = "{leak_secret}"\n',
+        f'AWS_KEY = "{vendor}"\n',
         "accidentally commit a real-shaped secret in an unrelated test file",
     )
-
-    result = _run(repo, "--range", f"{base}..{tip}")
-
+    result = _run(repo, "--range", f"{marked}..{elsewhere}")
     assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stderr}"
     assert "tests/test_something_else.py" in result.stderr
 
