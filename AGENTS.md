@@ -64,6 +64,29 @@ what.
   Several of those memos record measurements that contradict claims made
   elsewhere — read them before trusting a number you did not measure.
 
+## Measured numbers in comments
+
+A comment that states a quantity measured from THIS repository — a blob
+size, a commit count, a candidate count, a reachable-object count — must
+name the commit it was measured at, or be pinned by a test that
+re-derives it. Present-tense claims about live state ("the largest blob
+anywhere in this repository's history is 191 KB", "0 binary blobs across
+this repository's 424 commits") stop being true the next time the
+repository grows, and nothing can see it: no runtime assertion, no lint
+rule and no reviewer diff reads a comment. Four of the eight such claims
+sampled in one audit had already drifted, and the repository had shown it
+cannot self-correct by hand — one file explicitly retracted another
+file's "424 commits" figure and left the false number standing at its own
+site.
+
+Write it as a dated observation instead — `measured at c003a08, 517
+distinct blobs reachable from every ref` — so it stays true rather than
+silently stopping. `tests/test_measured_claims.py` enforces this over
+every tracked `.py` comment and docstring. It checks only that a live-repo
+quantity carries an anchor, never that the anchored number is still
+correct; re-deriving each figure would need git plumbing per claim and
+would fail on a shallow clone.
+
 ## Releases
 
 GitHub is the source of truth. PyPI publish is owner-gated (no token on the

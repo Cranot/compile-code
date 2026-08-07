@@ -60,8 +60,12 @@ MAX_VERIFY_STDERR_BYTES = 64 * 1024
 MAX_ROAM_VERSION_BYTES = 8 * 1024
 MAX_ROAM_EXECUTABLE_BYTES = 64 * 1024 * 1024
 # `claude` is a bundled single-file runtime (Node/Bun + embedded assets), not a
-# small pip console-script stub like roam's -- a real install was observed at
-# ~265 MiB. Reusing MAX_ROAM_EXECUTABLE_BYTES here would make _content_digest
+# small pip console-script stub like roam's -- a real install measured 272 MiB
+# (284,981,920 bytes) on 2026-08-07, up from the ~265 MiB an earlier reading of
+# this comment recorded. The observation is dated because it tracks someone
+# else's release cadence and will keep moving; the ceiling below is sized with
+# headroom rather than to the reading, so the drift costs nothing.
+# Reusing MAX_ROAM_EXECUTABLE_BYTES here would make _content_digest
 # refuse to hash it at all and turn every real launch into a false "content
 # could not be verified" refusal. Sized with real headroom above the observed
 # binary, not tightly to it.
@@ -2292,8 +2296,8 @@ def _claude(ctx: click.Context, agent_args: tuple[str, ...], read_only: bool, al
     # for the residual window that remains even with the digest in place).
     #
     # Cost is not roam-sized: roam's console-script stub is tens of KB, but a
-    # real `claude` install is a bundled single-file runtime -- observed at
-    # ~265 MiB -- and this function hashes it twice per launch (here and in
+    # real `claude` install is a bundled single-file runtime -- 272 MiB when
+    # measured on 2026-08-07 -- and this function hashes it twice per launch (here and in
     # the final recheck below). Measured on that real install: ~0.6-1.0s per
     # hash, so up to ~1.2-2s of added latency per `compile claude` launch.
     # That is real, user-visible cost, not the sub-millisecond figure the

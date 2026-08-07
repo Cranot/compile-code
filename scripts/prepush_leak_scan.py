@@ -145,8 +145,14 @@ _SCAN_BATCH_LINES = 512
 # anything here sees it, so skipping the decode saved no allocation at all).
 # Measured end-to-end throughput of the two catalogues on this machine is
 # ~1 MiB/s for line-dense text and ~4 MiB/s for minified single-line text, so
-# 16 MiB bounds one pathological blob at roughly 16 seconds. For scale, the
-# largest blob anywhere in this repository's history is 191 KB.
+# 16 MiB bounds one pathological blob at roughly 16 seconds. For scale, measured
+# at c003a08 the largest blob reachable from any ref in this repository is
+# 202,290 bytes (~198 KiB, a revision of scripts/release_artifacts.py), so the
+# ceiling sits about 83x above anything that has ever been committed here. The
+# figure is anchored to a commit on purpose: it tracks the largest FILE in the
+# tree and moves every time that file is edited, and the unanchored form of this
+# sentence had already drifted by two revisions of that same file before anyone
+# noticed.
 _SCAN_CEILING_BYTES = 16 * 1024 * 1024
 
 # The three dispositions a blob can have. Explicitly three-valued: the defect
@@ -878,8 +884,15 @@ def main(argv: list[str]) -> int:
     # argument that those bytes were READ and classified -- but classifying is
     # not matching, and no pattern from either catalogue ever ran over them. A
     # blob that publishes unread publishes permanently, whatever the reason it
-    # went unread. Measured: 0 binary blobs across this repository's 424
-    # commits, so the refusal costs nothing that has ever been pushed here.
+    # went unread. Measured at c003a08: of the 517 distinct blobs reachable
+    # from every ref (442 commits from HEAD, 452 across all refs), 0 are
+    # classified binary by ``inventory.is_binary_content`` -- so the refusal
+    # costs nothing that has ever been pushed here. Five of those blobs do
+    # carry a NUL byte (historical revisions of CHANGELOG.md); they are read
+    # rather than skipped because ``is_utf16_text`` accepts NUL-padded content
+    # that is valid UTF-8 once the padding is removed, and ``decode_views``
+    # then scans both the raw and NUL-stripped views. The earlier form of this
+    # sentence claimed "424 commits", which reproduced under no counting rule.
     #
     # The surface counts ride here too. ``0 commits in range`` was a true
     # sentence printed at exit 0 for a push that published a brand-new tag

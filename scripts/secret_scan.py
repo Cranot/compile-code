@@ -734,13 +734,16 @@ def _scan_repo(root: Path) -> RepoScan:
             # and, through ``check.leak_scan``, every local push, until it is
             # deleted or gitignored. ``.gitignore`` here carries directory
             # names only, no suffix rules, so nothing catches those by default.
-            # What IS zero, re-measured at this commit: 0 of 51 candidates are
-            # binary, and 0 of the 480 distinct blobs reachable from every ref
+            # What IS zero, measured at c003a08: 0 of 52 candidates are binary,
+            # and 0 of the 517 distinct blobs reachable from every ref
             # (``git rev-list --objects --all``) are binary -- so nothing ever
             # committed here refuses, which is a narrower claim than the one
-            # that shipped. The "424 commits" in that claim reproduces under no
-            # counting rule; the repository had 426 commits reachable from HEAD
-            # when it was written.
+            # that shipped. Both numbers are anchored to a commit because both
+            # move whenever the repository does: the unanchored form of this
+            # note said 51 and 480, and it had drifted before anyone read it
+            # again. The "424 commits" in the claim it replaced reproduces
+            # under no counting rule; the repository had 426 commits reachable
+            # from HEAD when that sentence was written.
             binary_skipped += 1
             findings.append(
                 _unscannable_finding(
