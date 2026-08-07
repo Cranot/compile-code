@@ -2093,6 +2093,46 @@ class TestVerifyReceiptV3Protocol:
         assert self._validate(json.dumps(envelope)) == envelope
         assert "1 changed file" in mod._render_verify_envelope(envelope)
 
+    def test_accepts_an_indexed_doc_in_scope(self):
+        # Measured against roam-code 13.10.0 (the pinned floor) on this repo's
+        # own tree with README.md in the changed set. roam indexes docs, so a
+        # non-code target can resolve: `_verify_scope_summary` derives
+        # unresolved as target_count - len(file_map) and omits the key at zero,
+        # and never couples non_code_file_count to it.
+        mod._validate_verify_scope_summary(
+            {
+                "target_file_count": 3,
+                "indexed_file_count": 3,
+                "non_code_file_count": 1,
+                "non_code_scope_definition": mod._VERIFY_NON_CODE_SCOPE_DEFINITION,
+            },
+            expected_count=3,
+            files_checked=3,
+        )
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            # roam emits the block only when a doc or an unresolved file exists.
+            {"target_file_count": 3, "indexed_file_count": 3, "non_code_file_count": 0},
+            # files_checked is len(file_map), so it must equal indexed_file_count.
+            {"target_file_count": 3, "indexed_file_count": 2, "non_code_file_count": 1},
+            # indexed + unresolved is the target count by construction.
+            {
+                "target_file_count": 3,
+                "indexed_file_count": 3,
+                "non_code_file_count": 1,
+                "unresolved_file_count": 1,
+            },
+            # a non-code count larger than the scope it counts is not arithmetic.
+            {"target_file_count": 3, "indexed_file_count": 3, "non_code_file_count": 4},
+        ],
+        ids=["block-without-a-reason", "checked-exceeds-indexed", "counts-do-not-add-up", "non-code-exceeds-scope"],
+    )
+    def test_scope_accounting_still_has_to_add_up(self, scope):
+        with pytest.raises(ValueError, match="scope_binding"):
+            mod._validate_verify_scope_summary(scope, expected_count=3, files_checked=3)
+
     def test_rejects_audit_exact_contradictory_two_line_canary(self):
         raw = "VERDICT: PASS (score 100/100) -- no issues\nVERDICT: SKIPPED -- checks did not run\n"
         with pytest.raises(ValueError):
@@ -2447,7 +2487,7 @@ class TestVerifyReceiptV3Protocol:
         (tmp_path / "a.py").write_bytes(b"print('a')\n")
         (tmp_path / "b.py").write_bytes(b"print('b')\n")
 
-        root, targets, receipt, env = mod._prepare_verify_request(("b.py", "a.py", "a.py"))
+        root, targets, receipt, env, _excluded = mod._prepare_verify_request(("b.py", "a.py", "a.py"))
 
         a_digest = mod.hashlib.sha256(b"print('a')\n").hexdigest()
         b_digest = mod.hashlib.sha256(b"print('b')\n").hexdigest()
@@ -2469,7 +2509,7 @@ class TestVerifyReceiptV3Protocol:
         (tmp_path / " leading.py").write_bytes(b"leading-space\n")
         (tmp_path / "leading.py").write_bytes(b"different-file\n")
 
-        root, targets, receipt, _env = mod._prepare_verify_request((" leading.py",))
+        root, targets, receipt, _env, _excluded = mod._prepare_verify_request((" leading.py",))
 
         digest = mod.hashlib.sha256(b"leading-space\n").hexdigest()
         payload = json.dumps([[" leading.py", f"sha256:{digest}"]], ensure_ascii=False, separators=(",", ":"))
@@ -2572,6 +2612,128 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError):
             mod._verification_scope_paths(["safe.py", "bad\nname.py"])
 
+    def test_tool_state_directories_are_not_source_for_discovery(self):
+        kept, excluded = mod._partition_non_source_scope(
+            [
+                ".roam/index.db",
+                ".roam/index.db-wal",
+                "src/a.py",
+                "node_modules/pkg/index.js",
+                "__pycache__/cli.cpython-313.pyc",
+                "app/.venv/lib/site.py",
+                ".roamignore",
+                "venv",
+                "tools/venvsetup.py",
+            ]
+        )
+
+        assert kept == [
+            "src/a.py",
+            ".roamignore",
+            "venv",
+            "tools/venvsetup.py",
+        ]
+        assert excluded == [
+            ".roam/index.db",
+            ".roam/index.db-wal",
+            "node_modules/pkg/index.js",
+            "__pycache__/cli.cpython-313.pyc",
+            "app/.venv/lib/site.py",
+        ]
+
+    def test_descent_and_discovery_share_one_non_source_directory_set(self):
+        # Two sets would be free to drift, and the drift is invisible: descent
+        # would refuse a directory that discovery had already handed to roam.
+        assert "NON_SOURCE_SCOPE_DIRECTORIES" in inspect.getsource(mod._expand_verify_targets)
+        assert "NON_SOURCE_SCOPE_DIRECTORIES" in inspect.getsource(mod._partition_non_source_scope)
+        assert ".roam" in mod.NON_SOURCE_SCOPE_DIRECTORIES
+
+    def test_changed_scope_excludes_roams_own_live_index(self, monkeypatch, tmp_path):
+        # A project that does not gitignore .roam/ makes `git status -uall`
+        # report roam's live SQLite index as changed work. Binding it as a
+        # verify target can never succeed -- the WAL moves while roam reads it.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".roam").mkdir()
+        for name in ("index.db", "index.db-shm", "index.db-wal", "index.lock", "index.state"):
+            (tmp_path / ".roam" / name).write_bytes(b"tool-state\n")
+        (tmp_path / "alpha.py").write_bytes(b"print('a')\n")
+        discovered = [
+            ".roam/index.db",
+            ".roam/index.db-shm",
+            ".roam/index.db-wal",
+            ".roam/index.lock",
+            ".roam/index.state",
+            "alpha.py",
+        ]
+        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: list(discovered))
+
+        _root, targets, receipt, env, excluded = mod._prepare_verify_request(())
+
+        assert targets == ["alpha.py"]
+        assert env["ROAM_VERIFY_SCOPE_COUNT"] == "1"
+        assert receipt["target_file_count"] == 1
+        assert sorted(excluded) == sorted(discovered[:5])
+
+    def test_explicit_targets_are_never_silently_dropped(self, monkeypatch, tmp_path):
+        # Discovery guesses at scope, so it may filter; an explicit path is the
+        # caller's stated intent and must be verified or refused, never dropped.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".roam").mkdir()
+        (tmp_path / ".roam" / "index.db").write_bytes(b"tool-state\n")
+
+        _root, targets, _receipt, _env, excluded = mod._prepare_verify_request((".roam/index.db",))
+
+        assert targets == [".roam/index.db"]
+        assert excluded == []
+
+    def test_verify_discloses_that_it_narrowed_the_changed_scope(self, runner, monkeypatch, compatible_roam, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "alpha.py").write_bytes(b"print('a')\n")
+        monkeypatch.setattr(
+            mod,
+            "_discover_verify_targets",
+            lambda _root: [".roam/index.db", "node_modules/pkg/index.js", "alpha.py"],
+        )
+        monkeypatch.setattr(mod, "_delegate_capturing", lambda *args, **kwargs: (0, None))
+
+        result = runner.invoke(mod.cli, ["verify", "--changed"])
+
+        assert "2 changed path(s)" in result.output
+        assert "node_modules" in result.output
+        assert ".roam" in result.output
+        assert "Traceback" not in result.output
+
+    def test_tool_state_only_change_names_the_remedy_that_works(self, runner, monkeypatch, compatible_roam, tmp_path):
+        # Nothing source changed, so verify delegates --changed and roam
+        # rediscovers the same tool state. .gitignore is the only real fix.
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: [".roam/index.db", ".roam/index.db-wal"])
+        monkeypatch.setattr(mod, "_delegate_capturing", lambda *args, **kwargs: (5, "{}"))
+
+        result = runner.invoke(mod.cli, ["verify", "--changed"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "no source path changed" in result.output
+        assert "Add .roam/ to .gitignore" in result.output
+        assert "Traceback" not in result.output
+
+    def test_scope_instability_verdict_does_not_prescribe_a_roam_upgrade(self):
+        # These two reasons are raised by this CLI's own post-run recheck, never
+        # by roam's receipt, so a newer roam cannot be the remedy.
+        for reason in ("post_verify_content_changed", "post_verify_scope_changed"):
+            verdict = mod._verify_protocol_verdict(
+                ValueError(reason),
+                executable="roam",
+                targets=["a.py"],
+            )
+            assert "pip install --upgrade" not in verdict
+            assert "changed while verify ran" in verdict
+            assert reason in verdict
+
     @pytest.mark.parametrize("unsafe", ["../escape", "bad\nname.py", "bad\udcff.py"])
     def test_prepare_rejects_unsafe_scope_before_any_filesystem_expansion(self, monkeypatch, tmp_path, unsafe):
         monkeypatch.chdir(tmp_path)
@@ -2637,7 +2799,7 @@ class TestVerifyReceiptV3Protocol:
         monkeypatch.setattr(
             mod,
             "_prepare_verify_request",
-            lambda files: (tmp_path, ["src/a.py"], expected, env),
+            lambda files: (tmp_path, ["src/a.py"], expected, env, []),
         )
         monkeypatch.setattr(
             mod,

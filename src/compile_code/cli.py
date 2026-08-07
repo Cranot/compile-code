@@ -67,6 +67,16 @@ MAX_ROAM_EXECUTABLE_BYTES = 64 * 1024 * 1024
 # binary, not tightly to it.
 MAX_CLAUDE_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
+# Directories that carry tool state, dependencies or build output rather than
+# source. Changed-file discovery runs `git status --untracked-files=all`, which
+# names every FILE inside an untracked directory -- so a project that does not
+# gitignore `.roam/` hands roam its own live SQLite index (index.db, -wal, -shm,
+# index.lock, index.state) as changed work. That scope can never verify: the WAL
+# moves while roam reads it, the run reports itself incomplete, and the refusal
+# blames the roam version for a scope defect no upgrade can fix. Bounded
+# directory descent already refuses to enter these; discovery has to agree, or
+# the two disagree about what source is.
+NON_SOURCE_SCOPE_DIRECTORIES = frozenset({".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"})
 MAX_STRICT_JSON_DEPTH = 128
 _VERIFY_CAPTURE_CHUNK_BYTES = 64 * 1024
 _VERIFY_TERMINATION_GRACE_SECONDS = 1.0
@@ -2717,7 +2727,7 @@ def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
 
     seen = set(expanded)
     seen_directories: set[str] = set()
-    skip_dirs = {".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"}
+    skip_dirs = NON_SOURCE_SCOPE_DIRECTORIES
     pending = deque(path for _relative, path in directories)
     directory_count = 0
     entry_count = 0
@@ -2855,6 +2865,65 @@ def _discover_verify_targets(root: Path) -> list[str]:
     if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
         raise ValueError("changed_file_discovery_failed")
     return _parse_verify_status_paths(proc.stdout or b"")
+
+
+def _partition_non_source_scope(paths: list[str]) -> tuple[list[str], list[str]]:
+    """Split discovered paths into source and tool state, preserving order.
+
+    A path is tool state when any of its DIRECTORY components is one of
+    ``NON_SOURCE_SCOPE_DIRECTORIES``; the final component is deliberately
+    exempt, so a tracked file named ``venv`` or ``.roamignore`` stays in scope.
+    """
+    source: list[str] = []
+    tool_state: list[str] = []
+    for path in paths:
+        parents = PurePosixPath(path).parts[:-1]
+        if any(part in NON_SOURCE_SCOPE_DIRECTORIES for part in parents):
+            tool_state.append(path)
+        else:
+            source.append(path)
+    return source, tool_state
+
+
+def _narrowed_scope_notice(excluded: list[str]) -> str:
+    """Name what discovery dropped, so a narrowed scope is never silent.
+
+    Only directory names from ``NON_SOURCE_SCOPE_DIRECTORIES`` are printed --
+    never the discovered paths themselves, which are producer-supplied text this
+    surface does not replay.
+    """
+    matched = sorted(
+        {part for path in excluded for part in PurePosixPath(path).parts[:-1] if part in NON_SOURCE_SCOPE_DIRECTORIES}
+    )
+    names = ", ".join(matched) or "tool-state directories"
+    return (
+        f"note: {len(excluded)} changed path(s) under {names} are tool state, not source, "
+        "and were excluded from the verification scope."
+    )
+
+
+def _unignored_tool_state_note(excluded: list[str]) -> str:
+    """Explain the one failure this narrowing cannot repair, with a real remedy.
+
+    With no source path left, verify has nothing to bind and delegates
+    ``--changed`` to roam, which re-discovers the same tool state under its own
+    rules. When roam does not ignore it either, the run cannot bind its scope --
+    and no roam version fixes that, because the project is asking both tools to
+    verify a live index. Ignoring it is the remedy that works.
+    """
+    matched = sorted(
+        {part for path in excluded for part in PurePosixPath(path).parts[:-1] if part in NON_SOURCE_SCOPE_DIRECTORIES}
+    )
+    names = " ".join(f"{name}/" for name in matched) or "those directories"
+    return (
+        "note: no source path changed, so `roam verify --changed` rediscovered the excluded tool state itself. "
+        f"Add {names} to .gitignore and rerun `compile verify --changed`."
+    )
+
+
+def _discovered_scope(root: Path) -> tuple[list[str], list[str]]:
+    """Discover the changed scope and split it once, for every caller alike."""
+    return _partition_non_source_scope(_verification_scope_paths(_discover_verify_targets(root)))
 
 
 def _verification_scope_paths(targets: list[str]) -> list[str]:
@@ -3037,10 +3106,18 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _prepare_verify_request(files: tuple[str, ...]) -> tuple[Path, list[str], dict[str, object], dict[str, str]]:
+def _prepare_verify_request(
+    files: tuple[str, ...],
+) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
     root = _verification_root()
-    raw_targets = list(files) if files else _discover_verify_targets(root)
-    requested_targets = _verification_scope_paths(raw_targets)
+    excluded: list[str] = []
+    if files:
+        # An explicit path is the caller's stated intent: verify it or refuse
+        # it, never quietly drop it. Only discovery, which guesses at scope,
+        # narrows.
+        requested_targets = _verification_scope_paths(list(files))
+    else:
+        requested_targets, excluded = _discovered_scope(root)
     targets = _verification_scope_paths(_expand_verify_targets(requested_targets, root))
     if len(targets) > MAX_VERIFY_TARGETS or sum(len(path) + 1 for path in targets) > MAX_VERIFY_ARG_CHARS:
         raise ValueError("verification_scope_too_large")
@@ -3068,7 +3145,7 @@ def _prepare_verify_request(files: tuple[str, ...]) -> tuple[Path, list[str], di
             "ROAM_AGENT_CONTRACT_BLOCK": "1",
         }
     )
-    return root, targets, expected, env
+    return root, targets, expected, env, excluded
 
 
 def _plain_int(value: object, *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -3210,12 +3287,18 @@ def _validate_verify_scope_summary(scope: object, *, expected_count: int, files_
     indexed_count = _plain_int(scope.get("indexed_file_count"))
     non_code_count = _plain_int(scope.get("non_code_file_count"))
     unresolved_count = _plain_int(scope.get("unresolved_file_count", 0))
+    # Roam derives the block arithmetically: unresolved is target_count minus
+    # the indexed file map (omitted at zero) and non_code counts doc surfaces
+    # among the SAME targets, resolved or not. The two are independent, so
+    # requiring `non_code <= unresolved` -- or any unresolved file at all --
+    # refused every changed set that included an INDEXED doc, which is what a
+    # touched README is. The accounting still has to close exactly.
     if (
         target_count != expected_count
         or indexed_count != files_checked
         or indexed_count + unresolved_count != expected_count
-        or non_code_count > unresolved_count
-        or unresolved_count == 0
+        or non_code_count > expected_count
+        or not (non_code_count or unresolved_count)
     ):
         raise ValueError("scope_binding")
     definition = scope.get("non_code_scope_definition")
@@ -3627,6 +3710,16 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
             f"cannot read (reads {VERIFY_ENVELOPE_SCHEMA} {VERIFY_ENVELOPE_SCHEMA_VERSION} and later same-major "
             "shapes). Fix: python -m pip install --upgrade compile-code"
         )
+    if reason in {"post_verify_content_changed", "post_verify_scope_changed"}:
+        # Raised by this CLI's own post-run recheck, never by roam's receipt:
+        # the tree moved under a completed run. Prescribing a roam upgrade here
+        # sends the caller after a version that was already in range.
+        return (
+            f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+            f"scope target indices {indices}; the verification scope changed while verify ran, so the receipt no "
+            "longer describes the tree. Fix: stop anything writing to the worktree and rerun "
+            "`compile verify --changed`"
+        )
     return (
         f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
         f"scope target indices {indices}; executable `{executable}` did not return one complete, bound Verify "
@@ -3685,12 +3778,14 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     if advisory:
         click.echo(advisory)
     try:
-        root, bound_targets, expected_receipt, verify_env = _prepare_verify_request(files)
+        root, bound_targets, expected_receipt, verify_env, excluded = _prepare_verify_request(files)
     except (UnicodeError, ValueError) as exc:
         click.echo(
             _unsafe_scope_verdict(exc) or (_verify_protocol_verdict(exc, executable=str(executable), targets=targets))
         )
         raise SystemExit(EXIT_TOOLCHAIN)
+    if excluded:
+        click.echo(_narrowed_scope_notice(excluded))
 
     argv = ["--json", "verify"]
     if new_only:
@@ -3717,8 +3812,9 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         )
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
-        post_raw_targets = list(files) if files else _discover_verify_targets(root)
-        post_requested_targets = _verification_scope_paths(post_raw_targets)
+        # Recompute through the SAME narrowing as the request, or a repo whose
+        # scope was narrowed would fail post_verify_scope_changed on every run.
+        post_requested_targets = _verification_scope_paths(list(files)) if files else _discovered_scope(root)[0]
         post_targets = _verification_scope_paths(_expand_verify_targets(post_requested_targets, root))
         if post_targets != bound_targets:
             raise ValueError("post_verify_scope_changed")
@@ -3727,6 +3823,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             _unsafe_scope_verdict(exc)
             or (_verify_protocol_verdict(exc, executable=str(executable), targets=bound_targets))
         )
+        if excluded and not bound_targets:
+            click.echo(_unignored_tool_state_note(excluded))
         raise SystemExit(EXIT_TOOLCHAIN)
     rendered = _render_verify_envelope(envelope)
     click.echo(rendered)
