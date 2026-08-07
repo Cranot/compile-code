@@ -547,11 +547,30 @@ def _scan_repo(root: Path) -> RepoScan:
             findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
         if is_binary_content(data):
-            # Non-fatal, and disclosed in the denominator: the bytes WERE read
-            # and classified. That is a decision about this content, not an
-            # admission the scanner never looked -- the distinction the suffix
-            # list it replaced could not make.
+            # FAIL CLOSED. Classifying bytes is not matching them: no pattern
+            # in this catalogue ever ran over this file, so "0 findings" for it
+            # is a verdict this scan did not compute. It stayed non-fatal on
+            # the argument that the bytes WERE read -- and the only guard was
+            # the range-global ``files_examined == 0`` floor below, which a
+            # single readable companion file defeats. Measured over the real
+            # 51-file tree: a NUL-prefixed blob carrying an ``sk-ant-oat01-``
+            # token in an ``--index-url`` line printed PASS with exit 0, its
+            # existence disclosed as nothing but ``1 binary-skipped``.
+            #
+            # Conservation is kept by the FINDING, not by the skip: the bytes
+            # are still never pattern-matched, so this is one line naming a
+            # path rather than catalogue noise from every committed image.
+            # Measured cost of the refusal when it landed: 0 tracked files in
+            # this repository are binary, and 0 binary blobs appear anywhere in
+            # its 424 commits of history.
             binary_skipped += 1
+            findings.append(
+                _unscannable_finding(
+                    rel_path,
+                    "tracked binary content: no pattern catalogue can read these bytes -- "
+                    "untrack it (git rm --cached) rather than tracking content no gate can inspect",
+                )
+            )
             continue
         files_examined += 1
         prior_view_findings: set[tuple[object, ...]] = set()

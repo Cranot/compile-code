@@ -356,12 +356,20 @@ def test_utf16_blob_in_pushed_history_is_scanned(repo: Path, label: str, encode)
     assert "cred.md" in result.stderr
 
 
-def test_binary_blobs_are_still_skipped(repo: Path) -> None:
-    """Conservation check: widening the text rule must not swallow binary.
+def test_binary_blobs_are_not_pattern_matched_but_refuse_the_push(repo: Path) -> None:
+    """Conservation AND fail-closed, on the history arm.
 
-    Without this, "decode everything" would pass the UTF-16 tests above while
-    burying the gate in noise from every committed PNG and object file. A fix
-    that makes everything loud is not a fix.
+    Conservation survives: a binary blob still produces no credential-shaped
+    finding, so widening the text rule has not buried the gate in noise from
+    every committed PNG and object file. What changed is the verdict: an
+    unopened blob is refused by name (exit 3, UNSCANNED) instead of riding in
+    a bucket the clean-path condition never consulted.
+
+    Why that mattered: ``binary_skipped`` was deliberately excluded from the
+    clean condition, which is the same "defeated by a single readable
+    companion" shape this script had already fixed for ``path_filtered``. A
+    NUL-prefixed blob carrying an ``sk-ant-oat01-`` token published under the
+    word "clean", exit 0.
     """
     base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
     png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 8
@@ -371,7 +379,30 @@ def test_binary_blobs_are_still_skipped(repo: Path) -> None:
 
     result = _run(repo, "--range", f"{base}..{tip}")
 
-    assert result.returncode == 0, f"binary blobs produced findings:\n{result.stderr}"
+    # Exit 3 is "read nothing here", not 2 ("found a credential"): the bytes
+    # produced no pattern hits, which is the conservation half of this test.
+    assert result.returncode == 3, f"unopened blobs reported clean (exit {result.returncode}):\n{result.stdout}"
+    assert "image.dat" in result.stderr and "object.dat" in result.stderr
+
+
+def test_binary_blob_beside_a_readable_companion_still_refuses(repo: Path) -> None:
+    """The escape a range-global denominator cannot see.
+
+    One readable file in the same commit puts ``opened`` above zero, so any
+    guard keyed on "the whole range went unread" passes. The refusal is
+    per-blob for exactly that reason.
+    """
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    token = "sk-" + "ant-" + "oat" + "01-" + "Aa7_-" * 12
+    probe = b"\x00\x80" + f"index-url = https://__token__:{token}@pypi.example.invalid/simple\n".encode()
+    (repo / "companion.txt").write_text("plainly readable\n", encoding="utf-8")
+    _git(repo, "add", "companion.txt")
+    tip = _commit_bytes(repo, "release/toolstate.dat", probe, "add tool state beside a readable file")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 3, f"a readable companion rescued an unopened blob:\n{result.stdout}"
+    assert "release/toolstate.dat" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -495,18 +526,21 @@ def test_clean_verdict_publishes_its_denominator(repo: Path) -> None:
     assert "bytes" in result.stdout, result.stdout
 
 
-def test_binary_skips_are_disclosed_not_invisible(repo: Path) -> None:
-    """Binary stays non-fatal (see the conservation test above), but it stops
-    being invisible: a reader of the clean verdict can see that some content
-    was classified rather than pattern-matched."""
+def test_binary_skips_are_named_in_the_refusal_not_only_counted(repo: Path) -> None:
+    """Disclosure was never the missing half -- action was.
+
+    The count ``1 binary-skipped`` printed on the clean line for a whole
+    release cycle. A number nothing keys a verdict on is not a gate, so the
+    blob is now named in a refusal and the denominator still rides with it.
+    """
     base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
     tip = _commit_bytes(repo, "object.dat", b"\x7fELF\x02\x01\x01" + bytes(range(256)) * 8, "add an object blob")
 
     result = _run(repo, "--range", f"{base}..{tip}")
 
-    assert result.returncode == 0, result.stderr
-    assert "1 binary-skipped" in result.stdout, result.stdout
-    assert "object.dat" in result.stdout, "a skipped blob is not named anywhere in the verdict"
+    assert result.returncode == 3, result.stdout
+    assert "1 binary-skipped" in result.stderr, result.stderr
+    assert "object.dat" in result.stderr, "a skipped blob is not named anywhere in the verdict"
 
 
 def test_credential_committed_under_a_binary_looking_name_is_read(repo: Path) -> None:

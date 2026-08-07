@@ -152,13 +152,14 @@ class _Ledger:
     next to how many blobs and bytes produced it -- this scanner has already
     demonstrated once that it can report clean having decoded nothing.
 
-    The counts are split by WHY content went unread, because those states are
-    not equivalent. ``binary_skipped`` bytes were read and classified.
-    ``path_filtered`` bytes were never opened -- a decision from the path
-    alone -- which is the same epistemic state as ``unanalyzable``, and is now
-    treated the same way: a non-empty ``path_filtered`` refuses. ``considered``
-    and ``opened`` remain, but only to say in the refusal whether the whole
-    range or part of it went unread.
+    The counts are split by WHY content went unread, because the remedies
+    differ -- but every one of them now REFUSES, because the epistemic state
+    is identical: no pattern from either catalogue was applied to those bytes.
+    ``path_filtered`` was decided from the path alone; ``binary_skipped`` was
+    decided from the bytes; ``unanalyzable`` could not be held at all. The
+    middle one was the last to be acted on, and it was the one a NUL-prefixed
+    credential blob rode out on. ``considered`` and ``opened`` remain, but only
+    to say in the refusal whether the whole range or part of it went unread.
 
     ``corpus_exempt`` is deliberately outside ``considered``. It is one named,
     reviewed path (``scripts/secret_scan.py``'s ``_OWN_TEST_CORPUS_FILES``)
@@ -243,10 +244,11 @@ def _read_blob(data: bytes) -> _Reading:
 
     Genuine binary is still not pattern-matched — the conservation rule from
     the UTF-16 fix, since a gate buried in noise from every committed object
-    file is a gate that gets bypassed — but it is now DISCLOSED in the
-    denominator rather than silently dropped. It stays non-fatal because the
-    bytes were read and classified: that is a decision about this content, not
-    an admission that the scanner could not look.
+    file is a gate that gets bypassed — but the blob is now REFUSED by name
+    rather than counted into a bucket the clean-path condition never read.
+    Disclosure was never the missing half: ``1 binary-skipped`` printed on the
+    clean line while a NUL-prefixed blob carrying an ``sk-ant-oat01-`` token
+    published with the push. Classifying bytes is not matching them.
     """
     if len(data) > _SCAN_CEILING_BYTES:
         return _Reading(_UNANALYZABLE, [], f"exceeds the {_SCAN_CEILING_BYTES}-byte scan ceiling")
@@ -560,14 +562,24 @@ def _print_unread_paths(ledger: _Ledger) -> None:
         sys.stderr.write(f"  {label}  [excluded by path, content never read]\n")
     if len(ledger.path_filtered) > 20:
         sys.stderr.write(f"  ... and {len(ledger.path_filtered) - 20} more\n")
+    # Named, not merely counted. ``1 binary-skipped`` rode on the CLEAN line
+    # for a whole release cycle: a number no verdict is keyed on is a
+    # disclosure, not a gate.
+    for label, size in ledger.binary_skipped[:20]:
+        sys.stderr.write(f"  {label}  {size} bytes  [binary content, never pattern-matched]\n")
+    if len(ledger.binary_skipped) > 20:
+        sys.stderr.write(f"  ... and {len(ledger.binary_skipped) - 20} more\n")
     sys.stderr.write(
         "\n"
         "This is NOT a pass. These blobs publish permanently and no pattern in\n"
         "either catalogue was ever applied to their bytes. Options:\n"
-        "  - Do not publish these paths. They sit under a directory in\n"
-        "    inventory.UNTRACKABLE_DIRECTORY_SEGMENTS, which scripts/check.py's\n"
-        "    artifact_scan fails the build on, so they should not be tracked at\n"
-        "    all: git rm --cached the path and amend or rebase the commit.\n"
+        "  - Do not publish these paths. A path-excluded one sits under a\n"
+        "    directory in inventory.UNTRACKABLE_DIRECTORY_SEGMENTS, which\n"
+        "    scripts/check.py's artifact_scan fails the build on, so it should\n"
+        "    not be tracked at all: git rm --cached the path and amend or\n"
+        "    rebase the commit. A binary one is content no gate in this\n"
+        "    repository can inspect; keep it out of git (release asset, LFS,\n"
+        "    generated at build time).\n"
         "  - Prove them by hand, then bypass this one push deliberately:\n"
         "    git push --no-verify\n"
     )
@@ -740,11 +752,15 @@ def main(argv: list[str]) -> int:
     # unread, and unread content cannot be called clean no matter how many
     # other blobs in the same range were read. The range-global form of this
     # rule was defeated by a single readable companion file.
-    unread_paths = bool(ledger.path_filtered)
+    # ``binary_skipped`` joins ``path_filtered`` here. It was excluded on the
+    # argument that those bytes were READ and classified -- but classifying is
+    # not matching, and no pattern from either catalogue ever ran over them. A
+    # blob that publishes unread publishes permanently, whatever the reason it
+    # went unread. Measured: 0 binary blobs across this repository's 424
+    # commits, so the refusal costs nothing that has ever been pushed here.
+    unread_paths = bool(ledger.path_filtered) or bool(ledger.binary_skipped)
     if not findings and not ledger.unanalyzable and not unread_paths:
         print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
-        for label, size in ledger.binary_skipped:
-            print(f"  skipped (binary, not pattern-matched): {label}  {size} bytes")
         for label in ledger.corpus_exempt:
             print(f"  exempt (scanner's own test corpus): {label}")
         return 0

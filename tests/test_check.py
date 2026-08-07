@@ -707,7 +707,10 @@ def test_tree_scans_report_healthy_inventory_counts(tmp_path, monkeypatch, capsy
     # numbers are different measurements and only the second one used to be
     # printed, which made "0 findings" unfalsifiable. The artifact gate keeps
     # the single count on purpose -- its subject IS the path, not the content.
-    assert "established 2 candidate paths; examined 2 text files; 0 findings" in output
+    # "not read" closes the denominator: the gap between paths established and
+    # files examined is named in the line rather than left for a reader to
+    # subtract. That invisible gap is where a tracked credential sat.
+    assert "established 2 candidate paths; examined 2 text files; 0 not read; 0 findings" in output
     assert output.count("examined 2 candidate paths") == 1
 
 
@@ -745,25 +748,38 @@ def test_leak_gate_carries_a_pattern_for_the_credential_it_publishes_with(tmp_pa
     assert "[PyPI upload token]" in capsys.readouterr().out
 
 
-def test_genuine_binary_stays_unmatched_and_an_all_binary_tree_refuses(tmp_path, monkeypatch, capsys):
-    """Conservation plus the denominator gate in one fixture: real binary is
-    still not pattern-matched, and a tree whose every candidate went unread
-    cannot report PASS -- ``0 findings`` there is a verdict never computed."""
+def test_binary_candidate_refuses_and_a_readable_companion_does_not_rescue_it(tmp_path, monkeypatch, capsys):
+    """Fail closed, and stay closed once a readable file joins the tree.
+
+    The all-binary tree already refused, via the range-global ``examined == 0``
+    floor. That floor is defeated by ONE readable companion file, which is the
+    whole escape: measured over the real 51-file tree, a NUL-prefixed blob
+    carrying an ``sk-ant-oat01-`` token in an ``--index-url`` line printed
+    ``[check] leak scan: PASS (established 52 candidate paths; examined 51 text
+    files; 0 findings)`` -- the credential sitting in the silent remainder
+    between the two numbers.
+
+    Conservation survives: the refusal is one line naming the path, not
+    catalogue noise from pattern-matching arbitrary bytes.
+    """
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
-    (tmp_path / "image.png").write_bytes(png)
-    subprocess.run(["git", "add", "--", "image.png"], cwd=tmp_path, check=True)
+    token = "sk-" + "ant-" + "oat" + "01-" + "Aa7_-" * 12
+    probe = b"\x00\x80" + f"index-url = https://__token__:{token}@pypi.example.invalid/simple\n".encode()
+    (tmp_path / "toolstate.dat").write_bytes(probe)
+    subprocess.run(["git", "add", "--", "toolstate.dat"], cwd=tmp_path, check=True)
     monkeypatch.setattr(check, "ROOT", tmp_path)
 
     assert check.leak_scan() is False
     output = capsys.readouterr().out
-    assert "examined 0 text files; 0 findings" in output
-    assert "would be a verdict this gate did not compute" in output
+    assert "examined 0 text files" in output
+    assert "toolstate.dat  [tracked binary content]" in output
 
     (tmp_path / "readme.md").write_text("benign\n", encoding="utf-8")
     subprocess.run(["git", "add", "--", "readme.md"], cwd=tmp_path, check=True)
-    assert check.leak_scan() is True
-    assert "established 2 candidate paths; examined 1 text files; 0 findings" in capsys.readouterr().out
+    assert check.leak_scan() is False, "one readable companion file turned the unread blob back into a PASS"
+    output = capsys.readouterr().out
+    assert "established 2 candidate paths; examined 1 text files; 1 not read; 1 findings" in output, output
+    assert "toolstate.dat  [tracked binary content]" in output
 
 
 def test_leak_gate_that_finds_nothing_reports_broken_not_pass(tmp_path, monkeypatch, capsys):

@@ -905,7 +905,14 @@ def _leak_scan_file(rel: str) -> tuple[bool, list[str]]:
     except OSError as exc:
         return False, [f"  {rel}  [unreadable tracked file] {exc}"]
     if is_binary_content(data):
-        return False, []
+        # FAIL CLOSED, and name the file. Returning ``(False, [])`` here made
+        # a tracked binary invisible to everything except the range-global
+        # ``examined == 0`` floor, which one readable companion file defeats.
+        # The bytes are still not pattern-matched -- conservation lives in the
+        # single reported line, not in a silent skip.
+        return False, [
+            f"  {rel}  [tracked binary content] no pattern catalogue can read these bytes; untrack it (git rm --cached)"
+        ]
     hits: dict[tuple[int, str], None] = {}
     for view in _scan_views(data):
         for hit in _leak_pattern_hits(view):
@@ -999,17 +1006,33 @@ def leak_scan() -> bool:
     # Publish files READ, not only paths considered: the old line printed
     # "examined N candidate paths" identically whether every one was opened or
     # every one was suffix-skipped unread.
+    #
+    # ``not read`` closes the denominator. The line published two numbers whose
+    # gap a reader had to subtract for themselves, and over the real tree that
+    # gap read "established 52 candidate paths; examined 51 text files" -- the
+    # missing 1 being a tracked file carrying a live-format credential, named
+    # nowhere and bucketed as nothing. Every unread path is now also a hit, so
+    # the count below can never be a remainder nobody accounts for.
+    unread = len(tracked) - examined
     verdict = "PASS" if not hits else "FAIL"
-    if not hits and examined == 0:
+    if not hits and (examined == 0 or unread):
         verdict = "FAIL"
     print(
         f"[check] leak scan: {verdict} "
-        f"(established {len(tracked)} candidate paths; examined {examined} text files; {len(hits)} findings)"
+        f"(established {len(tracked)} candidate paths; examined {examined} text files; "
+        f"{unread} not read; {len(hits)} findings)"
     )
     for h in hits[:10]:
         print(h)
+    if len(hits) > 10:
+        print(f"  ... and {len(hits) - 10} more")
     if not hits and examined == 0:
         print("  no candidate file's content was read; '0 findings' would be a verdict this gate did not compute")
+        return False
+    if not hits and unread:
+        # Belt and braces: a future skip added to ``_leak_scan_file`` that
+        # returns no hit would otherwise reopen exactly this hole silently.
+        print(f"  {unread} candidate path(s) were established but never read, and none of them reported why")
         return False
     return not hits
 

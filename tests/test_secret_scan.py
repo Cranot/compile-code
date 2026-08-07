@@ -352,25 +352,59 @@ def test_pypi_token_in_a_lock_file_is_found(tmp_path) -> None:
     ]
 
 
-def test_genuine_binary_is_still_not_pattern_matched_but_is_disclosed(tmp_path) -> None:
-    """Conservation: deciding from content must not turn every committed PNG
-    into noise. The skip survives -- it is now an observation about the bytes,
-    and it rides in the published denominator."""
+def test_genuine_binary_is_not_pattern_matched_but_is_refused_by_name(tmp_path) -> None:
+    """Conservation AND fail-closed in one fixture.
+
+    Conservation: a real PNG still produces no credential-shaped finding --
+    deciding from content must not turn every committed image into catalogue
+    noise. Fail-closed: it produces an ``Unscannable Tracked File`` finding
+    instead of a silent bucket entry, because no pattern ever ran over those
+    bytes and "0 findings" for them is a verdict this scan did not compute.
+    """
     png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
     root = _repo_with(tmp_path, {"image.png": png, "readme.md": b"benign\n"})
 
     scan = secret_scan._scan_repo(root)
 
     assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (2, 1, 1)
-    assert scan.findings == []
+    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [("image.png", "Unscannable Tracked File")]
+    assert scan.unaccounted == 0
+
+
+def test_binary_credential_beside_one_readable_file_refuses(tmp_path, monkeypatch, capsys) -> None:
+    """The escape the ``examined == 0`` floor could never catch.
+
+    A NUL-prefixed file whose remaining bytes are a live-format credential is
+    classified binary by every gate here, so no catalogue reads it -- and the
+    only guard was a RANGE-GLOBAL floor that a single readable companion file
+    defeats. Measured on the shipped scanner over the real 51-file tree, this
+    exact probe produced ``PASS ... 1 binary-skipped ... 0 findings``, exit 0.
+
+    The existing binary fixtures were single-file repositories, which is why
+    the floor looked sufficient and the companion escape survived.
+    """
+    token = "sk-" + "ant-" + "oat" + "01-" + "Aa7_-" * 12
+    probe = b"\x00\x80" + f"index-url = https://__token__:{token}@pypi.example.invalid/simple\n".encode()
+    root = _repo_with(tmp_path, {"release/toolstate.dat": probe, "readme.md": b"benign\n"})
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+
+    assert secret_scan.main([]) == 1
+    error = capsys.readouterr().err
+    assert "release/toolstate.dat" in error, "the unread tracked file is not named in the refusal"
+    assert "Unscannable Tracked File" in error
 
 
 def test_scan_that_read_nothing_refuses_instead_of_passing(tmp_path, monkeypatch, capsys) -> None:
     """``examined == 0`` is the estate's signature false clean: the same output
     a working scan of a clean tree prints, with an empty denominator behind
-    it. The printed number is now acted on, not merely disclosed."""
-    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
-    root = _repo_with(tmp_path, {"image.png": png})
+    it. The printed number is now acted on, not merely disclosed.
+
+    The fixture is a path-skipped candidate rather than a binary one: binary
+    content is a finding now, so it exits 1 before this floor is reached. The
+    floor stays because it is correct -- it was never sufficient on its own,
+    since a single readable companion file lifts ``examined`` above zero.
+    """
+    root = _repo_with(tmp_path, {"build/generated.py": b"generated = True\n"})
     monkeypatch.setattr(secret_scan, "ROOT", root)
 
     assert secret_scan.main([]) == 3
