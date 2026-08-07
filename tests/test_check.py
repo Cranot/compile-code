@@ -32,6 +32,52 @@ def test_does_not_flag_real_source():
     assert not check._path_is_committed_artifact("src/compile_code/builder.py")
 
 
+# ---------------------------------------------------------------------------
+# THE SKIP LIST AND THE FATAL LIST MUST BE ONE LIST.
+#
+# Measured at 4f3e203: ``secret_scan._SKIP_DIRS`` held 13 names and
+# ``check.ARTIFACT_SEGMENTS`` 5, so eight directories were opened by no
+# scanner and refused by no gate. Seven of them (``.eggs``, ``.mypy_cache``,
+# ``.pytest_cache``, ``.roam``, ``.ruff_cache``, ``.tox``, ``venv``) were
+# reachable in the current tracked tree -- ``git ls-files`` would carry a
+# credential under any of them straight past all four gates, exit 0
+# throughout. The eighth, ``.git``, is unreachable: git stages nothing under
+# it (``git add .git/probe.txt`` exits 0 and adds nothing).
+#
+# The relation is pinned here because drift is how it arose, and because the
+# consequence is silent in both directions: neither list failing tells you the
+# other one changed.
+# ---------------------------------------------------------------------------
+
+
+def test_the_unopened_set_and_the_refused_set_are_the_same_list():
+    from scripts import inventory, secret_scan
+
+    assert set(secret_scan._SKIP_DIRS) == set(check.ARTIFACT_SEGMENTS), (
+        "a directory is unread by one gate and untouched by the other"
+    )
+    assert set(check.ARTIFACT_SEGMENTS) == set(inventory.UNTRACKABLE_DIRECTORY_SEGMENTS), (
+        "a gate re-forked its own copy of the list"
+    )
+    assert "venv" not in secret_scan._SKIP_DIRS, (
+        "venv can be tracked source (CPython ships Lib/venv/__init__.py), so it cannot be left unread"
+    )
+
+
+def test_tool_state_directories_are_fatal_not_merely_unread():
+    """Each name ``secret_scan`` declines to open must fail this gate, or the
+    decline is an absent measurement published as a clean result."""
+    for rel in (
+        ".tox/py311/pip.conf",
+        ".pytest_cache/v/cache/lastfailed",
+        ".mypy_cache/3.12/builtins.data.json",
+        ".ruff_cache/content",
+        ".eggs/pkg/EGG-INFO/PKG-INFO",
+        ".roam/index.db",
+    ):
+        assert check._path_is_committed_artifact(rel), f"{rel} is skipped unread and refused by nothing"
+
+
 def test_release_lock_rejects_mutable_unhashed_and_url_requirements():
     problems = check._lock_problems(
         "release/bad.lock",

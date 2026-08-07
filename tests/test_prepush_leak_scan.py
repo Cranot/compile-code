@@ -557,6 +557,43 @@ def test_range_whose_every_path_went_unopened_refuses_instead_of_passing(repo: P
     assert "build/generated.py" in result.stderr, "the refusal does not name the path it never opened"
 
 
+def test_one_readable_companion_file_does_not_clear_an_unopened_path(repo: Path) -> None:
+    """The refusal above was range-global, so a single readable path in the
+    same commit defeated it. Measured on the shipped gate: this exact commit
+    printed ``clean (1 commit(s) scanned, 0 findings; blobs: 1 scanned / 45
+    bytes, ... 1 path-filtered ...)`` and exited 0, with a real-shaped
+    ``sk-ant-oat01-`` token in the unopened blob. Whether a blob was read is a
+    fact about that blob, so the refusal has to be about that blob."""
+    token = "sk-" + "ant-" + "oat" + "01-" + "Qw7zR2mK9bT4xL6vN8pD3sG5hJ1cF0yA" * 2
+    (repo / ".tox").mkdir(parents=True, exist_ok=True)
+    (repo / ".tox" / "pip.conf").write_text(f"extra-index-url = https://x:{token}@i.invalid/s\n", encoding="utf-8")
+    (repo / "benign.txt").write_text("plain tracked text\n", encoding="utf-8")
+    _git(repo, "add", ".tox/pip.conf", "benign.txt")
+    _git(repo, "commit", "-q", "-m", "a skipped path beside a readable one")
+
+    result = _run(repo, "--range", "HEAD")
+
+    assert result.returncode == 3, f"a readable companion cleared an unopened path (exit {result.returncode})"
+    assert "clean" not in result.stdout, f"an unread blob was rendered as clean:\n{result.stdout}"
+    assert "UNSCANNED" in result.stderr
+    assert ".tox/pip.conf" in result.stderr, "the refusal does not name the path it never opened"
+
+
+def test_the_unread_path_refusal_states_a_remedy_that_is_true(repo: Path) -> None:
+    """The old text told the operator these paths are "build artifacts or
+    skipped directories, which the tree gates already refuse to track" --
+    measured false for 7 of the 13 skipped names at the time, including the one
+    a credential was reproduced under. The gate's own remediation repeated the
+    wrong bound. It is true now only because the two lists were merged."""
+    _commit(repo, "build/generated.py", "generated = True\n", "commit a build artifact")
+
+    result = _run(repo, "--range", "HEAD")
+
+    assert result.returncode == 3
+    assert "artifact_scan" in result.stderr, "the remedy does not name the gate that makes the claim true"
+    assert "git rm --cached" in result.stderr, "the remedy does not say how to untrack the path"
+
+
 def test_own_test_corpus_exemption_does_not_trip_the_unopened_range_refusal(repo: Path) -> None:
     """The one named, reviewed path exemption stays outside the denominator.
     Its content is secret-shaped by construction -- a decided exemption, not a

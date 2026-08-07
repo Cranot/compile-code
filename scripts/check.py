@@ -34,18 +34,22 @@ from pathlib import Path
 
 try:
     from scripts.inventory import (
+        UNTRACKABLE_DIRECTORY_SEGMENTS,
         InventoryError,
         filesystem_files,
         git_candidate_files,
         is_binary_content,
+        is_untrackable_directory_segment,
         without_git_controls,
     )
 except ModuleNotFoundError:  # Direct ``python scripts/check.py`` execution.
     from inventory import (
+        UNTRACKABLE_DIRECTORY_SEGMENTS,
         InventoryError,
         filesystem_files,
         git_candidate_files,
         is_binary_content,
+        is_untrackable_directory_segment,
         without_git_controls,
     )
 
@@ -67,7 +71,12 @@ LEAK_PATTERNS = [
     (r"\binternal/(planning|dogfood)/", "private internal reference"),
     (r"(?i)\b(transcripts?|session-exports?)/", "private transcript export reference"),
 ]
-ARTIFACT_SEGMENTS = (".venv", "node_modules", "dist", "build", "__pycache__")
+# Sourced from ``inventory``, not written out again here: this list and
+# ``secret_scan._SKIP_DIRS`` must be the SAME list or a directory can be
+# unread by one gate and untouched by the other. See
+# ``inventory.UNTRACKABLE_DIRECTORY_SEGMENTS`` for the false clean that
+# measured when they were two.
+ARTIFACT_SEGMENTS = UNTRACKABLE_DIRECTORY_SEGMENTS
 
 # Claims retired by the 2026-07-14 public-claims audit. A match fails unless
 # an allow-marker shares its line(s) — i.e. the claim is quoted as corrected
@@ -308,8 +317,15 @@ def _strict_json_document(data: bytes, label: str) -> object:
 
 
 def _path_is_committed_artifact(rel: str) -> bool:
-    """Return whether a tracked relative path belongs to a build artifact."""
-    return any(segment in ARTIFACT_SEGMENTS or segment.endswith(".egg-info") for segment in rel.split("/"))
+    """Return whether a tracked relative path belongs to an untrackable directory.
+
+    "Build artifact" was the original scope; the list now also carries tool
+    state (``.tox``, ``.pytest_cache``, ``.mypy_cache``, ``.ruff_cache``,
+    ``.eggs``, ``.roam``) because ``secret_scan`` declines to open those and
+    this is the gate that has to make that decline safe -- see
+    ``inventory.UNTRACKABLE_DIRECTORY_SEGMENTS``.
+    """
+    return any(is_untrackable_directory_segment(segment) for segment in rel.split("/"))
 
 
 def _without_git_controls(environment: dict[str, str] | None = None) -> dict[str, str]:
@@ -1011,7 +1027,13 @@ def artifact_scan() -> bool:
         f"(examined {len(tracked)} candidate paths; {len(hits)} findings)"
     )
     for rel in hits[:10]:
-        print(f"  {rel}  [committed artifact]")
+        print(f"  {rel}  [committed artifact or tool state]")
+    if hits:
+        # This gate is what makes ``secret_scan``'s corresponding skip safe: a
+        # path that scanner does not open is a path this one refuses. Say so,
+        # because the fix is "do not track it", not "add a pattern".
+        print("  These directories are never opened by scripts/secret_scan.py, so tracking one hides its content")
+        print("  from the credential catalogue entirely. Untrack the path (git rm --cached) rather than ignoring it.")
     return not hits
 
 

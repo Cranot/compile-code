@@ -4,7 +4,19 @@ __pycache__/
 dist/
 build/
 .venv/
+venv/
 .roam/
 internal/
 .claude/
 .stoa/
+# Tool state that was never ignored here, so `git add .` after a tox run or a
+# cache-writing linter staged the whole tree -- including any pip.conf inside
+# it. scripts/secret_scan.py declines to open these directories and
+# scripts/check.py's artifact_scan fails the build on tracking one; ignoring
+# them removes the accident that made that pair matter.
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+node_modules/

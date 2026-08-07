@@ -54,7 +54,8 @@ Exit codes: 0 = clean, and the verdict publishes the denominator that
 produced it. 1 = finding(s). 3 = candidates were established but none of
 their content was read, so "no findings" would be a verdict this scan did not
 compute. 4 = the scanner's own positive control failed -- it is broken and its
-verdict means nothing.
+verdict means nothing. 5 = the denominator did not reconcile: some candidate
+path reached no disposition, so this scan cannot say what happened to it.
 """
 
 from __future__ import annotations
@@ -68,9 +69,23 @@ from pathlib import Path
 from typing import NamedTuple
 
 try:
-    from scripts.inventory import InventoryError, git_candidate_files, is_binary_content, without_git_controls
+    from scripts.inventory import (
+        UNTRACKABLE_DIRECTORY_SEGMENTS,
+        InventoryError,
+        git_candidate_files,
+        is_binary_content,
+        is_untrackable_directory_segment,
+        without_git_controls,
+    )
 except ModuleNotFoundError:  # Direct ``python scripts/secret_scan.py`` execution.
-    from inventory import InventoryError, git_candidate_files, is_binary_content, without_git_controls
+    from inventory import (
+        UNTRACKABLE_DIRECTORY_SEGMENTS,
+        InventoryError,
+        git_candidate_files,
+        is_binary_content,
+        is_untrackable_directory_segment,
+        without_git_controls,
+    )
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -353,23 +368,23 @@ def scan_text(rel_path: str, text: str) -> list[dict]:
 # Repository scan
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = frozenset(
-    {
-        ".git",
-        ".venv",
-        "venv",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-        ".tox",
-        ".roam",
-        ".eggs",
-    }
-)
+# NOT a list of its own. This is exactly ``check.ARTIFACT_SEGMENTS``, because
+# the only defensible reason to leave a candidate path unread is that a gate in
+# this repository refuses to track it at all: then "unread" and "cannot exist"
+# coincide, and a directory this scanner never opens cannot hold a published
+# credential.
+#
+# When these were two lists they drifted, and the drift was a live false clean:
+# eight names were skipped here that ``artifact_scan`` did not refuse, so a
+# tracked ``venv/pip.conf`` carrying an ``sk-ant-oat01-`` token passed all four
+# gates with exit 0 while sitting in the current tracked tree. Note what does
+# NOT fix that: widening the pattern catalogue. A directory that is never
+# opened is invisible to every pattern, however good the pattern is.
+#
+# ``venv`` is no longer skipped at all -- it can be real tracked source
+# (CPython's own ``Lib/venv/__init__.py``), so it is read like any other path,
+# and ``.gitignore`` keeps a local virtualenv out of the candidate inventory.
+_SKIP_DIRS = frozenset(UNTRACKABLE_DIRECTORY_SEGMENTS)
 
 # There is deliberately no suffix list here any more. A file NAME is not a
 # measurement of the bytes behind it: the list this replaced skipped a
@@ -381,8 +396,12 @@ _SKIP_DIRS = frozenset(
 
 
 def _in_skip_dir(rel_path: str) -> bool:
-    parts = rel_path.split("/")
-    return any(p in _SKIP_DIRS or p.endswith(".egg-info") for p in parts[:-1])
+    """Whether a DIRECTORY component of *rel_path* is one the repo refuses.
+
+    ``parts[:-1]``: the final component is a file name, and a tracked file
+    merely NAMED ``build`` is ordinary content that must be read.
+    """
+    return any(is_untrackable_directory_segment(p) for p in rel_path.split("/")[:-1])
 
 
 # The scanner's OWN test fixture corpus: a path allowlist, not a directory
@@ -450,12 +469,40 @@ class RepoScan(NamedTuple):
     ``files_examined`` is what makes ``0 findings`` falsifiable: it is the
     count of candidates whose bytes were actually decoded and matched, as
     distinct from the count of paths considered.
+
+    Every other disposition is counted too, and the counts must ADD UP to
+    ``candidates`` -- see ``unaccounted``. Publishing only ``candidates`` and
+    ``files_examined`` left a silent remainder: the shipped verdict read
+    ``established 54 candidate paths; examined 51 text files`` over a tree
+    holding a tracked credential, and the three missing paths were the whole
+    defect, disclosed as nothing but a gap between two numbers. A path can no
+    longer leave this scan without saying which bucket it left by.
     """
 
     findings: list[dict]
     candidates: int
     files_examined: int
     binary_skipped: int
+    path_skipped: tuple[str, ...] = ()
+    corpus_exempt: tuple[str, ...] = ()
+    absent: int = 0
+    unscannable: int = 0
+
+    @property
+    def accounted(self) -> int:
+        return (
+            self.files_examined
+            + self.binary_skipped
+            + len(self.path_skipped)
+            + len(self.corpus_exempt)
+            + self.absent
+            + self.unscannable
+        )
+
+    @property
+    def unaccounted(self) -> int:
+        """Candidates that reached no bucket -- always a bug in this loop."""
+        return self.candidates - self.accounted
 
 
 def _scan_repo(root: Path) -> RepoScan:
@@ -463,24 +510,40 @@ def _scan_repo(root: Path) -> RepoScan:
     candidates = _tracked_files(root)
     files_examined = 0
     binary_skipped = 0
+    path_skipped: list[str] = []
+    corpus_exempt: list[str] = []
+    absent = 0
+    unscannable = 0
     for rel_path in candidates:
-        if _in_skip_dir(rel_path) or _is_own_test_corpus(rel_path):
+        if _is_own_test_corpus(rel_path):
+            corpus_exempt.append(rel_path)
+            continue
+        if _in_skip_dir(rel_path):
+            # Counted and named, never merely absent. Safe only because
+            # ``check.artifact_scan`` fails the build on exactly these paths
+            # (one shared list, ``inventory.UNTRACKABLE_DIRECTORY_SEGMENTS``),
+            # so an unread path here is a path that cannot be published.
+            path_skipped.append(rel_path)
             continue
         full = root / rel_path
         if full.is_symlink():
+            unscannable += 1
             findings.append(_unscannable_finding(rel_path, "tracked symlink"))
             continue
         if not full.exists():
             # Tracked but deleted from the worktree: there is genuinely no
             # content here to scan. That is a true "nothing", not an
             # uncomputed one, so it stays a skip.
+            absent += 1
             continue
         if not full.is_file():
+            unscannable += 1
             findings.append(_unscannable_finding(rel_path, "tracked path is not a regular file"))
             continue
         try:
             data = full.read_bytes()
         except OSError as exc:
+            unscannable += 1
             findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
         if is_binary_content(data):
@@ -501,7 +564,16 @@ def _scan_repo(root: Path) -> RepoScan:
             # finding already emitted from an earlier reading of these bytes.
             prior_view_findings.update(_finding_identity(finding) for finding in view_findings)
     findings.sort(key=lambda f: (f["file"], f["line"], f["pattern_name"]))
-    return RepoScan(findings, len(candidates), files_examined, binary_skipped)
+    return RepoScan(
+        findings,
+        len(candidates),
+        files_examined,
+        binary_skipped,
+        tuple(path_skipped),
+        tuple(corpus_exempt),
+        absent,
+        unscannable,
+    )
 
 
 def scan_repo(root: Path) -> list[dict]:
@@ -566,6 +638,18 @@ def main(argv: list[str] | None = None) -> int:
     if scan.findings:
         print(format_findings(scan.findings), file=sys.stderr)
         return 1
+    if scan.unaccounted:
+        print(
+            f"REFUSED: {scan.unaccounted} of {scan.candidates} candidate path(s) reached no disposition -- "
+            "this scan cannot say what happened to them.\n"
+            f"  examined {scan.files_examined}, binary-skipped {scan.binary_skipped}, "
+            f"path-skipped {len(scan.path_skipped)}, corpus-exempt {len(scan.corpus_exempt)}, "
+            f"absent {scan.absent}, unscannable {scan.unscannable}\n"
+            "A path that leaves this scan silently is a path whose content nothing measured, which is\n"
+            "the exact defect this denominator exists to make impossible. Fix _scan_repo; do not push.",
+            file=sys.stderr,
+        )
+        return 5
     if scan.files_examined == 0:
         print(
             f"REFUSED: established {scan.candidates} candidate path(s) and read the content of none of them "
@@ -574,10 +658,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 3
+    # The denominator CLOSES: every candidate is in exactly one bucket, and the
+    # buckets are named. The line this replaced printed candidates and examined
+    # only, so the paths it had skipped by directory name showed up as an
+    # unexplained difference between two numbers -- and that difference was
+    # where a tracked credential sat, reported by nobody.
     print(
         f"secret scan: PASS (established {scan.candidates} candidate paths; "
-        f"examined {scan.files_examined} text files; {scan.binary_skipped} binary-skipped; 0 findings)"
+        f"examined {scan.files_examined} text files; {scan.binary_skipped} binary-skipped; "
+        f"{len(scan.path_skipped)} path-skipped; {len(scan.corpus_exempt)} corpus-exempt; "
+        f"{scan.absent} absent; {scan.unscannable} unscannable; 0 findings)"
     )
+    for rel_path in scan.path_skipped[:10]:
+        print(f"  not opened (untrackable directory; check.artifact_scan fails the build on it): {rel_path}")
+    if len(scan.path_skipped) > 10:
+        print(f"  ... and {len(scan.path_skipped) - 10} more")
+    for rel_path in scan.corpus_exempt:
+        print(f"  exempt (this scanner's own test corpus): {rel_path}")
     return 0
 
 

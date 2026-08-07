@@ -61,8 +61,15 @@ commit(s) scanned, 0 findings; blobs: 0 scanned / 0 bytes, 0 binary-skipped,
 1 path-filtered, 0 unanalyzable)` -- exit 0, the honest denominator right
 there in the line and nothing acting on it. Binary is now decided from the
 bytes (`inventory.is_binary_content`), the surviving path exclusions are
-structural only, and the ledger is GATED: if the range changed paths and this
-scanner opened no blob at all, the verdict is a refusal, not `clean`.
+structural only, and the ledger is GATED PER PATH: any blob excluded by name
+makes the verdict a refusal, not `clean`.
+
+That gate used to be range-global -- it fired only when NO blob in the range
+was opened -- and one readable file in the same commit defeated it. Measured:
+a commit carrying `venv/pip.conf` (a real-shaped `sk-ant-oat01-` token) beside
+one ordinary text file printed `clean (1 commit(s) scanned, 0 findings; blobs:
+1 scanned / 45 bytes, ... 1 path-filtered ...)` and exited 0. Whether a blob
+was read is a fact about that blob, so the refusal is now about that blob.
 
 POSITIVE CONTROL: a scanner that reports clean while reading nothing is
 indistinguishable from a clean repository unless it is asked to find
@@ -73,8 +80,8 @@ drops the tail is caught too). If either planted credential is not found, the
 scanner reports BROKEN and exits 4 rather than reporting 0 findings.
 
 Exit codes: 0 = clean. 2 = leak(s) found. 3 = content this gate did not read
--- at least one blob was unanalyzable, or the range changed paths and no blob
-was opened at all ("I could not check this" is a failure of the gate, not a pass).
+-- at least one blob was unanalyzable, or at least one changed path was
+excluded by name ("I could not check this" is a failure of the gate, not a pass).
 4 = the scanner's own positive control failed -- it is broken, and its
 verdict means nothing. 1 = usage error or a git command needed to resolve
 the range failed (fail closed -- never silently pass). When more than one
@@ -148,9 +155,10 @@ class _Ledger:
     The counts are split by WHY content went unread, because those states are
     not equivalent. ``binary_skipped`` bytes were read and classified.
     ``path_filtered`` bytes were never opened -- a decision from the path
-    alone -- which is the same epistemic state as ``unanalyzable`` and is why
-    ``considered`` and ``opened`` exist: a range that changed files while this
-    scanner opened none of them has no basis for the word "clean".
+    alone -- which is the same epistemic state as ``unanalyzable``, and is now
+    treated the same way: a non-empty ``path_filtered`` refuses. ``considered``
+    and ``opened`` remain, but only to say in the refusal whether the whole
+    range or part of it went unread.
 
     ``corpus_exempt`` is deliberately outside ``considered``. It is one named,
     reviewed path (``scripts/secret_scan.py``'s ``_OWN_TEST_CORPUS_FILES``)
@@ -533,21 +541,33 @@ def _print_report(findings: list[Finding]) -> None:
     )
 
 
-def _print_unread_range(ledger: _Ledger) -> None:
-    sys.stderr.write(
-        f"\nUNSCANNED: this range changed {ledger.considered} path(s) and this gate opened none of them:\n"
-    )
+def _print_unread_paths(ledger: _Ledger) -> None:
+    """Refuse over paths whose blobs were never opened -- all or some of them.
+
+    This used to fire only when the WHOLE range went unopened, which any single
+    readable companion path defeated: one benign file in the same commit put
+    ``opened`` above zero and the excluded blob published unread under the word
+    "clean". Measured -- a commit carrying ``venv/pip.conf`` (an
+    ``sk-ant-oat01-`` token) plus one ordinary text file printed
+    ``prepush_leak_scan: clean (1 commit(s) scanned, 0 findings; ... 1
+    path-filtered ...)`` and exited 0. A path-level fact needs a path-level
+    refusal; a range-global denominator was the wrong unit.
+    """
+    whole_range = ledger.opened == 0
+    scope = "and this gate opened none of them" if whole_range else "including path(s) it never opened"
+    sys.stderr.write(f"\nUNSCANNED: this range changed {ledger.considered} path(s) {scope}:\n")
     for label in ledger.path_filtered[:20]:
         sys.stderr.write(f"  {label}  [excluded by path, content never read]\n")
     if len(ledger.path_filtered) > 20:
         sys.stderr.write(f"  ... and {len(ledger.path_filtered) - 20} more\n")
     sys.stderr.write(
         "\n"
-        "This is NOT a pass. 'clean' here would rest on the commit messages\n"
-        "alone: no blob's bytes were read, so the verdict was not computed\n"
-        "from the content about to be published. Options:\n"
-        "  - Do not publish these paths: they are build artifacts or skipped\n"
-        "    directories, which the tree gates already refuse to track.\n"
+        "This is NOT a pass. These blobs publish permanently and no pattern in\n"
+        "either catalogue was ever applied to their bytes. Options:\n"
+        "  - Do not publish these paths. They sit under a directory in\n"
+        "    inventory.UNTRACKABLE_DIRECTORY_SEGMENTS, which scripts/check.py's\n"
+        "    artifact_scan fails the build on, so they should not be tracked at\n"
+        "    all: git rm --cached the path and amend or rebase the commit.\n"
         "  - Prove them by hand, then bypass this one push deliberately:\n"
         "    git push --no-verify\n"
     )
@@ -716,15 +736,15 @@ def main(argv: list[str]) -> int:
     # The denominator publishes on EVERY path, clean or blocked. Without it
     # "0 findings" is unfalsifiable: it is what a working scan of a clean
     # range prints and also what a scan that read nothing prints. And it is
-    # now ACTED on: a range that changed paths while this gate opened no blob
-    # at all cannot be called clean, whichever rule kept the bytes closed.
-    unread_range = ledger.considered > 0 and ledger.opened == 0
-    if not findings and not ledger.unanalyzable and not unread_range:
+    # now ACTED on PER PATH, not per range: any blob excluded by name went
+    # unread, and unread content cannot be called clean no matter how many
+    # other blobs in the same range were read. The range-global form of this
+    # rule was defeated by a single readable companion file.
+    unread_paths = bool(ledger.path_filtered)
+    if not findings and not ledger.unanalyzable and not unread_paths:
         print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
         for label, size in ledger.binary_skipped:
             print(f"  skipped (binary, not pattern-matched): {label}  {size} bytes")
-        for label in ledger.path_filtered:
-            print(f"  excluded by path (content not read): {label}")
         for label in ledger.corpus_exempt:
             print(f"  exempt (scanner's own test corpus): {label}")
         return 0
@@ -734,8 +754,8 @@ def main(argv: list[str]) -> int:
         _print_report(findings)
     if ledger.unanalyzable:
         _print_unscannable(ledger)
-    if unread_range:
-        _print_unread_range(ledger)
+    if unread_paths:
+        _print_unread_paths(ledger)
     return 2 if findings else 3
 
 

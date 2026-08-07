@@ -24,6 +24,62 @@ MAX_GIT_INVENTORY_BYTES = 16 * 1024 * 1024
 # Everything a text file may legitimately contain outside the printable set.
 _TEXT_CONTROL_CHARS = frozenset("\t\n\r\f\v")
 
+# The directories this repository refuses to track -- and therefore the ONLY
+# directories a scanner here may leave unread.
+#
+# ONE list, in one place, deliberately: ``check.ARTIFACT_SEGMENTS`` refuses
+# exactly these and ``secret_scan._SKIP_DIRS`` declines to open exactly these,
+# so "this scanner never opened the path" and "this repository cannot track the
+# path" are the same statement instead of two lists that drift apart.
+#
+# They HAD drifted, and the drift was a live false clean. Measured at 4f3e203:
+# ``secret_scan._SKIP_DIRS`` held 13 names against ``ARTIFACT_SEGMENTS``'s 5,
+# and for 7 of the 8 extras (``.eggs``, ``.mypy_cache``, ``.pytest_cache``,
+# ``.roam``, ``.ruff_cache``, ``.tox``, ``venv``) NOTHING read the content and
+# NOTHING refused the path. A tracked ``venv/pip.conf`` carrying an
+# ``sk-ant-oat01-`` token passed all four gates -- ``secret_scan`` PASS exit 0,
+# ``check.leak_scan`` PASS, ``check.artifact_scan`` PASS, ``prepush_leak_scan``
+# clean exit 0 -- with the token in the CURRENT TRACKED TREE, not in history.
+# Commit 4f3e203 asserted the residual was "already fatal at the tree gate
+# (artifact_scan), so the exposure is history-only"; that holds for 5 of the 13
+# names and is false for the other 7, which is why this list now exists.
+#
+# ``venv`` is deliberately NOT here. It is the one skipped name that can
+# legitimately BE tracked source -- CPython ships ``Lib/venv/__init__.py`` --
+# so it cannot be refused, and under this rule that means it cannot be left
+# unread either. It is scanned; ``.gitignore`` keeps a local virtualenv out of
+# the candidate inventory instead.
+#
+# ``.git`` is deliberately NOT here either. Measured: ``git add .git/probe.txt``
+# exits 0 and stages nothing, ``git ls-files --error-unmatch`` then fails, and
+# ``git ls-files --cached --others`` never emits a path under ``.git`` -- so
+# skipping it was dead weight. An exception carved into this list is exactly
+# how the drift above began, so there are none.
+UNTRACKABLE_DIRECTORY_SEGMENTS = (
+    ".eggs",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".roam",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+)
+
+
+def is_untrackable_directory_segment(segment: str) -> bool:
+    """Whether one path component names a directory this repository refuses.
+
+    Callers decide WHICH components to test -- ``check`` tests every one, and
+    ``secret_scan`` exempts the final component so a tracked file merely NAMED
+    ``build`` is still opened -- but they must not each keep their own name
+    list. That is the drift this function exists to make impossible.
+    """
+    return segment in UNTRACKABLE_DIRECTORY_SEGMENTS or segment.endswith(".egg-info")
+
 
 class InventoryError(RuntimeError):
     """The complete set to examine could not be established."""

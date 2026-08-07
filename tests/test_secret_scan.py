@@ -281,7 +281,8 @@ def test_clean_secret_scan_reports_established_and_examined_counts(tmp_path, mon
 
     assert secret_scan.main([]) == 0
     assert (
-        "established 2 candidate paths; examined 2 text files; 0 binary-skipped; 0 findings" in capsys.readouterr().out
+        "established 2 candidate paths; examined 2 text files; 0 binary-skipped; "
+        "0 path-skipped; 0 corpus-exempt; 0 absent; 0 unscannable; 0 findings" in capsys.readouterr().out
     )
 
 
@@ -412,3 +413,92 @@ def test_tracked_symlink_is_reported_and_worktree_deletion_is_not(monkeypatch, t
 
     findings = secret_scan.scan_repo(tmp_path)
     assert [(f["file"], f["matched_text"]) for f in findings] == [("link.py", "tracked symlink")]
+
+
+# ---------------------------------------------------------------------------
+# A DIRECTORY THAT IS NEVER OPENED IS INVISIBLE TO EVERY PATTERN.
+#
+# The suffix half of name-based skipping was removed at 4f3e203; the DIRECTORY
+# half stayed, with the claim that the residual was "already fatal at the tree
+# gate (artifact_scan), so the exposure is history-only". Measured, that was
+# true for 5 of the 13 skipped names and false for the other 7 -- and the
+# exposure was reachable in the CURRENT tracked tree, not only in history. A
+# tracked ``venv/pip.conf`` carrying an ``sk-ant-oat01-`` token passed
+# secret_scan (PASS, exit 0), check.leak_scan (PASS), check.artifact_scan
+# (PASS) and prepush_leak_scan (clean, exit 0) simultaneously.
+#
+# Widening the catalogue would not have touched it: secret_scan's catalogue
+# ALREADY matched that content when handed it. The bytes were never read.
+# ---------------------------------------------------------------------------
+
+_PLANTED_ANTHROPIC_TOKEN = "sk-" + "ant-" + "oat" + "01-" + "Qw7zR2mK9bT4xL6vN8pD3sG5hJ1cF0yA" * 2
+_PLANTED_PIP_CONF = f"[global]\nextra-index-url = https://x:{_PLANTED_ANTHROPIC_TOKEN}@i.invalid/s\n".encode()
+
+
+def test_credential_tracked_under_a_venv_directory_is_read(tmp_path) -> None:
+    """``venv`` is the one skipped name that can legitimately BE tracked source
+    -- CPython ships ``Lib/venv/__init__.py`` -- so it cannot be made fatal,
+    which under the rule below means it cannot be left unread either. It is
+    scanned now; ``.gitignore`` keeps a local virtualenv out of the inventory.
+    """
+    root = _repo_with(tmp_path, {"venv/pip.conf": _PLANTED_PIP_CONF, "benign.txt": b"plain text\n"})
+
+    scan = secret_scan._scan_repo(root)
+
+    assert scan.path_skipped == (), "venv/ is still being skipped unread"
+    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [("venv/pip.conf", "Anthropic OAuth Token")]
+
+
+def test_skipped_path_is_counted_and_named_never_silently_absent(tmp_path, monkeypatch, capsys) -> None:
+    """The remaining skips must show up IN the denominator. The shipped verdict
+    printed ``established 54 candidate paths; examined 51 text files`` over a
+    tree holding a tracked credential: the three unexamined paths were the
+    entire defect, published as nothing but a gap between two numbers."""
+    root = _repo_with(tmp_path, {".tox/py311/pip.conf": _PLANTED_PIP_CONF, "benign.txt": b"plain text\n"})
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+
+    scan = secret_scan._scan_repo(root)
+    assert scan.path_skipped == (".tox/py311/pip.conf",)
+    assert scan.unaccounted == 0, "a candidate path reached no disposition"
+
+    assert secret_scan.main([]) == 0
+    out = capsys.readouterr().out
+    assert "1 path-skipped" in out, out
+    assert ".tox/py311/pip.conf" in out, "a skipped path is not named anywhere in the verdict"
+
+
+def test_every_candidate_path_lands_in_exactly_one_bucket(tmp_path) -> None:
+    """The reconciliation itself, over one candidate of every disposition."""
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
+    root = _repo_with(
+        tmp_path,
+        {
+            "benign.txt": b"plain text\n",
+            "image.png": png,
+            "build/generated.py": b"generated = True\n",
+            "tests/test_secret_scan.py": b"corpus\n",
+        },
+    )
+
+    scan = secret_scan._scan_repo(root)
+
+    assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (4, 1, 1)
+    assert (scan.path_skipped, scan.corpus_exempt) == (("build/generated.py",), ("tests/test_secret_scan.py",))
+    assert scan.unaccounted == 0
+
+
+def test_unreconciled_denominator_refuses_instead_of_passing(tmp_path, monkeypatch, capsys) -> None:
+    """A future edit that adds a silent ``continue`` to the scan loop must fail
+    loudly rather than shrink the denominator behind a PASS. Simulated by
+    dropping a candidate on the floor."""
+    root = _repo_with(tmp_path, {"benign.txt": b"plain text\n", "other.txt": b"also plain\n"})
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+    real_scan_repo = secret_scan._scan_repo
+    monkeypatch.setattr(
+        secret_scan,
+        "_scan_repo",
+        lambda root: real_scan_repo(root)._replace(files_examined=1),
+    )
+
+    assert secret_scan.main([]) == 5
+    assert "reached no disposition" in capsys.readouterr().err
