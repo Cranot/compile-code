@@ -33,9 +33,21 @@ from collections.abc import Callable
 from pathlib import Path
 
 try:
-    from scripts.inventory import InventoryError, filesystem_files, git_candidate_files, without_git_controls
+    from scripts.inventory import (
+        InventoryError,
+        filesystem_files,
+        git_candidate_files,
+        is_binary_content,
+        without_git_controls,
+    )
 except ModuleNotFoundError:  # Direct ``python scripts/check.py`` execution.
-    from inventory import InventoryError, filesystem_files, git_candidate_files, without_git_controls
+    from inventory import (
+        InventoryError,
+        filesystem_files,
+        git_candidate_files,
+        is_binary_content,
+        without_git_controls,
+    )
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,6 +56,12 @@ LEAK_PATTERNS = [
     (r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "GitHub token"),
     (r"sk-[A-Za-z0-9]{20,}", "API secret key"),
     (r"AKIA[0-9A-Z]{16}", "AWS access key"),
+    # This repository publishes to PyPI, and a PyPI upload token's natural
+    # home is an ``--index-url`` line in a pip requirements/lock file. It was
+    # absent here while ``secret_scan``'s catalogue carried it, so the one
+    # gate that did read ``release/*.lock`` had no pattern for the credential
+    # most likely to be in one.
+    (r"pypi-[A-Za-z0-9_-]{100,}", "PyPI upload token"),
     (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", "PEM private key"),
     (r"/root/(apps|services|repos)/", "VPS-local path"),
     (r"\binternal/(planning|dogfood)/", "private internal reference"),
@@ -853,22 +871,70 @@ def _scan_views(data: bytes) -> list[str]:
     return views
 
 
-def _scan_file_for_leaks(rel: str) -> list[str]:
-    """All leak-pattern hits in one tracked file, formatted for display."""
+def _leak_scan_file(rel: str) -> tuple[bool, list[str]]:
+    """``(the content was read, formatted hits)`` for one candidate file.
+
+    Whether the bytes were READ is returned alongside the hits because a
+    caller that only sums hits cannot tell "nothing in it" from "never opened
+    it" -- the shape this gate has already produced once. The skip is now
+    decided by ``inventory.is_binary_content`` from the bytes themselves; the
+    suffix list this replaced (``.png``/``.jpg``/``.gif``/``.ico``) meant a
+    plain-text credential file named ``logo.png`` printed PASS unread.
+    """
     path = ROOT / rel
     if path.is_symlink():
-        return [f"  {rel}  [tracked symlink] release source must be regular"]
-    if path.suffix in (".png", ".jpg", ".gif", ".ico"):
-        return []
+        return False, [f"  {rel}  [tracked symlink] release source must be regular"]
     try:
         data = path.read_bytes()
     except OSError as exc:
-        return [f"  {rel}  [unreadable tracked file] {exc}"]
+        return False, [f"  {rel}  [unreadable tracked file] {exc}"]
+    if is_binary_content(data):
+        return False, []
     hits: dict[tuple[int, str], None] = {}
     for view in _scan_views(data):
         for hit in _leak_pattern_hits(view):
             hits[hit] = None
-    return [f"  {rel}:{line}  [{label}] redacted match" for line, label in sorted(hits)]
+    return True, [f"  {rel}:{line}  [{label}] redacted match" for line, label in sorted(hits)]
+
+
+def _scan_file_for_leaks(rel: str) -> list[str]:
+    """All leak-pattern hits in one tracked file, formatted for display."""
+    return _leak_scan_file(rel)[1]
+
+
+# --- positive control -------------------------------------------------------
+# Assembled by concatenation so this file's own source text never contains a
+# contiguous match: every gate here reads scripts/check.py like any other
+# candidate. One planted item per FAMILY in LEAK_PATTERNS -- a credential
+# shape and a private-infrastructure string -- because a control exercising
+# only a pattern already known to work proves nothing about the rest, and one
+# of the two rides in as UTF-16 so the decode path that ``_scan_views``
+# exists for is a live control rather than only a test.
+_LEAK_CONTROL_EXPECTED = ("AWS access key", "VPS-local path", "GitHub token")
+_LEAK_CONTROL_UTF8 = 'aws = "' + "AK" + "IA" + "C" * 16 + '"\nlog = "/root/' + 'services/app.log"\n'
+_LEAK_CONTROL_UTF16 = 'token = "' + "gh" + "p_" + "C" * 36 + '"\n'
+
+
+def _leak_control_failures() -> list[str]:
+    """Empty iff the catalogue can still find a leak this gate planted itself.
+
+    ``0 findings`` is what a working scan of a clean tree prints and also what
+    a scan whose catalogue or decoding stopped working prints. Measured before
+    this existed: with ``LEAK_PATTERNS`` emptied, ``leak_scan()`` printed
+    ``PASS (examined 51 candidate paths; 0 findings)`` and returned True over
+    the real repository. ``prepush_leak_scan`` already refused under the same
+    sabotage; the discipline was on one of the three scanners only.
+    """
+    found: set[str] = set()
+    for data in (_LEAK_CONTROL_UTF8.encode("utf-8"), _LEAK_CONTROL_UTF16.encode("utf-16")):
+        if is_binary_content(data):
+            return ["control content was classified binary; the text/binary rule is broken"]
+        views = _scan_views(data)
+        if not views:
+            return ["control content decoded to zero text views"]
+        for view in views:
+            found.update(label for _, label in _leak_pattern_hits(view))
+    return [f"planted control leak not detected: {name}" for name in _LEAK_CONTROL_EXPECTED if name not in found]
 
 
 def _tracked_files() -> list[str]:
@@ -895,19 +961,40 @@ def _tracked_files() -> list[str]:
 
 
 def leak_scan() -> bool:
+    broken = _leak_control_failures()
+    if broken:
+        print("[check] leak scan: BROKEN (this gate cannot find a leak it planted itself)")
+        for problem in broken:
+            print(f"  {problem}")
+        print("  Its '0 findings' would mean nothing. Fix the gate; do not push.")
+        return False
     try:
         tracked = _tracked_files()
     except RuntimeError as exc:
         print("[check] leak scan: FAIL")
         print(f"  {exc}")
         return False
-    hits = [hit for rel in tracked for hit in _scan_file_for_leaks(rel)]
+    hits: list[str] = []
+    examined = 0
+    for rel in tracked:
+        was_read, file_hits = _leak_scan_file(rel)
+        examined += 1 if was_read else 0
+        hits.extend(file_hits)
+    # Publish files READ, not only paths considered: the old line printed
+    # "examined N candidate paths" identically whether every one was opened or
+    # every one was suffix-skipped unread.
+    verdict = "PASS" if not hits else "FAIL"
+    if not hits and examined == 0:
+        verdict = "FAIL"
     print(
-        f"[check] leak scan: {'PASS' if not hits else 'FAIL'} "
-        f"(examined {len(tracked)} candidate paths; {len(hits)} findings)"
+        f"[check] leak scan: {verdict} "
+        f"(established {len(tracked)} candidate paths; examined {examined} text files; {len(hits)} findings)"
     )
     for h in hits[:10]:
         print(h)
+    if not hits and examined == 0:
+        print("  no candidate file's content was read; '0 findings' would be a verdict this gate did not compute")
+        return False
     return not hits
 
 

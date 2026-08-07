@@ -656,7 +656,104 @@ def test_tree_scans_report_healthy_inventory_counts(tmp_path, monkeypatch, capsy
 
     assert check.leak_scan() is True
     assert check.artifact_scan() is True
-    assert capsys.readouterr().out.count("examined 2 candidate paths") == 2
+    output = capsys.readouterr().out
+    # The leak gate publishes files READ as well as paths considered: the two
+    # numbers are different measurements and only the second one used to be
+    # printed, which made "0 findings" unfalsifiable. The artifact gate keeps
+    # the single count on purpose -- its subject IS the path, not the content.
+    assert "established 2 candidate paths; examined 2 text files; 0 findings" in output
+    assert output.count("examined 2 candidate paths") == 1
+
+
+def test_leak_gate_reads_a_credential_under_a_binary_looking_name(tmp_path, monkeypatch, capsys):
+    """A file NAME is not a measurement of the bytes behind it.
+
+    This gate skipped ``.png``/``.jpg``/``.gif``/``.ico`` unread, so a repo of
+    two credential-bearing files under those names printed
+    ``PASS (examined 2 candidate paths; 0 findings)`` -- the signature false
+    clean, with an honest denominator nothing acted on.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    key = "AKIA" + "Z" * 16
+    (tmp_path / "logo.png").write_text(f'aws = "{key}"\n', encoding="utf-8")
+    subprocess.run(["git", "add", "--", "logo.png"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False
+    output = capsys.readouterr().out
+    assert "examined 1 text files" in output
+    assert "logo.png:1  [AWS access key]" in output
+
+
+def test_leak_gate_carries_a_pattern_for_the_credential_it_publishes_with(tmp_path, monkeypatch, capsys):
+    """This repository publishes to PyPI and reads ``release/*.lock``; it had
+    no pattern for a PyPI upload token, which is what an ``--index-url`` line
+    in one of those files would carry."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    token = "pypi-" + "AgEIcHlwaS5vcmcC" + "Aa9_-" * 24
+    (tmp_path / "req.lock").write_text(f"--index-url https://u:{token}@index/simple\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "req.lock"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False
+    assert "[PyPI upload token]" in capsys.readouterr().out
+
+
+def test_genuine_binary_stays_unmatched_and_an_all_binary_tree_refuses(tmp_path, monkeypatch, capsys):
+    """Conservation plus the denominator gate in one fixture: real binary is
+    still not pattern-matched, and a tree whose every candidate went unread
+    cannot report PASS -- ``0 findings`` there is a verdict never computed."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
+    (tmp_path / "image.png").write_bytes(png)
+    subprocess.run(["git", "add", "--", "image.png"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False
+    output = capsys.readouterr().out
+    assert "examined 0 text files; 0 findings" in output
+    assert "would be a verdict this gate did not compute" in output
+
+    (tmp_path / "readme.md").write_text("benign\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "readme.md"], cwd=tmp_path, check=True)
+    assert check.leak_scan() is True
+    assert "established 2 candidate paths; examined 1 text files; 0 findings" in capsys.readouterr().out
+
+
+def test_leak_gate_that_finds_nothing_reports_broken_not_pass(tmp_path, monkeypatch, capsys):
+    """The planted-control discipline ``prepush_leak_scan`` already had, on
+    the gate that lacked it: with ``LEAK_PATTERNS`` emptied, ``leak_scan()``
+    printed ``PASS (examined 51 candidate paths; 0 findings)`` and returned
+    True over the real repository."""
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "readme.md").write_text("benign\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "readme.md"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+    assert check._leak_control_failures() == [], "the positive control does not pass on healthy code"
+
+    monkeypatch.setattr(check, "LEAK_PATTERNS", [])
+
+    assert check._leak_control_failures(), "an emptied catalogue passed the gate's own positive control"
+    assert check.leak_scan() is False
+    assert "BROKEN" in capsys.readouterr().out
+
+
+def test_leak_control_covers_both_catalogue_families(monkeypatch):
+    """One planted item per FAMILY -- a credential shape and a private-
+    infrastructure string -- because a control exercising only a pattern
+    already known to work proves nothing about the rest."""
+    for label in ("AWS access key", "VPS-local path", "GitHub token"):
+        monkeypatch.setattr(check, "LEAK_PATTERNS", [p for p in check.LEAK_PATTERNS if p[1] != label])
+        assert check._leak_control_failures() == [f"planted control leak not detected: {label}"]
+        monkeypatch.undo()
+
+
+def test_leak_control_fails_if_the_utf16_decode_regresses(monkeypatch):
+    """The GitHub half of the control rides in as UTF-16, so the decode fix is
+    a live control on every run rather than only a test."""
+    monkeypatch.setattr(check, "_scan_views", lambda data: [data.decode("utf-8", errors="ignore")])
+
+    assert check._leak_control_failures() == ["planted control leak not detected: GitHub token"]
 
 
 def test_empty_quality_source_inventory_fails_both_ruff_gates(tmp_path, monkeypatch, capsys):

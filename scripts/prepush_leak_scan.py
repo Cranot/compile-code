@@ -54,6 +54,16 @@ Every invocation publishes its denominator -- blobs scanned, bytes scanned,
 blobs skipped, blobs unanalyzable -- so "0 findings" can be checked against
 how much was actually read.
 
+A NAME IS NOT A MEASUREMENT: this script used to decide "binary, do not
+open" from a path's suffix, so a plain-text file carrying a credential and
+committed as `logo.png` was never read and the range printed `clean (1
+commit(s) scanned, 0 findings; blobs: 0 scanned / 0 bytes, 0 binary-skipped,
+1 path-filtered, 0 unanalyzable)` -- exit 0, the honest denominator right
+there in the line and nothing acting on it. Binary is now decided from the
+bytes (`inventory.is_binary_content`), the surviving path exclusions are
+structural only, and the ledger is GATED: if the range changed paths and this
+scanner opened no blob at all, the verdict is a refusal, not `clean`.
+
 POSITIVE CONTROL: a scanner that reports clean while reading nothing is
 indistinguishable from a clean repository unless it is asked to find
 something it planted itself. Every invocation runs a sentinel blob carrying
@@ -62,8 +72,9 @@ the real blobs take (placed past the first line batch, so a batching bug that
 drops the tail is caught too). If either planted credential is not found, the
 scanner reports BROKEN and exits 4 rather than reporting 0 findings.
 
-Exit codes: 0 = clean. 2 = leak(s) found. 3 = at least one blob was
-unanalyzable ("I could not check this" is a failure of the gate, not a pass).
+Exit codes: 0 = clean. 2 = leak(s) found. 3 = content this gate did not read
+-- at least one blob was unanalyzable, or the range changed paths and no blob
+was opened at all ("I could not check this" is a failure of the gate, not a pass).
 4 = the scanner's own positive control failed -- it is broken, and its
 verdict means nothing. 1 = usage error or a git command needed to resolve
 the range failed (fail closed -- never silently pass). When more than one
@@ -133,19 +144,38 @@ class _Ledger:
     Printed on every invocation, clean or not. "0 findings" is only meaningful
     next to how many blobs and bytes produced it -- this scanner has already
     demonstrated once that it can report clean having decoded nothing.
+
+    The counts are split by WHY content went unread, because those states are
+    not equivalent. ``binary_skipped`` bytes were read and classified.
+    ``path_filtered`` bytes were never opened -- a decision from the path
+    alone -- which is the same epistemic state as ``unanalyzable`` and is why
+    ``considered`` and ``opened`` exist: a range that changed files while this
+    scanner opened none of them has no basis for the word "clean".
+
+    ``corpus_exempt`` is deliberately outside ``considered``. It is one named,
+    reviewed path (``scripts/secret_scan.py``'s ``_OWN_TEST_CORPUS_FILES``)
+    whose content is secret-shaped by construction -- a decided exemption, not
+    a guess about unknown content, and the only path filter of that kind.
     """
 
     blobs_scanned: int = 0
     bytes_scanned: int = 0
-    path_filtered: int = 0
+    considered: int = 0
+    path_filtered: list[str] = field(default_factory=list)
+    corpus_exempt: list[str] = field(default_factory=list)
     binary_skipped: list[tuple[str, int]] = field(default_factory=list)
     unanalyzable: list[tuple[str, int, str]] = field(default_factory=list)
+
+    @property
+    def opened(self) -> int:
+        """Blobs whose bytes this scanner actually held and classified."""
+        return self.blobs_scanned + len(self.binary_skipped) + len(self.unanalyzable)
 
     def summary(self) -> str:
         return (
             f"blobs: {self.blobs_scanned} scanned / {self.bytes_scanned} bytes, "
-            f"{len(self.binary_skipped)} binary-skipped, {self.path_filtered} path-filtered, "
-            f"{len(self.unanalyzable)} unanalyzable"
+            f"{len(self.binary_skipped)} binary-skipped, {len(self.path_filtered)} path-filtered, "
+            f"{len(self.corpus_exempt)} corpus-exempt, {len(self.unanalyzable)} unanalyzable"
         )
 
 
@@ -169,27 +199,6 @@ def _repo_root() -> str:
         sys.stderr.write("ERROR: not inside a git repository (git rev-parse failed).\n")
         raise SystemExit(1)
     return raw.stdout.decode("utf-8", errors="replace").strip()
-
-
-# Everything a text file may legitimately contain outside the printable set.
-_TEXT_CONTROL_CHARS = frozenset("\t\n\r\f\v")
-
-
-def _is_utf16_text(data: bytes) -> bool:
-    """True iff NUL-bearing *data* is UTF-16 text rather than binary.
-
-    A byte-order mark settles it. Without one, the bytes are accepted as text
-    only when removing the NUL padding leaves strictly-valid UTF-8 carrying no
-    control characters a text file would not — which a PNG, a zip or an object
-    file will not satisfy, so the binary skip below is preserved.
-    """
-    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return True
-    try:
-        text = data.replace(b"\x00", b"").decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return False
-    return not any(ch < " " and ch not in _TEXT_CONTROL_CHARS for ch in text)
 
 
 class _Reading(NamedTuple):
@@ -233,7 +242,7 @@ def _read_blob(data: bytes) -> _Reading:
     """
     if len(data) > _SCAN_CEILING_BYTES:
         return _Reading(_UNANALYZABLE, [], f"exceeds the {_SCAN_CEILING_BYTES}-byte scan ceiling")
-    if b"\x00" in data and not _is_utf16_text(data):
+    if inventory.is_binary_content(data):
         return _Reading(_SKIPPED_BINARY, [], "binary content (NUL bytes, not UTF-16 text)")
     return _Reading(_SCANNED, check._scan_views(data), "")
 
@@ -282,14 +291,20 @@ def _scan_text(label: str, text: str) -> list[Finding]:
     return findings
 
 
-def _should_scan_path(path: str) -> bool:
-    if check._path_is_committed_artifact(path):
-        return False
-    if secret_scan._in_skip_dir(path):
-        return False
+def _path_disposition(path: str) -> str:
+    """Why (or whether) this path's blob goes unopened -- decided by NAME.
+
+    Only structural exclusions remain here. The suffix test that used to be
+    the last line of this function decided "binary" from the file name, so a
+    plain-text credential file committed as ``logo.png`` was never opened and
+    the range printed ``clean`` with ``0 scanned / 0 bytes``. Binary is now
+    decided from the bytes in ``_read_blob``, where the evidence is.
+    """
     if secret_scan._is_own_test_corpus(path):
-        return False
-    return Path(path).suffix.lower() not in secret_scan._BINARY_EXTENSIONS
+        return "corpus-exempt"
+    if check._path_is_committed_artifact(path) or secret_scan._in_skip_dir(path):
+        return "path-filtered"
+    return "scan"
 
 
 # --- batched git access -----------------------------------------------------
@@ -437,8 +452,17 @@ def _scan_range(repo_root: str, shas: list[str]) -> tuple[list[Finding], _Ledger
     wanted_paths: dict[str, str] = {}  # blob oid -> path, for surviving (unskipped) entries per commit
     per_commit_paths: dict[str, list[tuple[str, str]]] = {}
     for sha in shas:
-        keep = [(path, oid) for path, oid in changed.get(sha, []) if _should_scan_path(path)]
-        ledger.path_filtered += len(changed.get(sha, [])) - len(keep)
+        keep: list[tuple[str, str]] = []
+        for path, oid in changed.get(sha, []):
+            disposition = _path_disposition(path)
+            if disposition == "corpus-exempt":
+                ledger.corpus_exempt.append(f"{sha[:10]}:{path}")
+                continue
+            ledger.considered += 1
+            if disposition == "path-filtered":
+                ledger.path_filtered.append(f"{sha[:10]}:{path}")
+                continue
+            keep.append((path, oid))
         per_commit_paths[sha] = keep
         for path, oid in keep:
             wanted_paths[oid] = path
@@ -506,6 +530,26 @@ def _print_report(findings: list[Finding]) -> None:
         "  - False positive on a LEAK_PATTERNS entry? Tighten it in\n"
         "    scripts/check.py.\n"
         "  - Deliberate one-off bypass (rare, discouraged): git push --no-verify\n"
+    )
+
+
+def _print_unread_range(ledger: _Ledger) -> None:
+    sys.stderr.write(
+        f"\nUNSCANNED: this range changed {ledger.considered} path(s) and this gate opened none of them:\n"
+    )
+    for label in ledger.path_filtered[:20]:
+        sys.stderr.write(f"  {label}  [excluded by path, content never read]\n")
+    if len(ledger.path_filtered) > 20:
+        sys.stderr.write(f"  ... and {len(ledger.path_filtered) - 20} more\n")
+    sys.stderr.write(
+        "\n"
+        "This is NOT a pass. 'clean' here would rest on the commit messages\n"
+        "alone: no blob's bytes were read, so the verdict was not computed\n"
+        "from the content about to be published. Options:\n"
+        "  - Do not publish these paths: they are build artifacts or skipped\n"
+        "    directories, which the tree gates already refuse to track.\n"
+        "  - Prove them by hand, then bypass this one push deliberately:\n"
+        "    git push --no-verify\n"
     )
 
 
@@ -671,11 +715,18 @@ def main(argv: list[str]) -> int:
 
     # The denominator publishes on EVERY path, clean or blocked. Without it
     # "0 findings" is unfalsifiable: it is what a working scan of a clean
-    # range prints and also what a scan that read nothing prints.
-    if not findings and not ledger.unanalyzable:
+    # range prints and also what a scan that read nothing prints. And it is
+    # now ACTED on: a range that changed paths while this gate opened no blob
+    # at all cannot be called clean, whichever rule kept the bytes closed.
+    unread_range = ledger.considered > 0 and ledger.opened == 0
+    if not findings and not ledger.unanalyzable and not unread_range:
         print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
         for label, size in ledger.binary_skipped:
             print(f"  skipped (binary, not pattern-matched): {label}  {size} bytes")
+        for label in ledger.path_filtered:
+            print(f"  excluded by path (content not read): {label}")
+        for label in ledger.corpus_exempt:
+            print(f"  exempt (scanner's own test corpus): {label}")
         return 0
 
     sys.stderr.write(f"prepush_leak_scan: {len(commits)} commit(s) scanned; {ledger.summary()}\n")
@@ -683,6 +734,8 @@ def main(argv: list[str]) -> int:
         _print_report(findings)
     if ledger.unanalyzable:
         _print_unscannable(ledger)
+    if unread_range:
+        _print_unread_range(ledger)
     return 2 if findings else 3
 
 

@@ -509,6 +509,68 @@ def test_binary_skips_are_disclosed_not_invisible(repo: Path) -> None:
     assert "object.dat" in result.stdout, "a skipped blob is not named anywhere in the verdict"
 
 
+def test_credential_committed_under_a_binary_looking_name_is_read(repo: Path) -> None:
+    """A file NAME is not a measurement of the bytes behind it.
+
+    Measured on the shipped scanner, with the credential in a plain-text file
+    committed as ``logo.png``::
+
+        prepush_leak_scan: clean (1 commit(s) scanned, 0 findings; blobs: 0
+        scanned / 0 bytes, 0 binary-skipped, 1 path-filtered, 0 unanalyzable)
+
+    exit 0 -- the word "clean" over zero bytes read, with the honest
+    denominator printed right beside it and nothing acting on it.
+    """
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    tip = _commit(repo, "logo.png", f'aws = "{"AKIA" + "Z" * 16}"\n', "credential under a binary-looking name")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stdout}"
+    assert "logo.png" in result.stderr
+
+
+def test_pypi_token_in_a_lock_file_is_read(repo: Path) -> None:
+    """``.lock`` sat in the do-not-open suffix list beside ``.exe``, so pip
+    requirement files -- the natural home for an ``--index-url`` credential --
+    were opened by no scanner at all."""
+    base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    token = "pypi-" + "AgEIcHlwaS5vcmcC" + "Aa9_-" * 24
+    tip = _commit(repo, "release/tooling-requirements.lock", f"--index-url https://u:{token}@i/s\n", "pin tooling")
+
+    result = _run(repo, "--range", f"{base}..{tip}")
+
+    assert result.returncode == 2, f"expected BLOCKED, got exit {result.returncode}:\n{result.stdout}"
+    assert "tooling-requirements.lock" in result.stderr
+
+
+def test_range_whose_every_path_went_unopened_refuses_instead_of_passing(repo: Path) -> None:
+    """The ledger is now GATED, not merely published. A range that changed
+    paths while this gate opened no blob at all has no basis for "clean": the
+    verdict would rest on the commit messages alone."""
+    _commit(repo, "build/generated.py", "generated = True\n", "commit a build artifact")
+
+    result = _run(repo, "--range", "HEAD")
+
+    assert result.returncode == 3, f"expected a refusal, got exit {result.returncode}:\n{result.stdout}"
+    assert "UNSCANNED" in result.stderr
+    assert "build/generated.py" in result.stderr, "the refusal does not name the path it never opened"
+
+
+def test_own_test_corpus_exemption_does_not_trip_the_unopened_range_refusal(repo: Path) -> None:
+    """The one named, reviewed path exemption stays outside the denominator.
+    Its content is secret-shaped by construction -- a decided exemption, not a
+    guess about unknown content -- so a push that only touches it is still
+    clean, and the exemption is disclosed rather than silent."""
+    _commit(repo, "tests/test_secret_scan.py", 'planted = "AKIA" + "W" * 16\n', "extend the scanner's own corpus")
+
+    result = _run(repo, "--range", "HEAD")
+
+    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}{result.stderr}"
+    assert "corpus-exempt" in result.stdout
+    assert "tests/test_secret_scan.py" in result.stdout
+
+
 def test_credential_past_the_first_line_batch_is_found_with_a_true_line_number(repo: Path) -> None:
     """Blobs are scanned in bounded line batches. A batching bug that scans
     only the first batch, or that restarts line numbering per batch, would

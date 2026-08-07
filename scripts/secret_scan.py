@@ -49,6 +49,12 @@ leak could hide behind, since it is one named path, not a directory rule.
 Same idiom as roam-code's ``WHITELIST_FILES`` in
 ``scripts/internal_language_patterns.py``, which exempts that pattern
 catalogue's own test file for the identical reason.
+
+Exit codes: 0 = clean, and the verdict publishes the denominator that
+produced it. 1 = finding(s). 3 = candidates were established but none of
+their content was read, so "no findings" would be a verdict this scan did not
+compute. 4 = the scanner's own positive control failed -- it is broken and its
+verdict means nothing.
 """
 
 from __future__ import annotations
@@ -59,11 +65,12 @@ import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 try:
-    from scripts.inventory import InventoryError, git_candidate_files, without_git_controls
+    from scripts.inventory import InventoryError, git_candidate_files, is_binary_content, without_git_controls
 except ModuleNotFoundError:  # Direct ``python scripts/secret_scan.py`` execution.
-    from inventory import InventoryError, git_candidate_files, without_git_controls
+    from inventory import InventoryError, git_candidate_files, is_binary_content, without_git_controls
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -364,34 +371,13 @@ _SKIP_DIRS = frozenset(
     }
 )
 
-_BINARY_EXTENSIONS = frozenset(
-    {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".ico",
-        ".bmp",
-        ".webp",
-        ".pdf",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".whl",
-        ".pyc",
-        ".pyo",
-        ".so",
-        ".dylib",
-        ".dll",
-        ".exe",
-        ".woff",
-        ".woff2",
-        ".ttf",
-        ".eot",
-        ".otf",
-        ".lock",
-    }
-)
+# There is deliberately no suffix list here any more. A file NAME is not a
+# measurement of the bytes behind it: the list this replaced skipped a
+# plain-text credential file named ``logo.png`` unread, and -- because
+# ``.lock`` sat in it beside ``.exe`` and ``.dll`` -- left all four
+# ``release/*.lock`` files (plain-text pip requirement files, the natural home
+# for an ``--index-url`` credential) examined by no scanner at all. Binary is
+# now decided from the content by ``inventory.is_binary_content``.
 
 
 def _in_skip_dir(rel_path: str) -> bool:
@@ -458,15 +444,27 @@ def _finding_identity(finding: dict) -> tuple[object, ...]:
     )
 
 
-def _scan_repo(root: Path) -> tuple[list[dict], int, int]:
+class RepoScan(NamedTuple):
+    """The findings AND the denominator that produced them.
+
+    ``files_examined`` is what makes ``0 findings`` falsifiable: it is the
+    count of candidates whose bytes were actually decoded and matched, as
+    distinct from the count of paths considered.
+    """
+
+    findings: list[dict]
+    candidates: int
+    files_examined: int
+    binary_skipped: int
+
+
+def _scan_repo(root: Path) -> RepoScan:
     findings: list[dict] = []
     candidates = _tracked_files(root)
     files_examined = 0
+    binary_skipped = 0
     for rel_path in candidates:
         if _in_skip_dir(rel_path) or _is_own_test_corpus(rel_path):
-            continue
-        suffix = Path(rel_path).suffix.lower()
-        if suffix in _BINARY_EXTENSIONS:
             continue
         full = root / rel_path
         if full.is_symlink():
@@ -485,6 +483,13 @@ def _scan_repo(root: Path) -> tuple[list[dict], int, int]:
         except OSError as exc:
             findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
             continue
+        if is_binary_content(data):
+            # Non-fatal, and disclosed in the denominator: the bytes WERE read
+            # and classified. That is a decision about this content, not an
+            # admission the scanner never looked -- the distinction the suffix
+            # list it replaced could not make.
+            binary_skipped += 1
+            continue
         files_examined += 1
         prior_view_findings: set[tuple[object, ...]] = set()
         for text in decode_views(data):
@@ -496,11 +501,11 @@ def _scan_repo(root: Path) -> tuple[list[dict], int, int]:
             # finding already emitted from an earlier reading of these bytes.
             prior_view_findings.update(_finding_identity(finding) for finding in view_findings)
     findings.sort(key=lambda f: (f["file"], f["line"], f["pattern_name"]))
-    return findings, len(candidates), files_examined
+    return RepoScan(findings, len(candidates), files_examined, binary_skipped)
 
 
 def scan_repo(root: Path) -> list[dict]:
-    return _scan_repo(root)[0]
+    return _scan_repo(root).findings
 
 
 def format_findings(findings: list[dict]) -> str:
@@ -510,14 +515,68 @@ def format_findings(findings: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# --- positive control -------------------------------------------------------
+# Same discipline ``scripts/prepush_leak_scan.py`` already carried, and for the
+# same reason it was needed there: with ``_COMPILED_PATTERNS`` emptied, this
+# scanner printed ``PASS (established 51 candidate paths; examined 46 text
+# files; 0 findings)`` and returned 0 over the real repository. The control
+# runs through ``decode_views``/``scan_text`` -- the exact path a candidate
+# file's bytes take -- and is UTF-16 encoded so the decode fix is a live
+# control, not only a test. Assembled by concatenation so this file's own
+# source text carries no contiguous match.
+_CONTROL_EXPECTED = ("AWS Access Key", "Anthropic OAuth Token")
+_CONTROL_AWS = "AK" + "IA" + "T" * 16
+_CONTROL_ANTHROPIC = "sk-" + "ant-" + "oat" + "01-" + "Bb8_-" * 12
+
+
+def _control_bytes() -> bytes:
+    return f'aws = "{_CONTROL_AWS}"\nkey = "{_CONTROL_ANTHROPIC}"\n'.encode("utf-16")
+
+
+def _self_test_failures() -> list[str]:
+    """Empty iff this scanner can still find a secret it planted itself.
+
+    One planted case per provider FAMILY, never one overall: the first gate
+    built against this defect self-tested with a GitHub token, passed, and let
+    a real Anthropic OAuth token through untouched.
+    """
+    data = _control_bytes()
+    if is_binary_content(data):
+        return ["control content was classified binary; the text/binary rule is broken"]
+    views = decode_views(data)
+    if not views:
+        return ["control content decoded to zero text views"]
+    names = {finding["pattern_name"] for view in views for finding in scan_text("<control>", view)}
+    return [f"planted control secret not detected: {name}" for name in _CONTROL_EXPECTED if name not in names]
+
+
 def main(argv: list[str] | None = None) -> int:
-    findings, candidate_count, files_examined = _scan_repo(ROOT)
-    if findings:
-        print(format_findings(findings), file=sys.stderr)
+    broken = _self_test_failures()
+    if broken:
+        print("BROKEN: secret_scan's own positive control failed:", file=sys.stderr)
+        for problem in broken:
+            print(f"  {problem}", file=sys.stderr)
+        print(
+            "\nThis scanner cannot find a secret it planted itself, so its\n"
+            "'0 findings' would mean nothing. Fix the scanner; do not push.",
+            file=sys.stderr,
+        )
+        return 4
+    scan = _scan_repo(ROOT)
+    if scan.findings:
+        print(format_findings(scan.findings), file=sys.stderr)
         return 1
+    if scan.files_examined == 0:
+        print(
+            f"REFUSED: established {scan.candidates} candidate path(s) and read the content of none of them "
+            f"({scan.binary_skipped} classified binary). 'No findings' would be a verdict this scan did not\n"
+            "compute -- it is the same output a working scan of a clean tree prints.",
+            file=sys.stderr,
+        )
+        return 3
     print(
-        f"secret scan: PASS (established {candidate_count} candidate paths; "
-        f"examined {files_examined} text files; 0 findings)"
+        f"secret scan: PASS (established {scan.candidates} candidate paths; "
+        f"examined {scan.files_examined} text files; {scan.binary_skipped} binary-skipped; 0 findings)"
     )
     return 0
 

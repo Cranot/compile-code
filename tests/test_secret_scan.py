@@ -280,7 +280,9 @@ def test_clean_secret_scan_reports_established_and_examined_counts(tmp_path, mon
     monkeypatch.setattr(secret_scan, "ROOT", tmp_path)
 
     assert secret_scan.main([]) == 0
-    assert "established 2 candidate paths; examined 2 text files; 0 findings" in capsys.readouterr().out
+    assert (
+        "established 2 candidate paths; examined 2 text files; 0 binary-skipped; 0 findings" in capsys.readouterr().out
+    )
 
 
 def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) -> None:
@@ -299,6 +301,105 @@ def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) 
 
     findings = secret_scan.scan_repo(tmp_path)
     assert [(f["file"], f["pattern_name"]) for f in findings] == [("locked.py", "Unscannable Tracked File")]
+
+
+# ---------------------------------------------------------------------------
+# A NAME IS NOT A MEASUREMENT.
+#
+# The scanner used to decide "binary, do not open" from a suffix list, so it
+# never read a file it had already enumerated as a candidate. Measured on the
+# shipped scanner: a plain-text file named ``logo.png`` carrying an AWS access
+# key produced ``candidates=2 examined=1 findings=0`` -- and because ``.lock``
+# sat in that same list beside ``.exe``, all four ``release/*.lock`` files
+# (plain-text pip requirement files, the natural home for an ``--index-url``
+# credential) were examined by no scanner at all.
+# ---------------------------------------------------------------------------
+
+
+def _repo_with(tmp_path, files: dict[str, bytes]):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    for rel, blob in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
+        subprocess.run(["git", "add", "--", rel], cwd=tmp_path, check=True)
+    return tmp_path
+
+
+def test_credential_under_a_binary_looking_name_is_read_not_skipped(tmp_path) -> None:
+    key = "AKIA" + "Z" * 16
+    root = _repo_with(tmp_path, {"logo.png": f'aws = "{key}"\n'.encode()})
+
+    scan = secret_scan._scan_repo(root)
+
+    assert scan.files_examined == 1, "the file was enumerated as a candidate and then never opened"
+    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [("logo.png", "AWS Access Key")]
+
+
+def test_pypi_token_in_a_lock_file_is_found(tmp_path) -> None:
+    """``release/*.lock`` are plain-text pip requirement files. A publish
+    credential's natural home is their ``--index-url`` line, and ``.lock`` was
+    on the do-not-open list, so this file was read by nothing."""
+    token = "pypi-" + "AgEIcHlwaS5vcmcC" + "Aa9_-" * 24
+    root = _repo_with(tmp_path, {"release/tooling-requirements.lock": f"--index-url https://u:{token}@i/s\n".encode()})
+
+    scan = secret_scan._scan_repo(root)
+
+    assert scan.files_examined == 1
+    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [
+        ("release/tooling-requirements.lock", "PyPI Token")
+    ]
+
+
+def test_genuine_binary_is_still_not_pattern_matched_but_is_disclosed(tmp_path) -> None:
+    """Conservation: deciding from content must not turn every committed PNG
+    into noise. The skip survives -- it is now an observation about the bytes,
+    and it rides in the published denominator."""
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
+    root = _repo_with(tmp_path, {"image.png": png, "readme.md": b"benign\n"})
+
+    scan = secret_scan._scan_repo(root)
+
+    assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (2, 1, 1)
+    assert scan.findings == []
+
+
+def test_scan_that_read_nothing_refuses_instead_of_passing(tmp_path, monkeypatch, capsys) -> None:
+    """``examined == 0`` is the estate's signature false clean: the same output
+    a working scan of a clean tree prints, with an empty denominator behind
+    it. The printed number is now acted on, not merely disclosed."""
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452") + bytes(range(256)) * 4
+    root = _repo_with(tmp_path, {"image.png": png})
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+
+    assert secret_scan.main([]) == 3
+    assert "read the content of none of them" in capsys.readouterr().err
+
+
+def test_scanner_that_finds_nothing_reports_broken_not_clean(tmp_path, monkeypatch, capsys) -> None:
+    """The planted-control discipline ``prepush_leak_scan`` already had. With
+    the catalogue emptied this scanner printed ``PASS (established 51
+    candidate paths; examined 46 text files; 0 findings)`` over the real
+    repository and returned 0."""
+    root = _repo_with(tmp_path, {"readme.md": b"benign\n"})
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+    assert secret_scan._self_test_failures() == [], "the positive control does not pass on healthy code"
+
+    monkeypatch.setattr(secret_scan, "_COMPILED_PATTERNS", [])
+
+    assert secret_scan._self_test_failures(), "an emptied catalogue passed the scanner's own positive control"
+    assert secret_scan.main([]) == 4
+    assert "positive control failed" in capsys.readouterr().err
+
+
+def test_positive_control_covers_a_family_the_narrow_catalogue_misses(monkeypatch) -> None:
+    """One planted case per provider FAMILY, never one overall: the first gate
+    built against this defect self-tested with a GitHub token, passed, and let
+    a real Anthropic OAuth token through untouched."""
+    survivors = [p for p in secret_scan._COMPILED_PATTERNS if p["name"] != "Anthropic OAuth Token"]
+    monkeypatch.setattr(secret_scan, "_COMPILED_PATTERNS", survivors)
+
+    assert secret_scan._self_test_failures() == ["planted control secret not detected: Anthropic OAuth Token"]
 
 
 def test_tracked_symlink_is_reported_and_worktree_deletion_is_not(monkeypatch, tmp_path) -> None:

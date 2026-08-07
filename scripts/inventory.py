@@ -3,6 +3,11 @@
 An empty or partially enumerated collection is not evidence that its members
 are clean.  The helpers here keep that distinction in one place so scanners
 do not each grow a subtly different loop guard.
+
+The same rule governs an individual member: a scanner may only decline to read
+content on evidence from the CONTENT.  ``is_binary_content`` is that evidence,
+kept here so all three gates share one answer -- see its docstring for the
+false clean that name-based skipping produced.
 """
 
 from __future__ import annotations
@@ -16,9 +21,56 @@ from typing import Any, Callable
 
 MAX_GIT_INVENTORY_BYTES = 16 * 1024 * 1024
 
+# Everything a text file may legitimately contain outside the printable set.
+_TEXT_CONTROL_CHARS = frozenset("\t\n\r\f\v")
+
 
 class InventoryError(RuntimeError):
     """The complete set to examine could not be established."""
+
+
+def is_utf16_text(data: bytes) -> bool:
+    """True iff NUL-bearing *data* is UTF-16 text rather than binary.
+
+    A byte-order mark settles it. Without one, the bytes are accepted as text
+    only when removing the NUL padding leaves strictly-valid UTF-8 carrying no
+    control characters a text file would not -- which a PNG, a zip or an object
+    file will not satisfy, so the binary skip is preserved.
+    """
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return True
+    try:
+        text = data.replace(b"\x00", b"").decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    return not any(ch < " " and ch not in _TEXT_CONTROL_CHARS for ch in text)
+
+
+def is_binary_content(data: bytes) -> bool:
+    """True iff *data* is binary, i.e. content a pattern catalogue cannot read.
+
+    THE ONLY admissible reason for a scanner to leave content unread. Each of
+    this repository's three scanners used to decide that question from the
+    PATH instead -- a suffix list (``.png``, ``.lock``, ...) in
+    ``secret_scan``/``prepush_leak_scan``, a shorter one in ``check`` -- and a
+    file name is not a measurement of the bytes behind it. Measured on the
+    shipped scanners before this moved here: a plain-text file named
+    ``logo.png`` carrying an AWS access key produced
+
+        prepush_leak_scan: clean (1 commit(s) scanned, 0 findings; blobs: 0
+        scanned / 0 bytes, 0 binary-skipped, 1 path-filtered, 0 unanalyzable)
+
+    with exit 0, and ``check.leak_scan`` printed PASS beside it. A PyPI upload
+    token in ``release/tooling-requirements.lock`` -- a plain-text pip
+    requirements file, and the natural home for an index credential -- passed
+    all three gates for the same reason.
+
+    Deciding from the content keeps the conservation rule the UTF-16 fix
+    established (a gate buried in noise from every committed object file is a
+    gate that gets bypassed) while making the skip an observation about these
+    bytes rather than a guess from their name.
+    """
+    return b"\x00" in data and not is_utf16_text(data)
 
 
 def without_git_controls(environment: dict[str, str] | None = None) -> dict[str, str]:
