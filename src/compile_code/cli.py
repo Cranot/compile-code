@@ -661,13 +661,39 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
     return info
 
 
+def _roam_remediation(version: object = None) -> str:
+    """Remediation that names the direction the constraint actually resolves.
+
+    The compatibility interval is closed at BOTH ends, so a version mismatch
+    has two opposite causes and one printed fix used to serve both. For a
+    caller below the floor, "upgrade roam" is exactly right. For a caller above
+    the ceiling -- the state every roam major bump produces -- the same
+    sentence describes the opposite of what happens: pip resolves the pin
+    DOWNWARD and installs an older roam than the one already on PATH.
+    (Measured: `pip install --upgrade "<pkg>>=a,<b>"` against an installed
+    version above `b` exits 0 and downgrades. The command works; the word
+    "upgrade" is what is false.) Worse, it names only one of the two valid
+    answers -- a caller who wants to keep the newer roam is never told that
+    moving compile-code forward is the other one.
+    """
+    pin = f'python -m pip install "{ROAM_PACKAGE_REQUIREMENT}"'
+    parsed = _parse_version_value(version) if isinstance(version, str) else None
+    if parsed is not None and parsed[0][0] >= MAX_ROAM_MAJOR_EXCLUSIVE:
+        return (
+            f"{pin} to pin roam back into the supported interval — this installs an OLDER roam than the "
+            "one on PATH — or keep that roam and move this side forward with "
+            "python -m pip install --upgrade compile-code"
+        )
+    return f'python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
+
+
 def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
     """Return the product exit code and verdict for an unusable roam install."""
     state = info.get("state")
     executable = info.get("path")
     version = info.get("version")
     metadata_version = info.get("metadata_version")
-    fix = f'python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
+    fix = _roam_remediation(version)
     if state == "missing":
         return EXIT_TOOLCHAIN, f"VERDICT: toolchain missing — `roam` is not on PATH. Fix: {fix}"
     if state == "timeout":

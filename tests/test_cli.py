@@ -697,7 +697,29 @@ class TestRoamVersionEnforcement:
         assert result.exit_code == mod.EXIT_TOOLCHAIN
         assert "toolchain version mismatch" in result.output
         assert "requires >=13.10.0,<14" in result.output
-        assert 'pip install --upgrade "roam-code>=13.10.0,<14"' in result.output
+        # The interval is closed at both ends, so the remediation must name the
+        # direction it actually resolves. For a caller ABOVE the ceiling the pin
+        # installs an older roam than the one on PATH; calling that an upgrade
+        # describes the opposite of what happens, and naming only that option
+        # hides the other valid answer for a caller who wants the newer roam.
+        assert 'pip install "roam-code>=13.10.0,<14"' in result.output
+        assert "installs an OLDER roam" in result.output
+        assert "pip install --upgrade compile-code" in result.output
+        assert 'pip install --upgrade "roam-code>=13.10.0,<14"' not in result.output
+
+    def test_a_version_below_the_floor_is_still_told_to_upgrade_roam(self):
+        # The other half of the closed interval must not drift with it.
+        below = mod._roam_remediation("13.9.9")
+
+        assert below == 'python -m pip install --upgrade "roam-code>=13.10.0,<14"'
+        assert "OLDER" not in below
+
+    @pytest.mark.parametrize("version", [None, "", "not-a-version", 14, object()])
+    def test_an_unreadable_version_falls_back_to_the_plain_upgrade(self, version):
+        # Reached from the `missing`, `timeout` and `broken` states, where no
+        # version was ever observed. An absent measurement must not be read as
+        # "above the ceiling".
+        assert mod._roam_remediation(version) == 'python -m pip install --upgrade "roam-code>=13.10.0,<14"'
 
     def test_doctor_reports_path_version_and_metadata_separately(self, runner, monkeypatch, tmp_path):
         path = r"C:\old-bin\roam.exe"
