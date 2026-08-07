@@ -405,7 +405,7 @@ def test_unreadable_tracked_file_is_reported_not_skipped(monkeypatch, tmp_path) 
     monkeypatch.setattr(secret_scan.Path, "read_bytes", deny)
 
     findings = secret_scan.scan_repo(tmp_path)
-    assert [(f["file"], f["pattern_name"]) for f in findings] == [("locked.py", "Unscannable Tracked File")]
+    assert [(f["file"], f["pattern_name"]) for f in findings] == [("locked.py", "Unscannable Candidate File")]
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +461,7 @@ def test_genuine_binary_is_not_pattern_matched_but_is_refused_by_name(tmp_path) 
 
     Conservation: a real PNG still produces no credential-shaped finding --
     deciding from content must not turn every committed image into catalogue
-    noise. Fail-closed: it produces an ``Unscannable Tracked File`` finding
+    noise. Fail-closed: it produces an ``Unscannable Candidate File`` finding
     instead of a silent bucket entry, because no pattern ever ran over those
     bytes and "0 findings" for them is a verdict this scan did not compute.
     """
@@ -471,7 +471,7 @@ def test_genuine_binary_is_not_pattern_matched_but_is_refused_by_name(tmp_path) 
     scan = secret_scan._scan_repo(root)
 
     assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (2, 1, 1)
-    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [("image.png", "Unscannable Tracked File")]
+    assert [(f["file"], f["pattern_name"]) for f in scan.findings] == [("image.png", "Unscannable Candidate File")]
     assert scan.unaccounted == 0
 
 
@@ -495,7 +495,7 @@ def test_binary_credential_beside_one_readable_file_refuses(tmp_path, monkeypatc
     assert secret_scan.main([]) == 1
     error = capsys.readouterr().err
     assert "release/toolstate.dat" in error, "the unread tracked file is not named in the refusal"
-    assert "Unscannable Tracked File" in error
+    assert "Unscannable Candidate File" in error
 
 
 def test_scan_that_read_nothing_refuses_instead_of_passing(tmp_path, monkeypatch, capsys) -> None:
@@ -550,7 +550,7 @@ def test_tracked_symlink_is_reported_and_worktree_deletion_is_not(monkeypatch, t
     monkeypatch.setattr(secret_scan.Path, "is_symlink", lambda self: self.name == "link.py")
 
     findings = secret_scan.scan_repo(tmp_path)
-    assert [(f["file"], f["matched_text"]) for f in findings] == [("link.py", "tracked symlink")]
+    assert [(f["file"], f["matched_text"]) for f in findings] == [("link.py", "symlink candidate")]
 
 
 # ---------------------------------------------------------------------------

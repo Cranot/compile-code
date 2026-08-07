@@ -801,14 +801,45 @@ def test_binary_candidate_refuses_and_a_readable_companion_does_not_rescue_it(tm
     assert check.leak_scan() is False
     output = capsys.readouterr().out
     assert "examined 0 text files" in output
-    assert "toolstate.dat  [tracked binary content]" in output
+    assert "toolstate.dat  [unscannable binary content]" in output
 
     (tmp_path / "readme.md").write_text("benign\n", encoding="utf-8")
     subprocess.run(["git", "add", "--", "readme.md"], cwd=tmp_path, check=True)
     assert check.leak_scan() is False, "one readable companion file turned the unread blob back into a PASS"
     output = capsys.readouterr().out
     assert "established 2 candidate paths; examined 1 text files; 1 not read; 1 findings" in output, output
-    assert "toolstate.dat  [tracked binary content]" in output
+    assert "toolstate.dat  [unscannable binary content]" in output
+
+
+def test_an_untracked_binary_refuses_and_is_not_called_tracked(tmp_path, monkeypatch, capsys):
+    """The population is candidates, so the disposition word must be too.
+
+    ``_tracked_files`` is ``git ls-files --cached --others
+    --exclude-standard``: an untracked, non-ignored working-tree file is in it.
+    The refusal shipped calling such a path ``[tracked binary content]`` and
+    prescribing ``git rm --cached``, which answers ``fatal: pathspec ... did
+    not match any files`` for exactly those paths. Measured on the shipped
+    gate with a stray ``stray-artifact.bin`` that was never ``git add``-ed:
+    ``SECRET_SCAN_EXIT=1``, ``leak scan: FAIL ... [tracked binary content]``,
+    and the printed remedy fatal. The refusal is correct and stays; the two
+    false statements in it do not.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "readme.md").write_text("benign\n", encoding="utf-8")
+    subprocess.run(["git", "add", "--", "readme.md"], cwd=tmp_path, check=True)
+    (tmp_path / "stray-artifact.bin").write_bytes(b"\x00\x80local build output, never git add-ed\n")
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False, "a binary candidate must refuse whether or not it is tracked"
+    output = capsys.readouterr().out
+    line = next(entry for entry in output.splitlines() if "stray-artifact.bin" in entry)
+    assert "[unscannable binary content]" in line, line
+    assert "tracked" not in line.split("]")[0], f"an untracked candidate is described as tracked: {line}"
+    assert ".gitignore" in line, f"the remedy for an untracked candidate is missing: {line}"
+    probe = subprocess.run(
+        ["git", "rm", "--cached", "stray-artifact.bin"], cwd=tmp_path, capture_output=True, text=True
+    )
+    assert probe.returncode != 0, "fixture drift: the path is tracked, so the old remedy would have worked"
 
 
 def test_leak_gate_that_finds_nothing_reports_broken_not_pass(tmp_path, monkeypatch, capsys):
@@ -836,6 +867,28 @@ def test_leak_control_covers_both_catalogue_families(monkeypatch):
     for label in ("AWS access key", "VPS-local path", "GitHub token", "AI provider key"):
         monkeypatch.setattr(check, "LEAK_PATTERNS", [p for p in check.LEAK_PATTERNS if p[1] != label])
         assert check._leak_control_failures() == [f"planted control leak not detected: {label}"]
+        monkeypatch.undo()
+
+
+def test_leak_control_fires_when_the_expectation_list_itself_is_edited(monkeypatch):
+    """The control has TWO editable halves, and it used to guard only one.
+
+    ``_leak_control_failures`` built its result as a comprehension over
+    ``_LEAK_CONTROL_EXPECTED``, so deleting a family from that tuple could only
+    ever shorten the list. Measured on the shipped gate: dropping ``"AI
+    provider key"`` from the tuple returned ``[]`` and ``leak_scan()`` printed
+    PASS, while dropping the same family from ``LEAK_PATTERNS`` returned the
+    expected failure -- so the commit that added the family described the
+    mechanism backwards, and the cheaper of the two edits was the unguarded
+    one. The two sets must agree exactly, in both directions.
+    """
+    for label in check._LEAK_CONTROL_EXPECTED:
+        monkeypatch.setattr(
+            check, "_LEAK_CONTROL_EXPECTED", tuple(n for n in check._LEAK_CONTROL_EXPECTED if n != label)
+        )
+        assert check._leak_control_failures() == [
+            f"planted control leak no longer declared in _LEAK_CONTROL_EXPECTED: {label}"
+        ]
         monkeypatch.undo()
 
 

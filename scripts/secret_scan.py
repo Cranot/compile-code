@@ -521,18 +521,26 @@ def _tracked_files(root: Path) -> list[str]:
 
 
 def _unscannable_finding(rel_path: str, reason: str) -> dict:
-    """A tracked file this scanner could not read is a finding, not a skip.
+    """A candidate file this scanner could not read is a finding, not a skip.
 
-    ``scripts/check.py::_scan_file_for_leaks`` already reports tracked
-    symlinks and unreadable tracked files instead of passing over them. A
-    scanner that answers "clean" for content it never decoded is stating a
-    result it did not compute.
+    ``scripts/check.py::_scan_file_for_leaks`` already reports symlink and
+    unreadable candidates instead of passing over them. A scanner that answers
+    "clean" for content it never decoded is stating a result it did not
+    compute.
+
+    CANDIDATE, NOT "TRACKED". ``_tracked_files`` returns ``git ls-files
+    --cached --others --exclude-standard``, so an untracked, non-ignored
+    working-tree file is in this population. The name shipped as ``Unscannable
+    Tracked File`` and the remedy shipped as ``git rm --cached``, which
+    answers ``fatal: pathspec '<path>' did not match any files`` for every
+    untracked path it was printed at -- a false statement about the file and
+    an inoperable instruction to the operator, in the same line.
     """
     return {
         "file": rel_path,
         "line": 1,
         "severity": "high",
-        "pattern_name": "Unscannable Tracked File",
+        "pattern_name": "Unscannable Candidate File",
         "matched_text": reason,
     }
 
@@ -609,23 +617,23 @@ def _scan_repo(root: Path) -> RepoScan:
         full = root / rel_path
         if full.is_symlink():
             unscannable += 1
-            findings.append(_unscannable_finding(rel_path, "tracked symlink"))
+            findings.append(_unscannable_finding(rel_path, "symlink candidate"))
             continue
         if not full.exists():
-            # Tracked but deleted from the worktree: there is genuinely no
+            # Enumerated but absent from the worktree: there is genuinely no
             # content here to scan. That is a true "nothing", not an
             # uncomputed one, so it stays a skip.
             absent += 1
             continue
         if not full.is_file():
             unscannable += 1
-            findings.append(_unscannable_finding(rel_path, "tracked path is not a regular file"))
+            findings.append(_unscannable_finding(rel_path, "candidate path is not a regular file"))
             continue
         try:
             data = full.read_bytes()
         except OSError as exc:
             unscannable += 1
-            findings.append(_unscannable_finding(rel_path, f"unreadable tracked file: {exc.strerror or exc}"))
+            findings.append(_unscannable_finding(rel_path, f"unreadable candidate file: {exc.strerror or exc}"))
             continue
         if is_binary_content(data):
             # FAIL CLOSED. Classifying bytes is not matching them: no pattern
@@ -641,15 +649,30 @@ def _scan_repo(root: Path) -> RepoScan:
             # Conservation is kept by the FINDING, not by the skip: the bytes
             # are still never pattern-matched, so this is one line naming a
             # path rather than catalogue noise from every committed image.
-            # Measured cost of the refusal when it landed: 0 tracked files in
-            # this repository are binary, and 0 binary blobs appear anywhere in
-            # its 424 commits of history.
+            #
+            # COST, RE-MEASURED, AND IT IS NOT ZERO. The commit that added this
+            # refusal recorded "measured cost: zero" over the TRACKED tree and
+            # over history, which is the wrong population: this loop runs on
+            # ``git ls-files --cached --others --exclude-standard``, so a stray
+            # untracked, non-ignored binary anywhere in the worktree -- a build
+            # artifact, a downloaded wheel, a scratch .db -- refuses this scan
+            # and, through ``check.leak_scan``, every local push, until it is
+            # deleted or gitignored. ``.gitignore`` here carries directory
+            # names only, no suffix rules, so nothing catches those by default.
+            # What IS zero, re-measured at this commit: 0 of 51 candidates are
+            # binary, and 0 of the 480 distinct blobs reachable from every ref
+            # (``git rev-list --objects --all``) are binary -- so nothing ever
+            # committed here refuses, which is a narrower claim than the one
+            # that shipped. The "424 commits" in that claim reproduces under no
+            # counting rule; the repository had 426 commits reachable from HEAD
+            # when it was written.
             binary_skipped += 1
             findings.append(
                 _unscannable_finding(
                     rel_path,
-                    "tracked binary content: no pattern catalogue can read these bytes -- "
-                    "untrack it (git rm --cached) rather than tracking content no gate can inspect",
+                    "binary content: no pattern catalogue can read these bytes -- "
+                    "git rm --cached it if it is tracked, delete it or add a .gitignore rule if it is not, "
+                    "rather than admitting content no gate can inspect",
                 )
             )
             continue

@@ -2703,11 +2703,39 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(TypeError):
             mod._partition_non_source_scope(["venv/mypkg/mod.py"])
 
-    def test_descent_and_discovery_share_one_non_source_directory_set(self):
+    def test_descent_and_discovery_share_one_non_source_directory_set(self, tmp_path):
         # Two sets would be free to drift, and the drift is invisible: descent
         # would refuse a directory that discovery had already handed to roam.
+        #
+        # THE DESCENT HALF IS A BEHAVIOURAL PROPERTY, derived from the constant
+        # rather than named in a string. The version of this test that only
+        # asserted `"NON_SOURCE_SCOPE_DIRECTORIES" in getsource(...)` for BOTH
+        # sides was replaced by one that asserted it for discovery only, plus a
+        # behavioural test exercising the single name "venv" -- and that trade
+        # was measured to lose a mutation class: rewriting cli.py's
+        # `skip_dirs = NON_SOURCE_SCOPE_DIRECTORIES` to
+        # `skip_dirs = frozenset({"venv"})` left the whole suite green at 332
+        # passed / 8 skipped, while handing roam `src/.git/config`,
+        # `src/.roam/index.db` and `src/__pycache__/*.pyc` as verify targets --
+        # the exact false scope the constant exists to prevent. Every name is
+        # covered here because the loop is over the constant itself.
         assert "NON_SOURCE_SCOPE_DIRECTORIES" in inspect.getsource(mod._partition_non_source_scope)
         assert ".roam" in mod.NON_SOURCE_SCOPE_DIRECTORIES
+
+        root = tmp_path / "src"
+        root.mkdir()
+        (root / "app.py").write_text("z=1\n", encoding="utf-8")
+        for name in sorted(mod.NON_SOURCE_SCOPE_DIRECTORIES):
+            (root / name).mkdir()
+            (root / name / "inside.py").write_text("x=1\n", encoding="utf-8")
+
+        assert mod._expand_verify_targets(["src"], tmp_path) == ["src/app.py"], (
+            "explicit descent no longer prunes every name in the shared set"
+        )
+        # ...and each pruned name is still reachable when it is the one NAMED,
+        # so the set is a descent filter and not a refusal of the path.
+        for name in sorted(mod.NON_SOURCE_SCOPE_DIRECTORIES):
+            assert mod._expand_verify_targets([f"src/{name}"], tmp_path) == [f"src/{name}/inside.py"]
 
     def test_explicit_descent_prunes_nested_tool_state_names_but_never_the_named_one(self, tmp_path):
         # THE RESIDUAL, AS A PROPERTY. The claim this replaces was a

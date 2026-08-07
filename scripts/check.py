@@ -927,22 +927,33 @@ def _leak_scan_file(rel: str) -> tuple[bool, list[str]]:
     decided by ``inventory.is_binary_content`` from the bytes themselves; the
     suffix list this replaced (``.png``/``.jpg``/``.gif``/``.ico``) meant a
     plain-text credential file named ``logo.png`` printed PASS unread.
+
+    NOTHING HERE MAY SAY "tracked". ``_tracked_files`` is named for the common
+    case but returns ``git ls-files --cached --others --exclude-standard``, so
+    an UNTRACKED, non-ignored working-tree file is a candidate too -- and the
+    refusal added for binary content shipped calling such a path "tracked
+    binary content" and prescribing ``git rm --cached``, which answers
+    ``fatal: pathspec '<path>' did not match any files`` for exactly the paths
+    it was printed at. The disposition word is now what this function actually
+    measured (the bytes, the link, the read error), and the remedy names both
+    dispositions because no trackedness oracle is consulted here.
     """
     path = ROOT / rel
     if path.is_symlink():
-        return False, [f"  {rel}  [tracked symlink] release source must be regular"]
+        return False, [f"  {rel}  [symlink candidate] release source must be regular"]
     try:
         data = path.read_bytes()
     except OSError as exc:
-        return False, [f"  {rel}  [unreadable tracked file] {exc}"]
+        return False, [f"  {rel}  [unreadable candidate file] {exc}"]
     if is_binary_content(data):
         # FAIL CLOSED, and name the file. Returning ``(False, [])`` here made
-        # a tracked binary invisible to everything except the range-global
+        # a binary candidate invisible to everything except the range-global
         # ``examined == 0`` floor, which one readable companion file defeats.
         # The bytes are still not pattern-matched -- conservation lives in the
         # single reported line, not in a silent skip.
         return False, [
-            f"  {rel}  [tracked binary content] no pattern catalogue can read these bytes; untrack it (git rm --cached)"
+            f"  {rel}  [unscannable binary content] no pattern catalogue can read these bytes; "
+            "git rm --cached it if it is tracked, delete it or add a .gitignore rule if it is not"
         ]
     hits: dict[tuple[int, str], None] = {}
     for view in _scan_views(data):
@@ -995,6 +1006,17 @@ def _leak_control_failures() -> list[str]:
     ``PASS (examined 51 candidate paths; 0 findings)`` and returned True over
     the real repository. ``prepush_leak_scan`` already refused under the same
     sabotage; the discipline was on one of the three scanners only.
+
+    THE CONTROL MUST FIRE IN BOTH DIRECTIONS, and as first written it fired in
+    only one. The failure list was a comprehension OVER
+    ``_LEAK_CONTROL_EXPECTED``, so DELETING a family from that tuple could only
+    ever make the list shorter. Measured: dropping ``"AI provider key"`` from
+    the tuple returned ``[]`` and ``leak_scan()`` printed PASS, while dropping
+    the same family from ``LEAK_PATTERNS`` returned the expected failure -- the
+    opposite edit from the one the commit that added it described. The tuple is
+    the easier of the two to edit and the likelier to be tidied away, so the
+    set the planted corpus produces and the set this tuple declares must now
+    agree EXACTLY rather than one-way.
     """
     found: set[str] = set()
     for data in (_LEAK_CONTROL_UTF8.encode("utf-8"), _LEAK_CONTROL_UTF16.encode("utf-16")):
@@ -1005,7 +1027,12 @@ def _leak_control_failures() -> list[str]:
             return ["control content decoded to zero text views"]
         for view in views:
             found.update(label for _, label in _leak_pattern_hits(view))
-    return [f"planted control leak not detected: {name}" for name in _LEAK_CONTROL_EXPECTED if name not in found]
+    missing = [f"planted control leak not detected: {name}" for name in _LEAK_CONTROL_EXPECTED if name not in found]
+    undeclared = [
+        f"planted control leak no longer declared in _LEAK_CONTROL_EXPECTED: {name}"
+        for name in sorted(found - set(_LEAK_CONTROL_EXPECTED))
+    ]
+    return missing + undeclared
 
 
 def _tracked_files() -> list[str]:

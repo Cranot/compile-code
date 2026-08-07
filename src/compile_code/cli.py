@@ -112,7 +112,10 @@ MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 #   $ compile verify venv/
 #     VERDICT: verifier protocol failure: receipt field/reason
 #              scope_path_not_canonical; scope target indices 0
-#     EXIT=2, and roam was never launched.
+#     EXIT=2, and roam is never handed a verify scope. It IS launched once
+#     first: _verify calls _inspect_roam() -> `roam --version` before
+#     _prepare_verify_request can raise, so a stub roam logging its argv
+#     records ['--version'] on this run and nothing else.
 #
 # An earlier wording of this bound said descent "reaches venv/__init__.py but
 # not venv/mypkg/mod.py", and gave `compile verify venv/` as the command that
