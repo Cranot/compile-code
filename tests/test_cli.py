@@ -3310,6 +3310,65 @@ class TestVerifyDirectoryTraversal:
         with pytest.raises(ValueError, match="verification_directory_timeout"):
             mod._expand_verify_targets(["src"], tmp_path)
 
+    @pytest.mark.parametrize(
+        ("constant", "value", "reason"),
+        (
+            ("MAX_VERIFY_DIRECTORIES", 1, "verification_directory_limit"),
+            ("MAX_VERIFY_DIRECTORY_ENTRIES", 1, "verification_directory_entry_limit"),
+        ),
+    )
+    def test_a_racing_bound_names_every_axis_not_only_the_one_that_fired(
+        self, monkeypatch, tmp_path, constant, value, reason
+    ):
+        # Three bounds share one traversal loop and which one trips is decided
+        # by filesystem throughput, not by policy: the same tree on the same
+        # machine has reported a different reason on a different day. A reason
+        # that names only its own bound reports that coin flip as a finding.
+        # Every branch must state directories, entries and seconds so the
+        # reader can predict the other bounds on their own hardware.
+        source = tmp_path / "src" / "nested"
+        source.mkdir(parents=True)
+        (source / "a.py").write_text("pass\n", encoding="utf-8")
+        (source / "b.py").write_text("pass\n", encoding="utf-8")
+        monkeypatch.setattr(mod, constant, value)
+
+        with pytest.raises(ValueError, match=reason) as error:
+            mod._expand_verify_targets(["src"], tmp_path)
+
+        raw = str(error.value)
+        assert raw.startswith(f"{reason}: ")
+        assert "directories" in raw and "entries" in raw and "dirs/s" in raw
+
+        verdict = mod._unsafe_scope_verdict(error.value)
+        assert verdict is not None
+        assert "directories" in verdict and "entries" in verdict and "dirs/s" in verdict
+
+    def test_the_traversal_deadline_also_names_every_axis(self, monkeypatch, tmp_path):
+        source = tmp_path / "src"
+        source.mkdir()
+        (source / "a.py").write_text("pass\n", encoding="utf-8")
+        ticks = iter([0.0, 0.0, mod.MAX_VERIFY_TRAVERSAL_SECONDS + 1.0])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(ticks))
+
+        with pytest.raises(ValueError, match="verification_directory_timeout") as error:
+            mod._expand_verify_targets(["src"], tmp_path)
+
+        verdict = mod._unsafe_scope_verdict(error.value)
+        assert verdict is not None
+        assert f"{mod.MAX_VERIFY_TRAVERSAL_SECONDS:g}-second safety limit at " in verdict
+        assert f"of {mod.MAX_VERIFY_DIRECTORIES} directories" in verdict
+        assert f"of {mod.MAX_VERIFY_DIRECTORY_ENTRIES} entries" in verdict
+        assert f"{mod.MAX_VERIFY_TRAVERSAL_SECONDS + 1.0:.1f}s of" in verdict
+
+    def test_a_reason_without_a_position_still_renders(self):
+        # Older raise sites and forwarded reasons carry no detail; the verdict
+        # must degrade to the bare bound rather than to a dangling preposition.
+        verdict = mod._unsafe_scope_verdict(ValueError("verification_directory_timeout"))
+
+        assert verdict is not None
+        assert f"{mod.MAX_VERIFY_TRAVERSAL_SECONDS:g}-second safety limit." in verdict
+        assert " at " not in verdict
+
 
 def _write_valid_claude_wiring(root: Path, *, hook_version: int = 10, include_verify: bool = True) -> Path:
     claude_dir = root / ".claude"

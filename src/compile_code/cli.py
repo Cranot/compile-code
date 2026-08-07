@@ -2751,6 +2751,27 @@ def _verification_root() -> Path:
     return current
 
 
+def _traversal_position(directories: int, entries: int, elapsed: float) -> str:
+    """Describe where a bounded traversal stood on EVERY axis, not only the one that fired.
+
+    Three bounds share one loop: a directory count, an entry count and a wall
+    clock. Which one trips is decided by the user's filesystem throughput, not
+    by policy -- the same tree on the same machine has reported a different
+    reason on a different day. Naming only the bound that fired therefore
+    reports a coin flip as if it were a finding, and tells the reader nothing
+    about how far the other bounds were from firing. Every branch reports the
+    same three coordinates so the reason is reproducible reading rather than a
+    race outcome. This discloses more; it moves no bound and refuses nothing
+    extra.
+    """
+    rate = f"{directories / elapsed:.0f}" if elapsed > 0 else "unmeasured"
+    return (
+        f"{directories} of {MAX_VERIFY_DIRECTORIES} directories, "
+        f"{entries} of {MAX_VERIFY_DIRECTORY_ENTRIES} entries, "
+        f"{elapsed:.1f}s of {MAX_VERIFY_TRAVERSAL_SECONDS:g} (~{rate} dirs/s)"
+    )
+
+
 def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
     """Expand explicit directories deterministically under closed resource bounds."""
     try:
@@ -2783,10 +2804,17 @@ def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
     pending = deque(path for _relative, path in directories)
     directory_count = 0
     entry_count = 0
-    deadline = time.monotonic() + MAX_VERIFY_TRAVERSAL_SECONDS
+    started = time.monotonic()
+    deadline = started + MAX_VERIFY_TRAVERSAL_SECONDS
     while pending:
-        if time.monotonic() > deadline:
-            raise ValueError("verification_directory_timeout")
+        # Read the clock ONCE per check and reuse it for the disclosure. A
+        # second `time.monotonic()` call at the raise site would report a
+        # different instant than the one that decided the refusal.
+        now = time.monotonic()
+        if now > deadline:
+            raise ValueError(
+                "verification_directory_timeout: " + _traversal_position(directory_count, entry_count, now - started)
+            )
         current = pending.popleft()
         current_key = os.path.normcase(str(current))
         if current_key in seen_directories:
@@ -2794,7 +2822,10 @@ def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
         seen_directories.add(current_key)
         directory_count += 1
         if directory_count > MAX_VERIFY_DIRECTORIES:
-            raise ValueError("verification_directory_limit")
+            raise ValueError(
+                "verification_directory_limit: "
+                + _traversal_position(directory_count, entry_count, time.monotonic() - started)
+            )
         before = _validated_verify_directory_state(current, canonical_root)
         names: list[str] = []
         try:
@@ -2802,9 +2833,16 @@ def _expand_verify_targets(targets: list[str], root: Path) -> list[str]:
                 for entry in entries:
                     entry_count += 1
                     if entry_count > MAX_VERIFY_DIRECTORY_ENTRIES:
-                        raise ValueError("verification_directory_entry_limit")
-                    if time.monotonic() > deadline:
-                        raise ValueError("verification_directory_timeout")
+                        raise ValueError(
+                            "verification_directory_entry_limit: "
+                            + _traversal_position(directory_count, entry_count, time.monotonic() - started)
+                        )
+                    now = time.monotonic()
+                    if now > deadline:
+                        raise ValueError(
+                            "verification_directory_timeout: "
+                            + _traversal_position(directory_count, entry_count, now - started)
+                        )
                     names.append(entry.name)
         except ValueError:
             raise
@@ -3769,6 +3807,10 @@ def _unsafe_scope_verdict(error: BaseException) -> str | None:
     raw_reason = str(error)
     reason, _, detail = raw_reason.partition(": ")
     location = f" ({detail})" if detail else " (scope location unavailable)"
+    # The three traversal bounds race on the user's filesystem, so each of them
+    # reports the reader's position on all three rather than only the one that
+    # tripped. An older raise site that carries no detail still renders.
+    position = f" at {detail}" if detail else ""
     if reason == "scope_path_control_character":
         return (
             f"VERDICT: verify refused: scope path{location} contains an unsafe control character "
@@ -3782,12 +3824,12 @@ def _unsafe_scope_verdict(error: BaseException) -> str | None:
     if reason == "verification_directory_limit":
         return (
             f"VERDICT: verify refused — explicit-directory traversal exceeded the "
-            f"{MAX_VERIFY_DIRECTORIES}-directory safety limit. Pass a smaller explicit file scope."
+            f"{MAX_VERIFY_DIRECTORIES}-directory safety limit{position}. Pass a smaller explicit file scope."
         )
     if reason == "verification_directory_entry_limit":
         return (
             f"VERDICT: verify refused — explicit-directory traversal exceeded the "
-            f"{MAX_VERIFY_DIRECTORY_ENTRIES}-entry safety limit. Pass a smaller explicit file scope."
+            f"{MAX_VERIFY_DIRECTORY_ENTRIES}-entry safety limit{position}. Pass a smaller explicit file scope."
         )
     if reason == "verification_target_limit":
         return (
@@ -3797,7 +3839,7 @@ def _unsafe_scope_verdict(error: BaseException) -> str | None:
     if reason == "verification_directory_timeout":
         return (
             f"VERDICT: verify refused — explicit-directory traversal exceeded the "
-            f"{MAX_VERIFY_TRAVERSAL_SECONDS:g}-second safety limit. Pass explicit file paths."
+            f"{MAX_VERIFY_TRAVERSAL_SECONDS:g}-second safety limit{position}. Pass explicit file paths."
         )
     if reason in {
         "verification_directory_changed",

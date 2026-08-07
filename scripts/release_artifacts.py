@@ -750,7 +750,16 @@ def _fetch_github_cli_archive(*, opener: Any | None = None) -> bytes:
         },
     )
     client = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), _GitHubCliRedirect())
-    deadline = time.monotonic() + GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS
+    started = time.monotonic()
+    deadline = started + GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS
+
+    def _download_position(received: int, now: float) -> str:
+        """Where the download stood on BOTH bounds, whichever one ended it."""
+        return (
+            f"{received} of {GITHUB_CLI_ARCHIVE_SIZE} bytes in {now - started:.1f}s of "
+            f"{GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS}s wall, {GITHUB_CLI_SOCKET_TIMEOUT_SECONDS}s per read"
+        )
+
     with client.open(request, timeout=GITHUB_CLI_SOCKET_TIMEOUT_SECONDS) as response:
         _validate_github_cli_release_url(
             response.geturl(),
@@ -774,13 +783,38 @@ def _fetch_github_cli_archive(*, opener: Any | None = None) -> bytes:
         received = 0
         read_once = getattr(response, "read1", response.read)
         while received < GITHUB_CLI_ARCHIVE_SIZE:
-            _require(time.monotonic() < deadline, "GitHub CLI archive download exceeded its wall-clock deadline")
-            chunk = read_once(min(GITHUB_CLI_DOWNLOAD_CHUNK_SIZE, GITHUB_CLI_ARCHIVE_SIZE - received))
-            _require(chunk, "GitHub CLI archive ended before its declared byte length")
+            now = time.monotonic()
+            _require(
+                now < deadline,
+                f"GitHub CLI archive download exceeded its wall-clock deadline: {_download_position(received, now)}",
+            )
+            # Two bounds end this download and only one of them used to have a
+            # name. The per-read socket timeout surfaces as a bare OSError from
+            # the reader, which escaped to the top-level handler and printed as
+            # a raw socket string with no statement of what was being fetched
+            # or how far it got. Which bound fires is decided by link speed, so
+            # the unnamed branch was reachable by any slow link. Both branches
+            # now report the same two coordinates.
+            try:
+                chunk = read_once(min(GITHUB_CLI_DOWNLOAD_CHUNK_SIZE, GITHUB_CLI_ARCHIVE_SIZE - received))
+            except OSError as exc:
+                raise ReleaseError(
+                    f"GitHub CLI archive read failed or timed out: {_download_position(received, time.monotonic())}"
+                    f": {exc}"
+                ) from exc
+            _require(
+                chunk,
+                "GitHub CLI archive ended before its declared byte length: "
+                f"{received} of {GITHUB_CLI_ARCHIVE_SIZE} bytes",
+            )
             received += len(chunk)
             _require(received <= GITHUB_CLI_ARCHIVE_SIZE, "GitHub CLI archive exceeded its exact byte length")
             chunks.append(chunk)
-            _require(time.monotonic() < deadline, "GitHub CLI archive download exceeded its wall-clock deadline")
+            now = time.monotonic()
+            _require(
+                now < deadline,
+                f"GitHub CLI archive download exceeded its wall-clock deadline: {_download_position(received, now)}",
+            )
         archive_bytes = b"".join(chunks)
     _require(len(archive_bytes) == GITHUB_CLI_ARCHIVE_SIZE, "GitHub CLI archive byte length mismatch")
     _require(

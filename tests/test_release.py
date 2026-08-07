@@ -1598,8 +1598,59 @@ def test_github_cli_download_is_exact_bounded_and_credential_free(monkeypatch):
     monkeypatch.setattr(release, "GITHUB_CLI_ARCHIVE_SHA256", hashlib.sha256(payload).hexdigest())
     moments = iter((0.0, float(release.GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS + 1)))
     monkeypatch.setattr(release.time, "monotonic", lambda: next(moments))
-    with pytest.raises(release.ReleaseError, match="wall-clock deadline"):
+    with pytest.raises(release.ReleaseError, match="wall-clock deadline") as wall:
         release._fetch_github_cli_archive(opener=Opener(payload))
+    assert f"0 of {len(payload)} bytes" in str(wall.value)
+    assert f"of {release.GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS}s wall" in str(wall.value)
+
+
+def test_a_socket_timeout_on_the_github_cli_download_gets_a_named_reason(monkeypatch):
+    # Two bounds end this download -- a per-read socket timeout and a
+    # wall-clock deadline -- and which one fires is decided by link speed. The
+    # socket branch used to escape as a bare OSError and print as a raw socket
+    # string with no statement of what was being fetched or how far it got, so
+    # on any link between the two crossovers the release refused without a
+    # diagnostic. Both branches must name the same coordinates.
+    payload = b"reviewed-gh-archive"
+    monkeypatch.setattr(release, "GITHUB_CLI_ARCHIVE_SIZE", len(payload))
+    monkeypatch.setattr(release, "GITHUB_CLI_ARCHIVE_SHA256", hashlib.sha256(payload).hexdigest())
+
+    class StallingResponse:
+        headers = {
+            "Content-Disposition": f"attachment; filename={release.GITHUB_CLI_ARCHIVE_NAME}",
+            "Content-Length": str(len(payload)),
+            "Content-Type": "application/octet-stream",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def geturl(self):
+            return "https://release-assets.githubusercontent.com/github-production-release-asset/exact?sig=1"
+
+        def read1(self, _limit: int):
+            raise TimeoutError("the read operation timed out")
+
+        read = read1
+
+    class StallingOpener:
+        def open(self, _request, *, timeout):  # noqa: ARG002 - signature parity with urllib
+            return StallingResponse()
+
+    with pytest.raises(release.ReleaseError, match="GitHub CLI archive read failed or timed out") as socket_error:
+        release._fetch_github_cli_archive(opener=StallingOpener())
+
+    message = str(socket_error.value)
+    assert f"0 of {len(payload)} bytes" in message
+    assert f"of {release.GITHUB_CLI_DOWNLOAD_TIMEOUT_SECONDS}s wall" in message
+    assert f"{release.GITHUB_CLI_SOCKET_TIMEOUT_SECONDS}s per read" in message
+    assert "the read operation timed out" in message
 
 
 def test_github_cli_pin_is_exact_and_above_the_security_floor():
