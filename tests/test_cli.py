@@ -8,6 +8,7 @@ subprocess work, so they run anywhere.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import re
@@ -4008,3 +4009,68 @@ class TestClaudeStructuralReadiness:
         assert result.exit_code == 1
         assert "Claude executable changed" in result.output
         assert launches == []
+
+
+class TestToolchainVersionGatingPartition:
+    """Which verbs refuse an out-of-interval roam, pinned as an exact partition.
+
+    Two independent reviews of the same tree published two different, both
+    wrong, lists of the commands that delegate to roam WITHOUT checking its
+    version -- one named `wire` as not delegating (its whole body is one call
+    that delegates), the other dropped `wire` and still missed `unwire`. A
+    residual that two readers cannot state correctly from the source is not a
+    residual anyone can decide about, so it is derived here instead of
+    described.
+
+    This pins a REAL and deliberate asymmetry: `compile verify` refuses a roam
+    outside `ROAM_VERSION_REQUIREMENT`, while seven other verbs will happily
+    drive that same roam. Closing it refuses MORE and is allowed; leaving it
+    keeps a working escape hatch on the day a new roam major lands. Either way
+    the next command added must land on one side of this list on purpose --
+    adding one that delegates without gating fails here until it is listed.
+    """
+
+    @staticmethod
+    def _call_graph() -> dict[str, ast.FunctionDef]:
+        source = Path(mod.__file__).read_text(encoding="utf-8")
+        return {node.name: node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef)}
+
+    @classmethod
+    def _reaches(cls, name: str, predicate, funcs, seen: frozenset[str] = frozenset()) -> bool:
+        if name in seen or name not in funcs:
+            return False
+        for node in ast.walk(funcs[name]):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if predicate(node.func.id) or cls._reaches(node.func.id, predicate, funcs, seen | {name}):
+                    return True
+        return False
+
+    def _partition(self) -> tuple[set[str], set[str]]:
+        funcs = self._call_graph()
+        gated, delegating = set(), set()
+        for name, command in mod.cli.commands.items():
+            entry = command.callback.__name__
+            if self._reaches(entry, lambda called: called == "_roam_problem", funcs):
+                gated.add(name)
+            if self._reaches(entry, lambda called: called.startswith("_delegate"), funcs):
+                delegating.add(name)
+        return gated, delegating
+
+    def test_only_these_verbs_check_the_roam_version(self):
+        gated, _ = self._partition()
+        assert gated == {"verify", "claude", "doctor"}
+
+    def test_every_other_delegating_verb_drives_an_unchecked_roam(self):
+        gated, delegating = self._partition()
+        # Seven, not the five either review reported. `wire` and `unwire` each
+        # consist of a single call whose only exit is through `_delegate`.
+        assert delegating - gated == {"baseline", "init", "report", "run", "stats", "wire", "unwire"}
+
+    def test_the_asymmetry_is_reachable_and_not_a_parsing_artifact(self):
+        # `wire`'s entire body is the delegating call, so "it does not
+        # delegate" cannot be true of any code path.
+        assert "_exit_after_canonical_claude_hook_update" in inspect.getsource(mod._wire.callback)
+        assert "_delegate(" in inspect.getsource(mod._exit_after_canonical_claude_hook_update)
+        # And the gate that `verify` has really is absent from theirs.
+        assert "_roam_problem" in inspect.getsource(mod._verify.callback)
+        assert "_roam_problem" not in inspect.getsource(mod._report.callback)

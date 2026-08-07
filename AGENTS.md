@@ -87,6 +87,17 @@ quantity carries an anchor, never that the anchored number is still
 correct; re-deriving each figure would need git plumbing per claim and
 would fail on a shallow clone.
 
+Its file scope is stated here because it was discovered the hard way: the
+commit right after that gate landed published "36 names" for a frozenset
+holding 33, into `CHANGELOG.md`, where the gate does not look. A number
+about the repository stated in a Markdown file is STILL UNGATED — write
+those as dated observations by hand. A number stated about a named CLI
+constant is gated, in Markdown and in Python prose both, by the
+cardinality check in the same file: state `N names` within 40 characters
+of the constant and it is compared against `len()` of that constant. That
+one verifies the number is correct rather than merely dated, because an
+importable constant needs no git plumbing to re-derive.
+
 ## Releases
 
 GitHub is the source of truth. PyPI publish is owner-gated (no token on the

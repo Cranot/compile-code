@@ -107,6 +107,17 @@ def _tracked_python_files() -> list[Path]:
     return [path for name in listing.split("\0") if name and (path := ROOT / name).resolve() != _SELF]
 
 
+def _tracked_markdown_files() -> list[Path]:
+    listing = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.md"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    return [ROOT / name for name in listing.split("\0") if name]
+
+
 def _prose_lines(path: Path) -> dict[int, str]:
     """Line number -> text, for every comment and string literal in *path*.
 
@@ -209,3 +220,117 @@ def test_a_decimal_only_token_is_not_mistaken_for_a_commit_anchor():
     # "1234567" is a plausible byte count and must not silence a claim.
     assert _COMMIT_ANCHOR.search("measured over 1234567 commits") is None
     assert _COMMIT_ANCHOR.search("measured at c003a08 over 42 commits") is not None
+
+
+# ---------------------------------------------------------------------------
+# A second class, found by the gate above FAILING TO SEE IT.
+#
+# The commit immediately after the gate above shipped published prose saying
+# `_VERIFY_INCOMPLETENESS_NAMES` is "36 names". The frozenset holds 33. The
+# number went into CHANGELOG.md -- the one tracked file this project's public
+# numbers live in -- and the live-repo gate could not see it for TWO
+# independent reasons, both measured rather than assumed: the gate reads only
+# tracked `*.py`, AND the claim matches neither `_MEASURED_QUANTITY` (whose
+# nouns are commits/blobs/candidates/files/bytes, not `names`) nor
+# `_LIVE_REPO_REFERENT`. So widening that gate to Markdown -- the obvious
+# remedy -- would still not have caught it. The missing axis is the KIND of
+# claim, not the kind of file.
+#
+# This class is cheaper to gate than the first one, because the claim is
+# checkable: a cardinality stated about a named module constant can be
+# compared against `len()` of that constant at import time. No git plumbing,
+# nothing that breaks on a shallow clone, and unlike the anchor gate this one
+# verifies the number is CORRECT rather than merely dated.
+_CARDINALITY_NOUNS = "names|entries|keys|fields|patterns|items|values|checks|categories|constants|reasons"
+_CARDINALITY_CLAIM = re.compile(rf"(\d[\d,_]*)\s+({_CARDINALITY_NOUNS})\b", re.IGNORECASE)
+_CONSTANT_NAME = re.compile(r"_?[A-Z][A-Z0-9_]{3,}")
+
+# How close the count has to sit to the constant it is a count OF. Measured on
+# the claim that motivated this: 4 characters ("`_VERIFY_INCOMPLETENESS_NAMES`
+# -- 36 names"). A whole-line window would attribute any number on a line that
+# happens to mention a constant to that constant -- "adds 2 fields to
+# `_VERIFY_ENVELOPE_KEYS`" is a true sentence a line-wide rule would refuse.
+_CARDINALITY_PROXIMITY_CHARS = 40
+
+
+def _sized_cli_constants() -> dict[str, object]:
+    """Every module-level constant in the CLI whose length is a fact prose can state."""
+    from compile_code import cli
+
+    return {
+        name: value
+        for name, value in vars(cli).items()
+        if _CONSTANT_NAME.fullmatch(name) and hasattr(value, "__len__") and not isinstance(value, (str, bytes))
+    }
+
+
+def _cardinality_mismatches(lines: dict[int, str], sized: dict[str, object]) -> list[str]:
+    """Every stated cardinality that disagrees with the constant it sits beside."""
+    wrong: list[str] = []
+    for number, text in sorted(lines.items()):
+        mentioned = [(text.index(name), name) for name in sized if name in text]
+        if not mentioned:
+            continue
+        for claim in _CARDINALITY_CLAIM.finditer(text):
+            stated = int(claim.group(1).replace(",", "").replace("_", ""))
+            start, name = min(mentioned, key=lambda seen: abs(seen[0] - claim.start()))
+            if (
+                not start - _CARDINALITY_PROXIMITY_CHARS
+                <= claim.start()
+                <= start + len(name) + _CARDINALITY_PROXIMITY_CHARS
+            ):
+                continue
+            actual = len(sized[name])
+            if stated != actual:
+                wrong.append(f"{number}: says {stated} {claim.group(2)} of {name}, which holds {actual}")
+    return wrong
+
+
+_CARDINALITY_MESSAGE = (
+    "Prose states a cardinality for a CLI constant that disagrees with the constant. The number is "
+    "checkable, so it is checked: correct the prose, or change the constant deliberately and correct "
+    "the prose in the same commit."
+)
+
+
+@pytest.mark.parametrize("path", _tracked_markdown_files(), ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_a_markdown_cardinality_claim_matches_the_constant_it_names(path: Path):
+    lines = dict(enumerate(path.read_text(encoding="utf-8").splitlines(), 1))
+    wrong = _cardinality_mismatches(lines, _sized_cli_constants())
+    assert not wrong, (
+        f"{_CARDINALITY_MESSAGE}\n  {path.relative_to(ROOT).as_posix()}:"
+        + f"\n  {path.relative_to(ROOT).as_posix()}:".join(wrong)
+    )
+
+
+@pytest.mark.parametrize("path", _tracked_python_files(), ids=lambda p: p.relative_to(ROOT).as_posix())
+def test_a_comment_cardinality_claim_matches_the_constant_it_names(path: Path):
+    wrong = _cardinality_mismatches(_prose_lines(path), _sized_cli_constants())
+    assert not wrong, (
+        f"{_CARDINALITY_MESSAGE}\n  {path.relative_to(ROOT).as_posix()}:"
+        + f"\n  {path.relative_to(ROOT).as_posix()}:".join(wrong)
+    )
+
+
+def test_the_cardinality_gate_catches_the_claim_that_motivated_it():
+    stale = {1: "in `_VERIFY_INCOMPLETENESS_NAMES` — 36 names including `errors`, `warnings` — which is"}
+    assert _cardinality_mismatches(stale, _sized_cli_constants())
+
+
+def test_the_cardinality_gate_leaves_a_correct_claim_and_a_distant_number_alone():
+    sized = _sized_cli_constants()
+    correct = {1: "`_VERIFY_INCOMPLETENESS_NAMES` — %d names — is refused" % len(sized["_VERIFY_INCOMPLETENESS_NAMES"])}
+    assert not _cardinality_mismatches(correct, sized)
+    # A number about something else, far enough away not to be a count OF the
+    # constant. Attributing it would refuse an honest sentence.
+    distant = {
+        1: "`_VERIFY_INCOMPLETENESS_NAMES` is the tripwire, and the reason it exists is that a producer "
+        "which renames one signal buys a pass; the envelope carries 2 fields this build does not read"
+    }
+    assert not _cardinality_mismatches(distant, sized)
+
+
+def test_the_cardinality_gate_scans_a_set_that_did_not_collapse():
+    sized = _sized_cli_constants()
+    assert len(sized) > 15, "the constant set collapsed; a gate over nothing passes over anything"
+    assert len(_tracked_markdown_files()) >= 4

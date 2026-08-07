@@ -52,6 +52,16 @@ EXIT_TIMEOUT = 124
 EXIT_VERIFY_GATE = 5
 BASELINE_TIMEOUT = 1200
 MIN_ROAM_VERSION = "13.10.0"
+# This ceiling GATES the envelope forward-compatibility machinery below, and
+# the two are not separable decisions. `_verify` inspects the executable and
+# exits on `_roam_problem` BEFORE it ever delegates, so an envelope from a roam
+# outside this interval is never parsed: every tolerance `_require_known_shape`
+# offers a newer producer is reachable only for a SAME-MAJOR roam that adds
+# fields. Raising this ceiling is therefore what makes that machinery apply to
+# the next major at all; leaving it is a deliberate refusal of that major, not
+# an independent setting that the envelope layer can compensate for.
+# `test_verify_blocks_unsupported_future_major_before_receipt_execution` pins
+# the ordering.
 MAX_ROAM_MAJOR_EXCLUSIVE = 14
 ROAM_VERSION_REQUIREMENT = f">={MIN_ROAM_VERSION},<{MAX_ROAM_MAJOR_EXCLUSIVE}"
 ROAM_PACKAGE_REQUIREMENT = f"roam-code{ROAM_VERSION_REQUIREMENT}"
