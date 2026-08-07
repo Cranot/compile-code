@@ -3407,8 +3407,22 @@ def _require_known_shape(
     present = frozenset(mapping)
     if not required <= present or not (present & vocabulary) <= allowed:
         raise ValueError(reason)
-    if (present - vocabulary) & _VERIFY_INCOMPLETENESS_NAMES:
-        raise ValueError("unknown_incompleteness_signal")
+    # Name the colliding field. This branch is the one place where an entirely
+    # NEUTRAL addition by a newer producer can hard-refuse: every other unknown
+    # key is tolerated and disclosed, but a key whose bare name is in the
+    # incompleteness vocabulary is refused, because a rename must not buy a
+    # pass. That trade is right and stays. What was wrong is that the refusal
+    # said nothing about WHICH name tripped it, so a producer that added a
+    # neutral field called `warnings` produced a verdict indistinguishable from
+    # a broken receipt, and the reader had no way to find the cause on either
+    # side of the contract. The name is rendered through the same safe filter
+    # as every other disclosed field, so no producer-supplied text reaches the
+    # verdict unfiltered.
+    colliding = sorted((present - vocabulary) & _VERIFY_INCOMPLETENESS_NAMES)
+    if colliding:
+        raise ValueError(
+            "unknown_incompleteness_signal: " + ", ".join(_disclosable_field_name(name) for name in colliding)
+        )
 
 
 def _disclosable_field_name(name: object) -> str:
@@ -3918,8 +3932,23 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
         return (
             f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
             f"scope target indices {indices}; executable `{executable}` declared an envelope schema this build "
-            f"cannot read (reads {VERIFY_ENVELOPE_SCHEMA} {VERIFY_ENVELOPE_SCHEMA_VERSION} and later same-major "
-            "shapes). Fix: python -m pip install --upgrade compile-code"
+            f"cannot read (reads any {VERIFY_ENVELOPE_SCHEMA} major "
+            f"{VERIFY_ENVELOPE_SCHEMA_VERSION.split('.')[0]} shape; this build was written against "
+            f"{VERIFY_ENVELOPE_SCHEMA_VERSION}). Fix: python -m pip install --upgrade compile-code"
+        )
+    if reason == "unknown_incompleteness_signal":
+        # Distinguished from the generic protocol failure below because the
+        # remedy is different and the cause is nameable. Prescribing a roam
+        # upgrade here would be wrong: the producer is the NEWER side.
+        _, _, colliding = str(error).partition(": ")
+        named = f" (field: {colliding})" if colliding else ""
+        return (
+            f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+            f"scope target indices {indices}; executable `{executable}` sent a field this build has no "
+            f"interpretation for whose NAME asserts an incomplete run{named}. A renamed incompleteness signal "
+            "must not buy a pass, so this is refused rather than ignored and disclosed like other unknown "
+            "fields. If that field is neutral, this build is too old to know it. "
+            "Fix: python -m pip install --upgrade compile-code"
         )
     if reason in {"post_verify_content_changed", "post_verify_scope_changed"}:
         # Raised by this CLI's own post-run recheck, never by roam's receipt:

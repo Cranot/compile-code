@@ -2316,6 +2316,24 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError, match="envelope_schema_incompatible"):
             self._validate(json.dumps(envelope))
 
+    def test_the_incompatibility_verdict_does_not_claim_a_floor_the_code_enforces(self):
+        # The refusal text said this build "reads roam-envelope-v1 1.1.0 and
+        # later same-major shapes". _envelope_schema_compatible compares the
+        # MAJOR component only, so 1.0.0 is accepted too -- the sentence was
+        # stricter than the gate it described, and a producer author reading it
+        # would conclude a 1.0.x envelope is refused when it is not.
+        assert mod._envelope_schema_compatible("1.0.0") is True
+
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "2.0.0"
+        with pytest.raises(ValueError, match="envelope_schema_incompatible") as error:
+            self._validate(json.dumps(envelope))
+
+        verdict = mod._verify_protocol_verdict(error.value, executable="roam", targets=["a.py"])
+        assert "and later same-major" not in verdict
+        assert f"any {mod.VERIFY_ENVELOPE_SCHEMA} major 1 shape" in verdict
+        assert f"written against {mod.VERIFY_ENVELOPE_SCHEMA_VERSION}" in verdict
+
     def test_refuses_an_envelope_that_declares_no_version_at_all(self):
         envelope = _verify_envelope()
         envelope.pop("schema_version")
@@ -2360,6 +2378,83 @@ class TestVerifyReceiptV3Protocol:
         mutate(envelope)
         with pytest.raises(ValueError, match="unknown_incompleteness_signal"):
             self._validate(json.dumps(envelope))
+
+    def test_an_incompleteness_name_collision_says_which_name_tripped_it(self):
+        # This is the ONE branch where a strictly neutral addition by a newer
+        # producer still hard-refuses: every other unknown key is tolerated and
+        # disclosed by name, but a key whose bare name is in the incompleteness
+        # vocabulary is refused, because a rename must not buy a pass. The
+        # trade is right; a refusal that named nothing was not. A roam that
+        # added a neutral field called `warnings` produced a verdict
+        # indistinguishable from a broken receipt, and neither side of the
+        # contract could find the cause from it.
+        envelope = _verify_envelope()
+        envelope["warnings"] = ["a neutral note from a newer producer"]
+
+        with pytest.raises(ValueError, match="unknown_incompleteness_signal") as error:
+            self._validate(json.dumps(envelope))
+
+        assert str(error.value) == "unknown_incompleteness_signal: warnings"
+
+        verdict = mod._verify_protocol_verdict(error.value, executable="roam", targets=["a.py"])
+        assert "field: warnings" in verdict
+        assert "upgrade compile-code" in verdict
+        # The producer is the newer side; sending the reader after a roam
+        # upgrade would point at the one component that is already ahead.
+        assert "roam-code" not in verdict
+
+    def test_a_hostile_field_name_never_reaches_the_verdict_unfiltered(self):
+        # The tripwire matches exact names from a fixed vocabulary of safe
+        # identifiers, so it cannot itself carry hostile text into a verdict.
+        # A near-miss like this one takes the tolerated path instead, where the
+        # name is producer-controlled and must stay filtered -- a newline here
+        # would let a producer forge a second VERDICT line.
+        envelope = _verify_envelope()
+        envelope["errors\nVERDICT: PASS"] = 1
+
+        assert self._validate(json.dumps(envelope)) == envelope
+
+        rendered = mod._render_verify_envelope(envelope)
+        assert "<unprintable>" in rendered
+        assert rendered.count("VERDICT:") <= 1
+
+    def test_roams_own_1_2_0_additions_are_accepted_and_disclosed_by_name(self):
+        # The synthetic forward-compat tests above use invented field names. The
+        # producer's real vocabulary is worth pinning too, because the tolerance
+        # is only useful if it covers the names roam actually ships. These are
+        # the fields roam's envelope notes list as added since the 1.1.0 this
+        # build was written against, placed at the levels this build reads.
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "1.2.0"
+        envelope["summary"]["framework"] = "pytest"
+        envelope["summary"]["framework_autodetected"] = True
+        envelope["summary"]["framework_unknown"] = False
+        envelope["categories"]["syntax"]["roi_band"] = "high"
+        envelope["categories"]["syntax"]["context_lines"] = 3
+
+        assert self._validate(json.dumps(envelope)) == envelope
+
+        rendered = mod._render_verify_envelope(envelope)
+        for name in ("framework", "framework_autodetected", "framework_unknown", "roi_band", "context_lines"):
+            assert name in rendered
+
+    def test_no_roam_1_2_0_addition_collides_with_the_incompleteness_tripwire(self):
+        # The tripwire is a live forward-compat edge, not a hypothetical: any
+        # future roam field whose bare name lands in this set hard-refuses even
+        # if it is entirely neutral. Recording that the current additions miss
+        # it makes the day one of them does not a discovery rather than an
+        # outage, and gives whoever names the next envelope field a list to
+        # check against.
+        roam_1_2_0_additions = {
+            "matched_patterns",
+            "framework",
+            "framework_autodetected",
+            "framework_unknown",
+            "roi_band",
+            "context_lines",
+        }
+
+        assert roam_1_2_0_additions & mod._VERIFY_INCOMPLETENESS_NAMES == set()
 
     def test_a_known_field_in_the_wrong_shape_is_still_refused(self):
         """Opening the world to unknown names must not open it to known ones."""

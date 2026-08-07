@@ -86,6 +86,16 @@ _ANCHOR_RADIUS_LINES = 6
 _REFERENT_RADIUS_LINES = 1
 
 
+# This file, and only this file. Its docstring and its fixtures QUOTE the stale
+# claims verbatim as counterexamples, so a scanner that reads itself refuses its
+# own illustrations. Anchoring them would defeat the illustration and teach the
+# next reader that the shape being described is acceptable. The exclusion is one
+# named path rather than a pattern or a suppression comment, because a general
+# escape hatch is how a gate stops being one; `test_the_exclusion_is_exactly_one
+# _file` pins that.
+_SELF = Path(__file__).resolve()
+
+
 def _tracked_python_files() -> list[Path]:
     listing = subprocess.run(
         ["git", "ls-files", "-z", "--", "*.py"],
@@ -94,7 +104,7 @@ def _tracked_python_files() -> list[Path]:
         check=True,
         text=True,
     ).stdout
-    return [ROOT / name for name in listing.split("\0") if name]
+    return [path for name in listing.split("\0") if name and (path := ROOT / name).resolve() != _SELF]
 
 
 def _prose_lines(path: Path) -> dict[int, str]:
@@ -178,6 +188,21 @@ def test_the_gate_leaves_a_fixture_number_and_an_anchored_claim_alone(accepted):
         and _LIVE_REPO_REFERENT.search(accepted)
         and not _COMMIT_ANCHOR.search(accepted)
     )
+
+
+def test_the_exclusion_is_exactly_one_file():
+    scanned = {path.resolve() for path in _tracked_python_files()}
+    all_tracked = subprocess.run(
+        ["git", "ls-files", "-z", "--", "*.py"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout
+    tracked = {(ROOT / name).resolve() for name in all_tracked.split("\0") if name}
+
+    assert tracked - scanned == {_SELF}
+    assert len(scanned) > 20, "the scan set collapsed; a gate over nothing passes over anything"
 
 
 def test_a_decimal_only_token_is_not_mistaken_for_a_commit_anchor():
