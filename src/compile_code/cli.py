@@ -79,8 +79,48 @@ MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 # Discovery narrows only UNTRACKED paths under these names, because the argument
 # above is about a live untracked index and reaches no path the project has
 # committed. Bounded directory descent (_expand_verify_targets) has no status
-# oracle and still prunes by name; that asymmetry is deliberate and bounded --
-# an explicit file argument bypasses both.
+# oracle and no budget for another git call, so it still prunes by NAME.
+#
+# The pruning applies ONLY to directories DISCOVERED during descent, never to
+# the directory NAMED on the command line: `pending` is seeded from the named
+# directories unfiltered, and the skip test below is reached only for children.
+#
+# RUN, not reasoned about. A real git repository with a tracked, changed
+# src/venv/mod.py and a stub roam that logs the argv it is handed:
+#
+#   $ compile verify src
+#     delegated -> ["--json", "verify", "--", "src/app.py", "src/pkg/mod.py"]
+#   $ compile verify src/venv
+#     delegated -> ["--json", "verify", "--", "src/venv/mod.py"]
+#   $ compile verify src/venv/mod.py
+#     delegated -> ["--json", "verify", "--", "src/venv/mod.py"]
+#   $ compile verify venv
+#     delegated -> ["--json", "verify", "--", "venv/__init__.py",
+#                   "venv/mypkg/mod.py"]
+#   $ compile verify              # discovery, no arguments
+#     delegated -> ["--json", "verify", "--", "node_modules/pkg/index.js",
+#                   "src/app.py", "src/pkg/mod.py", "src/venv/mod.py",
+#                   "venv/mypkg/mod.py"]
+#
+# So `compile verify src` silently omits tracked, changed source under a
+# nested directory with one of these names; naming the subtree or the file
+# reaches it; and discovery has no such residual at all, because it narrows on
+# trackedness. A trailing slash is not a way to name a directory -- it never
+# gets as far as descent, because _verification_scope_paths runs on the
+# explicit argument FIRST:
+#
+#   $ compile verify venv/
+#     VERDICT: verifier protocol failure: receipt field/reason
+#              scope_path_not_canonical; scope target indices 0
+#     EXIT=2, and roam was never launched.
+#
+# An earlier wording of this bound said descent "reaches venv/__init__.py but
+# not venv/mypkg/mod.py", and gave `compile verify venv/` as the command that
+# shows it. Both halves are wrong: that command cannot execute, and the form
+# that does execute covers both files. It was the only claim in its commit
+# stated in inline backticks with no transcript under it, which is the tell.
+# The bound is pinned by an executable test now, not by prose --
+# test_explicit_descent_prunes_nested_tool_state_names_but_never_the_named_one.
 NON_SOURCE_SCOPE_DIRECTORIES = frozenset({".git", ".roam", ".venv", "venv", "node_modules", "__pycache__"})
 # git porcelain v1 status for a path git has never been told about. It is the
 # only trackedness signal `git status` already hands us, so using it costs no

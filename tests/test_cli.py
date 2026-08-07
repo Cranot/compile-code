@@ -2706,9 +2706,55 @@ class TestVerifyReceiptV3Protocol:
     def test_descent_and_discovery_share_one_non_source_directory_set(self):
         # Two sets would be free to drift, and the drift is invisible: descent
         # would refuse a directory that discovery had already handed to roam.
-        assert "NON_SOURCE_SCOPE_DIRECTORIES" in inspect.getsource(mod._expand_verify_targets)
         assert "NON_SOURCE_SCOPE_DIRECTORIES" in inspect.getsource(mod._partition_non_source_scope)
         assert ".roam" in mod.NON_SOURCE_SCOPE_DIRECTORIES
+
+    def test_explicit_descent_prunes_nested_tool_state_names_but_never_the_named_one(self, tmp_path):
+        # THE RESIDUAL, AS A PROPERTY. The claim this replaces was a
+        # getsource() string check -- it passed whether descent pruned by name
+        # or did not prune at all. Mutating the skip test in
+        # _expand_verify_targets to `if name not in skip_dirs or True:` (which
+        # removes the pruning entirely while leaving the constant's NAME in the
+        # source) left the whole suite green: 330 passed, 8 skipped, zero
+        # failures. A comment-shaped test guarding a comment-shaped claim is
+        # how the same bound came to be written wrong twice in this file.
+        #
+        # Every value below was measured on a real git repository before it was
+        # written here.
+        (tmp_path / "venv" / "mypkg").mkdir(parents=True)
+        (tmp_path / "venv" / "__init__.py").write_text("x=1\n", encoding="utf-8")
+        (tmp_path / "venv" / "mypkg" / "mod.py").write_text("y=1\n", encoding="utf-8")
+        (tmp_path / "src" / "venv").mkdir(parents=True)
+        (tmp_path / "src" / "pkg").mkdir(parents=True)
+        (tmp_path / "src" / "app.py").write_text("z=1\n", encoding="utf-8")
+        (tmp_path / "src" / "pkg" / "mod.py").write_text("r=1\n", encoding="utf-8")
+        (tmp_path / "src" / "venv" / "mod.py").write_text("q=1\n", encoding="utf-8")
+
+        # The directory NAMED on the command line is descended even when its
+        # own name is in the set -- `pending` is seeded from it unfiltered.
+        assert sorted(mod._expand_verify_targets(["venv"], tmp_path)) == [
+            "venv/__init__.py",
+            "venv/mypkg/mod.py",
+        ]
+        # A NESTED directory by that name is pruned. This is the residual, and
+        # src/venv/mod.py here stands for tracked source that `compile verify
+        # src` silently omits from the delegated scope.
+        assert sorted(mod._expand_verify_targets(["src"], tmp_path)) == [
+            "src/app.py",
+            "src/pkg/mod.py",
+        ]
+        # ...and it stays reachable by naming the subtree or the file.
+        assert mod._expand_verify_targets(["src/venv"], tmp_path) == ["src/venv/mod.py"]
+        assert mod._expand_verify_targets(["src/venv/mod.py"], tmp_path) == ["src/venv/mod.py"]
+
+    def test_a_trailing_slash_never_reaches_descent_at_all(self):
+        # The command form the superseded wording gave for the bound above.
+        # _verification_scope_paths runs on the explicit argument BEFORE
+        # _expand_verify_targets, and PurePosixPath("venv/").as_posix() is
+        # "venv", so the canonical-form check refuses it: exit 2, no descent,
+        # no delegation. Shell tab-completion appends exactly this slash.
+        with pytest.raises(ValueError, match="scope_path_not_canonical"):
+            mod._verification_scope_paths(["venv/"])
 
     def test_changed_scope_excludes_roams_own_live_index(self, monkeypatch, tmp_path):
         # A project that does not gitignore .roam/ makes `git status -uall`
