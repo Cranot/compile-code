@@ -543,6 +543,29 @@ def test_positive_control_covers_a_family_the_narrow_catalogue_misses(monkeypatc
     assert secret_scan._self_test_failures() == ["planted control secret not detected: Anthropic OAuth Token"]
 
 
+@pytest.mark.parametrize("dropped", ["AWS Access Key", "Anthropic OAuth Token"])
+def test_shrinking_the_control_tuple_is_refused_not_silently_accepted(monkeypatch, dropped: str) -> None:
+    """The control has to fire in BOTH directions.
+
+    As a comprehension over ``_CONTROL_EXPECTED`` it could only ever get
+    shorter when that tuple got shorter: measured, dropping either declared
+    family returned ``[]`` and the scan printed PASS. The tuple is the easier
+    of the two lists to edit, so it is the likelier one to be quietly reduced
+    -- and reducing it is exactly how a family stops being self-tested without
+    anything saying so. ``check._leak_control_failures`` was repaired for this
+    already; this is the sister file catching up.
+    """
+    monkeypatch.setattr(
+        secret_scan,
+        "_CONTROL_EXPECTED",
+        tuple(name for name in secret_scan._CONTROL_EXPECTED if name != dropped),
+    )
+
+    assert secret_scan._self_test_failures() == [
+        f"planted control secret no longer declared in _CONTROL_EXPECTED: {dropped}"
+    ]
+
+
 def test_tracked_symlink_is_reported_and_worktree_deletion_is_not(monkeypatch, tmp_path) -> None:
     """A symlink can point the scanner's read outside the scanned content, so
     it is a finding. A tracked path deleted from the worktree genuinely has no

@@ -818,6 +818,16 @@ def _self_test_failures() -> list[str]:
     One planted case per provider FAMILY, never one overall: the first gate
     built against this defect self-tested with a GitHub token, passed, and let
     a real Anthropic OAuth token through untouched.
+
+    THE CONTROL MUST FIRE IN BOTH DIRECTIONS. As first written this was a
+    comprehension OVER ``_CONTROL_EXPECTED``, so deleting a family from that
+    tuple could only ever make the list shorter -- measured, dropping either
+    name returned ``[]`` and the scan printed PASS. The tuple is the easier of
+    the two to edit and the likelier to be tidied away by someone reducing a
+    "duplicated" list. ``check._leak_control_failures`` had exactly this defect
+    diagnosed and repaired next door; the sister file kept it. The set the
+    planted corpus produces and the set this tuple declares must AGREE, not
+    merely overlap.
     """
     data = _control_bytes()
     if is_binary_content(data):
@@ -826,7 +836,12 @@ def _self_test_failures() -> list[str]:
     if not views:
         return ["control content decoded to zero text views"]
     names = {finding["pattern_name"] for view in views for finding in scan_text("<control>", view)}
-    return [f"planted control secret not detected: {name}" for name in _CONTROL_EXPECTED if name not in names]
+    missing = [f"planted control secret not detected: {name}" for name in _CONTROL_EXPECTED if name not in names]
+    undeclared = [
+        f"planted control secret no longer declared in _CONTROL_EXPECTED: {name}"
+        for name in sorted(names - set(_CONTROL_EXPECTED))
+    ]
+    return missing + undeclared
 
 
 def main(argv: list[str] | None = None) -> int:
