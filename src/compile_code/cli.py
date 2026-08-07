@@ -640,10 +640,34 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
             detail += f": {diagnostic}"
         info.update(state="version_failed", detail=detail)
         return info
-    combined = b"\n".join((proc.stdout or b"", proc.stderr or b"")).decode("utf-8", errors="replace")
+    stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
+    combined = "\n".join((stdout_text, stderr_text))
     version = _extract_roam_version(combined)
     if version is None:
-        info.update(state="malformed_version", detail="`roam --version` returned no parseable version")
+        # Both streams are still required to be clean -- a version check is the
+        # one call this CLI trusts a stranger's binary for, and a binary that
+        # writes anything alongside its version is not in a state this build is
+        # willing to vouch for. But the two ways to fail that need different
+        # actions from the reader and used to print the same sentence. A binary
+        # that emitted nothing parseable is broken; a binary that printed a
+        # perfectly good version on stdout and one deprecation line on stderr
+        # is not, and telling that caller their toolchain "returned no
+        # parseable version" sends them to reinstall something that is fine
+        # while the actual cause -- a plugin or a wrapper writing to stderr --
+        # goes unmentioned. Only the count of stderr lines and the
+        # regex-validated version are reported; untrusted output is never
+        # replayed into the verdict.
+        stdout_only = _extract_roam_version(stdout_text)
+        noise = sum(1 for line in stderr_text.splitlines() if line.strip())
+        if stdout_only is not None and noise:
+            detail = (
+                f"`roam --version` reported {stdout_only} on stdout but also wrote {noise} line(s) to stderr; "
+                "a trusted version check must produce that one line and nothing else"
+            )
+        else:
+            detail = "`roam --version` returned no parseable version"
+        info.update(state="malformed_version", detail=detail)
         return info
     # The version string above is self-reported by the same binary this re-proof
     # exists to distrust -- a substituted executable can echo it back verbatim.

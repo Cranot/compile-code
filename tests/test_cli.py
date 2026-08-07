@@ -632,6 +632,53 @@ class TestRoamVersionEnforcement:
         assert captured["kwargs"]["stdout_limit"] == mod.MAX_ROAM_VERSION_BYTES
         assert captured["kwargs"]["stderr_limit"] == mod.MAX_ROAM_VERSION_BYTES
 
+    @pytest.mark.parametrize("noise_lines", [1, 3])
+    def test_stderr_chatter_beside_a_good_version_is_refused_with_the_real_reason(self, monkeypatch, noise_lines):
+        # Both streams must stay clean -- the version check is the one call this
+        # CLI trusts a stranger's binary for -- so this still fails closed. But
+        # "returned no parseable version" is false when the version was right
+        # there on stdout, and it sends the reader to reinstall a roam that is
+        # fine while the real cause (a plugin or wrapper writing to stderr) goes
+        # unnamed. The refusal must distinguish the two.
+        class _P:
+            returncode = 0
+            stdout = b"roam, version 13.10.2\n"
+            stderr = b"DeprecationWarning: something in a plugin\n" * noise_lines
+
+        monkeypatch.setattr(mod, "_resolve_roam_executable", lambda: r"C:\Tools\roam.exe")
+        monkeypatch.setattr(mod, "_python_roam_metadata_version", lambda: None)
+        monkeypatch.setattr(mod, "_run_bounded_capture", lambda argv, **kwargs: _P())
+
+        info = mod._inspect_roam()
+
+        assert info["state"] == "malformed_version"
+        assert info["version"] is None
+        detail = info["detail"]
+        assert "13.10.2" in detail
+        assert f"{noise_lines} line(s) to stderr" in detail
+        # The untrusted line itself is never replayed into the verdict.
+        assert "DeprecationWarning" not in detail
+
+        problem = mod._roam_problem(info)
+        assert problem is not None
+        assert problem[0] == mod.EXIT_TOOLCHAIN
+        assert "DeprecationWarning" not in problem[1]
+
+    def test_a_genuinely_unparseable_version_keeps_the_plain_reason(self, monkeypatch):
+        class _P:
+            returncode = 0
+            stdout = b"not a version line at all\n"
+            stderr = b""
+
+        monkeypatch.setattr(mod, "_resolve_roam_executable", lambda: r"C:\Tools\roam.exe")
+        monkeypatch.setattr(mod, "_python_roam_metadata_version", lambda: None)
+        monkeypatch.setattr(mod, "_run_bounded_capture", lambda argv, **kwargs: _P())
+
+        info = mod._inspect_roam()
+
+        assert info["state"] == "malformed_version"
+        assert info["detail"] == "`roam --version` returned no parseable version"
+
     @pytest.mark.parametrize(
         "output",
         [
