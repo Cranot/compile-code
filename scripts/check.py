@@ -1165,7 +1165,10 @@ def release_sanity() -> bool:
 
     try:
         release_module = _load_release_module()
-        release_module.locked_requirement_queries(ROOT)
+        # Builds both query sets without touching the network, so a malformed
+        # lock row or an unauditable runtime declaration is named here even when
+        # the OSV gate above could not run.
+        release_module.dependency_audit_queries(ROOT)
         problems.extend(release_module.audit_repository(ROOT))
     except (ImportError, OSError, RuntimeError) as exc:
         problems.append(f"release validator failed to load: {exc}")
@@ -1224,14 +1227,20 @@ def release_sanity() -> bool:
 
 
 def dependency_audit() -> bool:
-    """Fail closed on known vulnerabilities in the exact universal release locks."""
+    """Fail closed on the exact release locks and on the runtime floors this package publishes."""
     try:
-        audited = _load_release_module().audit_locked_requirements(ROOT)
+        release_module = _load_release_module()
+        audited = release_module.audit_locked_requirements(ROOT)
+        graphs = len(release_module.LOCK_GRAPHS)
+        floors = release_module.EXPECTED_RUNTIME_FLOOR_COUNT
     except (ImportError, OSError, RuntimeError) as exc:
         print("[check] locked dependency audit: FAIL")
         print(f"  {exc}")
         return False
-    print(f"[check] locked dependency audit: PASS ({audited} exact package versions; no resolution)")
+    print(
+        f"[check] locked dependency audit: PASS ({audited} exact package versions from {graphs} hashed lock "
+        f"graphs and {floors} declared runtime floors; no resolution, so no version above a floor is covered)"
+    )
     return True
 
 

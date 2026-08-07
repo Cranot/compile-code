@@ -28,7 +28,12 @@ dependencies = [
     # >=13.10.0,<14: tested receipt-v3 Verify + MCP-default mode enforcement;
     # CLI/hook enforcement remains explicit at the launcher boundary.
     "roam-code<14,>=13.10.0",
-    "click>=8.0",
+    # click below 8.3.3 carries CVE-2026-7246 / PYSEC-2026-2132: click.edit()
+    # passes its editor command through a shell, so an attacker-controlled
+    # EDITOR value runs arbitrary commands. This package never calls
+    # click.edit(), but the floor is what a resolver may install into the
+    # user's environment, so it is raised rather than waived.
+    "click>=8.3.3",
 ]
 
 [project.urls]

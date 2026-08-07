@@ -57,7 +57,7 @@ def _metadata() -> bytes:
         "License-File: LICENSE\n"
         "Provides-Extra: dev\n"
         "Requires-Dist: roam-code<14,>=13.10.0\n"
-        "Requires-Dist: click>=8.0\n"
+        "Requires-Dist: click>=8.3.3\n"
         'Requires-Dist: pytest==9.1.1; extra == "dev"\n'
         'Requires-Dist: PyYAML==6.0.3; extra == "dev"\n'
         'Requires-Dist: ruff==0.15.22; extra == "dev"\n'
@@ -941,7 +941,7 @@ def test_build_environment_is_closed_against_python_pip_and_setuptools_injection
 
 def test_runtime_dependency_contract_is_closed_to_the_tested_roam_major():
     project = release._read_pyproject(ROOT)["project"]
-    assert project["dependencies"] == ["roam-code<14,>=13.10.0", "click>=8.0"]
+    assert project["dependencies"] == ["roam-code<14,>=13.10.0", "click>=8.3.3"]
     assert release.RUNTIME_REQUIRES == project["dependencies"]
 
     docs = {name: (ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")}
@@ -1870,6 +1870,21 @@ def test_locked_graph_audit_is_stable_complete_and_never_resolves_roam_code():
         "tooling-requirements.lock",
     }
 
+
+def test_dependency_audit_sends_every_lock_row_and_every_declared_runtime_floor():
+    locked, _ = release.locked_requirement_queries(ROOT)
+    floors, _ = release.runtime_floor_queries(ROOT)
+    queries, provenance = release.dependency_audit_queries(ROOT)
+    package_versions = [(query["package"]["name"], query["version"]) for query in queries]
+    assert package_versions == sorted(package_versions)
+    assert len(package_versions) == len(set(package_versions))
+    assert all(query in queries for query in locked)
+    assert all(query in queries for query in floors)
+    # The runtime graph is what a user installs, and no hashed lock graph names
+    # it: before the floors were folded in, this row was queried by nothing.
+    assert {"package": {"ecosystem": "PyPI", "name": "roam-code"}, "version": "13.10.0"} in queries
+    assert provenance[("roam-code", "13.10.0")] == (release.RUNTIME_FLOOR_SOURCE,)
+
     requests: list[bytes] = []
 
     def clean(payload: bytes) -> object:
@@ -1882,8 +1897,77 @@ def test_locked_graph_audit_is_stable_complete_and_never_resolves_roam_code():
     assert requests == [release._canonical_json({"queries": queries})]
 
 
+def test_declared_runtime_floors_are_the_exact_versions_this_package_claims_are_safe():
+    queries, provenance = release.runtime_floor_queries(ROOT)
+    package_versions = [(query["package"]["name"], query["version"]) for query in queries]
+    assert package_versions == sorted(package_versions)
+    assert len(package_versions) == release.EXPECTED_RUNTIME_FLOOR_COUNT == 2
+    assert dict(package_versions) == {"click": "8.3.3", "roam-code": "13.10.0"}
+    assert all(query["package"]["ecosystem"] == "PyPI" for query in queries)
+    assert set().union(*map(set, provenance.values())) == {release.RUNTIME_FLOOR_SOURCE}
+
+
+def test_dependency_audit_fails_closed_on_a_vulnerable_declared_runtime_floor():
+    """click>=8.0 admitted CVE-2026-7246 for months and no gate in this repository queried it."""
+    queries, _ = release.dependency_audit_queries(ROOT)
+    floor_index = next(
+        index
+        for index, query in enumerate(queries)
+        if (query["package"]["name"], query["version"]) == ("click", "8.3.3")
+    )
+
+    def vulnerable(_payload: bytes) -> object:
+        results: list[dict[str, object]] = [{} for _query in queries]
+        results[floor_index] = {"vulns": [{"id": "PYSEC-2026-2132", "modified": "2026-07-13T07:15:21Z"}]}
+        return {"results": results}
+
+    with pytest.raises(
+        release.ReleaseError,
+        match=r"click==8\.3\.3:PYSEC-2026-2132\[pyproject\.toml:project\.dependencies\]",
+    ):
+        release.audit_locked_requirements(ROOT, fetch_json=vulnerable)
+
+
+def _root_with_runtime_dependencies(tmp_path: Path, dependencies: list[str], monkeypatch) -> Path:
+    """A repository whose only difference from this one is its declared runtime graph."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    rendered = "\n".join(f"    {json.dumps(requirement)}," for requirement in dependencies)
+    mutated, substitutions = re.subn(
+        r"(?ms)^dependencies = \[.*?^\]", f"dependencies = [\n{rendered}\n]", text, count=1
+    )
+    assert substitutions == 1
+    (root / "pyproject.toml").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(release, "RUNTIME_REQUIRES", list(dependencies))
+    return root
+
+
+@pytest.mark.parametrize(
+    ("dependencies", "message"),
+    [
+        (["roam-code<14,>=13.10.0", "click"], "exactly one inclusive >= floor is required"),
+        (["roam-code<14,>=13.10.0", "click<9"], "exactly one inclusive >= floor is required"),
+        (["roam-code<14,>=13.10.0", "click>=8.3.3,>=8.4"], "exactly one inclusive >= floor is required"),
+        (["roam-code<14,>=13.10.0", "click>=8"], "must name a complete release version"),
+        (["roam-code<14,>=13.10.0", 'click>=8.3.3; python_version < "3.11"'], "environment marker"),
+        (["roam-code<14,>=13.10.0", "click[colour]>=8.3.3"], "not audited here"),
+        (["roam-code<14,>=13.10.0", "click>=8.3.3.post1"], "exact operator and release version"),
+        (["roam-code<14,>=13.10.0", "click>=8.3.3", "requests>=2.34.2"], "must remain exactly 2"),
+        (["roam-code<14,>=13.10.0"], "must remain exactly 2"),
+    ],
+)
+def test_runtime_floor_audit_refuses_a_declaration_it_cannot_name_a_version_for(
+    tmp_path: Path, monkeypatch, dependencies: list[str], message: str
+):
+    """An unauditable declaration is UNKNOWN, so it must refuse rather than contribute nothing."""
+    root = _root_with_runtime_dependencies(tmp_path, dependencies, monkeypatch)
+    with pytest.raises(release.ReleaseError, match=message):
+        release.runtime_floor_queries(root)
+
+
 def test_locked_graph_audit_reports_vulnerabilities_with_graph_provenance():
-    queries, _ = release.locked_requirement_queries(ROOT)
+    queries, _ = release.dependency_audit_queries(ROOT)
     vulnerable_index = next(index for index, query in enumerate(queries) if query["package"]["name"] == "pip")
 
     def vulnerable(_payload: bytes) -> object:
@@ -1908,7 +1992,7 @@ def test_locked_graph_audit_reports_vulnerabilities_with_graph_provenance():
     ],
 )
 def test_locked_graph_audit_rejects_incomplete_or_malformed_service_results(mutation, message: str):
-    queries, _ = release.locked_requirement_queries(ROOT)
+    queries, _ = release.dependency_audit_queries(ROOT)
     results = [{} for _query in queries]
     mutation(results)
     with pytest.raises(release.ReleaseError, match=message):

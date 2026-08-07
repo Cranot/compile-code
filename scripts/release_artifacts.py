@@ -85,6 +85,16 @@ RELEASE_GUARD_SECRET = "RELEASE_GUARD_READ_TOKEN"  # name of a GH secret, not a 
 RELEASE_GUARD_POLICY_ID = 55_007_746
 RELEASE_GUARD_TAG_PATTERN = "v*"
 EXPECTED_LOCKED_VERSION_COUNT = 66
+# The four hashed lock graphs cover the release toolchain. They say nothing
+# about the graph a user installs, which is declared as ranges in pyproject.toml
+# and resolved on the user's machine. Nothing here resolves a range: the audit
+# queries the inclusive floor of each declared runtime requirement, because that
+# floor is the oldest version this package publicly claims is acceptable. A
+# vulnerability strictly above the floor is outside what any static check here
+# can see, and the printed PASS names both surfaces so it cannot be misread as
+# covering the resolved graph.
+EXPECTED_RUNTIME_FLOOR_COUNT = 2
+RUNTIME_FLOOR_SOURCE = "pyproject.toml:project.dependencies"
 IN_TOTO_STATEMENT_TYPE = "https://in-toto.io/Statement/v1"
 PYPI_PUBLISH_ATTESTATION_TYPE = "https://docs.pypi.org/attestations/publish/v1"
 PYPI_INTEGRITY_MEDIA_TYPE = "application/vnd.pypi.integrity.v1+json"
@@ -124,7 +134,7 @@ COMBINED_INSTALL_LOCKS = (
 )
 OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 BUILD_REQUIRES = ["setuptools==83.0.0", "wheel==0.47.0"]
-RUNTIME_REQUIRES = ["roam-code<14,>=13.10.0", "click>=8.0"]
+RUNTIME_REQUIRES = ["roam-code<14,>=13.10.0", "click>=8.3.3"]
 DEV_REQUIRES = ["pytest==9.1.1", "PyYAML==6.0.3", "ruff==0.15.22", "zizmor==1.29.0"]
 PROJECT_URLS = {
     "Homepage": "https://github.com/Cranot/compile-code",
@@ -200,6 +210,9 @@ INPUT_REQUIREMENT_RE = re.compile(
 )
 LOCK_HASH_RE = re.compile(r"^--hash=sha256:([0-9a-f]{64})(?:\s+\\)?$")
 OSV_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+RUNTIME_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+RUNTIME_SPECIFIER_RE = re.compile(r"(?:<=|>=|!=|==|~=|<|>)(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,3}\Z")
+RUNTIME_FLOOR_VERSION_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){1,3}\Z")
 
 
 class ReleaseError(RuntimeError):
@@ -2344,6 +2357,83 @@ def locked_requirement_queries(
     return queries, {key: tuple(sorted(provenance[key])) for key in ordered}
 
 
+def _runtime_floor(requirement: Any) -> tuple[str, str]:
+    """Return the canonical name and inclusive floor of one declared requirement."""
+    label = f"runtime requirement {requirement!r}"
+    _require(
+        isinstance(requirement, str) and requirement.isascii() and requirement == requirement.strip(),
+        f"{label}: must be a bare ASCII requirement string",
+    )
+    _require(";" not in requirement, f"{label}: an environment marker makes the floor conditional and unauditable")
+    _require("[" not in requirement, f"{label}: an extra changes the graph and is not audited here")
+    match = RUNTIME_NAME_RE.match(requirement)
+    if match is None:
+        raise ReleaseError(f"{label}: distribution name is unparseable")
+    remainder = requirement[match.end() :].strip()
+    clauses = [clause.strip() for clause in remainder.split(",")] if remainder else []
+    _require(
+        all(RUNTIME_SPECIFIER_RE.fullmatch(clause) for clause in clauses),
+        f"{label}: every version clause must be an exact operator and release version",
+    )
+    floors = [clause[2:] for clause in clauses if clause.startswith(">=")]
+    _require(
+        len(floors) == 1,
+        f"{label}: exactly one inclusive >= floor is required; an unbounded requirement names no version to audit",
+    )
+    _require(
+        RUNTIME_FLOOR_VERSION_RE.fullmatch(floors[0]) is not None,
+        f"{label}: the inclusive floor must name a complete release version",
+    )
+    return _canonical_name(match.group(0)), floors[0]
+
+
+def runtime_floor_queries(
+    root: Path = ROOT,
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], tuple[str, ...]]]:
+    """Return an OSV query set for the exact floors this package publishes.
+
+    A declared range is a public claim, and its floor is the oldest version that
+    claim admits. Auditing the floor needs no resolver and no network beyond OSV
+    itself, so it stays inside the rule that this module never invokes pip. What
+    it does not cover is any version above the floor: that set is open and only
+    the user's resolver knows which member it picked.
+    """
+    declared = _read_pyproject(root)["project"]["dependencies"]
+    _require(isinstance(declared, list), "pyproject.toml: project.dependencies must be an array")
+    provenance: dict[tuple[str, str], set[str]] = {}
+    for requirement in declared:
+        name, floor = _runtime_floor(requirement)
+        _require(
+            not any(name == existing for existing, _version in provenance),
+            f"pyproject.toml declares {name} more than once",
+        )
+        provenance[(name, floor)] = {RUNTIME_FLOOR_SOURCE}
+    _require(
+        len(provenance) == EXPECTED_RUNTIME_FLOOR_COUNT,
+        f"declared runtime floor count must remain exactly {EXPECTED_RUNTIME_FLOOR_COUNT}; got {len(provenance)}",
+    )
+    ordered = sorted(provenance)
+    queries = [{"package": {"ecosystem": "PyPI", "name": name}, "version": version} for name, version in ordered]
+    return queries, {key: tuple(sorted(provenance[key])) for key in ordered}
+
+
+def dependency_audit_queries(
+    root: Path = ROOT,
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], tuple[str, ...]]]:
+    """Every exact version this repository is answerable for, as one query set."""
+    merged: dict[tuple[str, str], set[str]] = {}
+    for _queries, provenance in (locked_requirement_queries(root), runtime_floor_queries(root)):
+        for key, sources in provenance.items():
+            merged.setdefault(key, set()).update(sources)
+    _require(
+        0 < len(merged) <= MAX_OSV_QUERIES,
+        f"dependency audit query count must be between 1 and {MAX_OSV_QUERIES}; got {len(merged)}",
+    )
+    ordered = sorted(merged)
+    queries = [{"package": {"ecosystem": "PyPI", "name": name}, "version": version} for name, version in ordered]
+    return queries, {key: tuple(sorted(merged[key])) for key in ordered}
+
+
 class _RejectOSVRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
         raise ReleaseError(f"OSV audit endpoint unexpectedly redirected with HTTP {code}")
@@ -2382,8 +2472,8 @@ def audit_locked_requirements(
     *,
     fetch_json: Callable[[bytes], Any] = _fetch_osv_batch,
 ) -> int:
-    """Audit only exact lock rows; never invoke pip or resolve project dependencies."""
-    queries, provenance = locked_requirement_queries(root)
+    """Audit exact lock rows and declared runtime floors; never invoke pip or resolve a range."""
+    queries, provenance = dependency_audit_queries(root)
     document = fetch_json(_canonical_json({"queries": queries}))
     response = _exact_keys(document, {"results"}, "OSV querybatch response")
     results = response["results"]
@@ -4123,7 +4213,11 @@ def main(argv: list[str] | None = None) -> int:
                 network_job="release.build",
             )
             audited = audit_locked_requirements(ROOT)
-            print(f"locked dependency audit: PASS ({audited} exact package versions; no resolution)")
+            print(
+                f"locked dependency audit: PASS ({audited} exact package versions from "
+                f"{len(LOCK_GRAPHS)} hashed lock graphs and {EXPECTED_RUNTIME_FLOOR_COUNT} declared runtime floors; "
+                f"no resolution, so no version above a floor is covered)"
+            )
         elif args.command == "pypi-state":
             _require(0 <= args.wait_seconds <= 600, "wait-seconds must be between 0 and 600")
             _require_release_environment(
