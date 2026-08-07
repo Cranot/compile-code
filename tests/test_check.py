@@ -748,6 +748,35 @@ def test_leak_gate_carries_a_pattern_for_the_credential_it_publishes_with(tmp_pa
     assert "[PyPI upload token]" in capsys.readouterr().out
 
 
+def test_leak_gate_carries_the_modern_ai_key_shapes_its_sk_pattern_cannot_reach(tmp_path, monkeypatch, capsys):
+    """``sk-[A-Za-z0-9]{20,}`` needs 20+ ALPHANUMERICS right after ``sk-``.
+
+    Every modern AI provider key puts a hyphen there -- ``sk-ant-oat01-``,
+    ``sk-ant-api03-``, ``sk-proj-`` -- so the class breaks after 3 characters,
+    well short of the floor, and this catalogue matched none of them.
+    ``scripts/secret_scan.py``'s own docstring documented that limitation; the
+    gap it left is not theoretical, because ``.githooks/pre-push`` runs THIS
+    gate as its whole-tree arm and does not run ``secret_scan.py`` at all
+    (only CI does). Measured before this pattern existed:
+    ``check._leak_pattern_hits`` returned ``[]`` for all three shapes.
+    """
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    planted = {
+        "oat.py": "sk-" + "ant-" + "oat" + "01-" + "Aa9_-" * 12,
+        "api.py": "sk-" + "ant-" + "api" + "03-" + "Bb8_-" * 12,
+        "proj.py": "sk-" + "proj-" + "Cc7" * 12,
+    }
+    for name, token in planted.items():
+        (tmp_path / name).write_text(f'key = "{token}"\n', encoding="utf-8")
+        subprocess.run(["git", "add", "--", name], cwd=tmp_path, check=True)
+    monkeypatch.setattr(check, "ROOT", tmp_path)
+
+    assert check.leak_scan() is False
+    output = capsys.readouterr().out
+    for name in planted:
+        assert f"{name}:1  [AI provider key]" in output, output
+
+
 def test_binary_candidate_refuses_and_a_readable_companion_does_not_rescue_it(tmp_path, monkeypatch, capsys):
     """Fail closed, and stay closed once a readable file joins the tree.
 
@@ -804,7 +833,7 @@ def test_leak_control_covers_both_catalogue_families(monkeypatch):
     """One planted item per FAMILY -- a credential shape and a private-
     infrastructure string -- because a control exercising only a pattern
     already known to work proves nothing about the rest."""
-    for label in ("AWS access key", "VPS-local path", "GitHub token"):
+    for label in ("AWS access key", "VPS-local path", "GitHub token", "AI provider key"):
         monkeypatch.setattr(check, "LEAK_PATTERNS", [p for p in check.LEAK_PATTERNS if p[1] != label])
         assert check._leak_control_failures() == [f"planted control leak not detected: {label}"]
         monkeypatch.undo()

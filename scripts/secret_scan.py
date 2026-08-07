@@ -18,14 +18,24 @@ correct even if the upstream package is temporarily behind.
 WHY THIS EXISTS
 ---------------
 Until this scan was added, compile-code's only credential-shaped checks were
-the four narrow ``LEAK_PATTERNS`` entries in ``scripts/check.py`` (AWS,
-generic ``sk-``, GitHub, PEM). That generic ``sk-`` pattern requires 20+
-alphanumeric characters immediately after the prefix -- so it does not match
-AI-provider keys that embed hyphens right after ``sk-`` (Anthropic's
-``sk-ant-oat01-...``, OpenAI's ``sk-proj-...``): the hyphen breaks the
-character class after 3-4 chars, well short of the 20-char floor. This repo
-ships an AI dev tool, so those are exactly the credentials most likely to
-turn up in a fixture, a pasted log, or a ``.env``.
+four narrow ``LEAK_PATTERNS`` entries in ``scripts/check.py`` (AWS, generic
+``sk-``, GitHub, PEM). That generic ``sk-`` pattern requires 20+ alphanumeric
+characters immediately after the prefix -- so it did not match AI-provider
+keys that embed hyphens right after ``sk-`` (Anthropic's ``sk-ant-oat01-...``,
+OpenAI's ``sk-proj-...``): the hyphen breaks the character class after 3-4
+chars, well short of the 20-char floor. This repo ships an AI dev tool, so
+those are exactly the credentials most likely to turn up in a fixture, a
+pasted log, or a ``.env``.
+
+THAT COUNT IS HISTORY, NOT THE CURRENT STATE. ``check.LEAK_PATTERNS`` now
+holds 9 entries and carries the hyphenated AI-key shape itself, because
+``.githooks/pre-push`` runs ``check.py`` as its whole-tree arm and does not
+run this script at all -- only CI does. The two catalogues stay separate on
+purpose and the difference runs BOTH ways: ``check`` carries three
+private-infrastructure shapes that no vendor catalogue has, plus a shorter
+``sk-`` form this one does not accept. Neither list is a superset of the
+other, so neither can replace the other; see the comment above
+``LEAK_PATTERNS`` in ``scripts/check.py`` for which job each does.
 
 METHOD NOTE -- why the self-test (tests/test_secret_scan.py) plants ONE CASE
 PER PROVIDER FAMILY:
@@ -147,6 +157,20 @@ SECRET_PATTERN_DEFS: list[dict[str, str]] = [
     {
         "name": "GitHub Personal Access Token (classic)",
         "pattern": r"ghp_[A-Za-z0-9]{36}",
+        "severity": "high",
+    },
+    {
+        # LOCAL ADDITION, not present in the ported upstream catalogue.
+        # GitHub's fine-grained PATs are prefixed ``github_pat_``, which
+        # matches NEITHER entry above: ``gh[pousr]_`` breaks at ``gi``, and
+        # ``ghp_`` does not apply at all. Measured on a 67-character sample --
+        # ``scripts/check.py`` matched it and this catalogue returned ``[]``,
+        # on all 51 candidate files and on every historical blob, since
+        # ``prepush_leak_scan`` runs both catalogues but only one of them knew
+        # the shape. The bound mirrors check.py's entry rather than inventing
+        # a second opinion about the format.
+        "name": "GitHub Fine-Grained PAT",
+        "pattern": r"github_pat_[A-Za-z0-9_]{36,}",
         "severity": "high",
     },
     {"name": "GitLab Token", "pattern": r"glpat-[A-Za-z0-9\-]{20,}", "severity": "high"},

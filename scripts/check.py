@@ -56,9 +56,40 @@ except ModuleNotFoundError:  # Direct ``python scripts/check.py`` execution.
 ROOT = Path(__file__).resolve().parent.parent
 
 # Credential shapes + private-infrastructure strings that must never ship.
+#
+# THIS CATALOGUE IS DELIBERATELY A SUBSET, and the subsetting is what needs
+# stating -- measured, this list holds 9 entries against
+# ``secret_scan.SECRET_PATTERN_DEFS``'s 34. That is not drift. The two lists do
+# different jobs over the same inventory:
+#
+#   * ``scripts/secret_scan.py`` is the broad VENDOR catalogue. CI runs it in
+#     the same job as this gate (.github/workflows/ci.yml:55 and :76) over an
+#     identical candidate set, so on every tracked file its 34 patterns are
+#     already applied and repeating them here would buy nothing but ~9x the
+#     runtime (measured over this tree: 110.6 ms -> 1104.4 ms).
+#   * The last three entries here are private-infrastructure strings that exist
+#     in NO vendor catalogue and never will. They are why this list cannot be
+#     replaced by an import of the other one -- a merge is only ever safe as a
+#     union, never as a substitution.
+#
+# The overlap that IS carried is not redundancy. ``.githooks/pre-push`` runs
+# this gate as its whole-tree arm and does NOT run ``secret_scan.py`` at all;
+# only CI does. So on a developer's machine these patterns are the only tree
+# catalogue there is, which is why the credential shapes below have to cover
+# the families this repository actually handles rather than the four it
+# started with.
 LEAK_PATTERNS = [
     (r"(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})", "GitHub token"),
     (r"sk-[A-Za-z0-9]{20,}", "API secret key"),
+    # The entry above cannot reach a modern AI-provider key: it needs 20+
+    # ALPHANUMERICS immediately after ``sk-``, and every one of these puts a
+    # hyphen there, breaking the class after 3 characters. Measured on the
+    # shipped gate, ``_leak_pattern_hits`` returned ``[]`` for
+    # ``sk-ant-oat01-``, ``sk-ant-api03-`` and ``sk-proj-`` alike -- a gap
+    # ``secret_scan``'s docstring had documented and this catalogue had not
+    # closed. This repository ships an AI dev tool, so these are the exact
+    # credentials most likely to be pasted into a fixture or a log here.
+    (r"sk-(?:ant-(?:oat|api)?[0-9]{2}|proj)-[A-Za-z0-9_\-]{20,}", "AI provider key"),
     (r"AKIA[0-9A-Z]{16}", "AWS access key"),
     # This repository publishes to PyPI, and a PyPI upload token's natural
     # home is an ``--index-url`` line in a pip requirements/lock file. It was
@@ -933,8 +964,25 @@ def _scan_file_for_leaks(rel: str) -> list[str]:
 # only a pattern already known to work proves nothing about the rest, and one
 # of the two rides in as UTF-16 so the decode path that ``_scan_views``
 # exists for is a live control rather than only a test.
-_LEAK_CONTROL_EXPECTED = ("AWS access key", "VPS-local path", "GitHub token")
-_LEAK_CONTROL_UTF8 = 'aws = "' + "AK" + "IA" + "C" * 16 + '"\nlog = "/root/' + 'services/app.log"\n'
+_LEAK_CONTROL_EXPECTED = ("AWS access key", "VPS-local path", "GitHub token", "AI provider key")
+_LEAK_CONTROL_UTF8 = (
+    'aws = "'
+    + "AK"
+    + "IA"
+    + "C" * 16
+    + '"\nlog = "/root/'
+    + 'services/app.log"\n'
+    # The newest family, planted like the rest: a control that exercises only
+    # the patterns that already worked is exactly how this catalogue shipped
+    # for a release with no reach into modern AI-provider keys at all.
+    + 'key = "'
+    + "sk-"
+    + "ant-"
+    + "oat"
+    + "01-"
+    + "Aa9_-" * 12
+    + '"\n'
+)
 _LEAK_CONTROL_UTF16 = 'token = "' + "gh" + "p_" + "C" * 36 + '"\n'
 
 

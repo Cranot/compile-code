@@ -3,10 +3,11 @@
 compile-code ships an AI dev tool, so Anthropic/OpenAI/xAI/Groq/HuggingFace/
 Replicate keys are the credentials most likely to sit in a fixture, a pasted
 log, or a ``.env`` -- and this repo had zero coverage for them until this
-scan was added (only four narrow patterns lived in ``scripts/check.py``, and
-its generic ``sk-`` pattern does not match key shapes with a hyphen right
+scan was added (four narrow patterns lived in ``scripts/check.py`` then, and
+its generic ``sk-`` pattern did not match key shapes with a hyphen right
 after the prefix, which is exactly how Anthropic's and OpenAI's project keys
-are shaped).
+are shaped; that gate has since grown a pattern for them, and both
+catalogues are now checked, because neither is a superset of the other).
 
 METHOD NOTE -- why one case PER PROVIDER FAMILY:
 the first gate built against this defect (roam-code's) self-tested with a
@@ -48,6 +49,11 @@ PROVIDER_FAMILY_CASES = [
     ("r8_" + "H" * 37, "Replicate API Token"),
     ("AKIA" + "I" * 16, "AWS Access Key"),
     ("ghp_" + "J" * 36, "GitHub Personal Access Token (classic)"),
+    # Fine-grained PATs match NEITHER of the two ghp_/gh[pousr]_ shapes above:
+    # the prefix is github_pat_, so the character class breaks at "gi".
+    # Measured before this case existed -- check.py caught it and this
+    # 33-pattern catalogue did not, on all 51 candidate files.
+    ("github_pat_" + "11ABCDEFG0" + "P" * 47, "GitHub Fine-Grained PAT"),
     ("glpat-" + "K" * 20, "GitLab Token"),
     ("sk_live_" + "L" * 24, "Stripe Secret Key"),
     ("AIza" + "M" * 35, "Google API Key"),
