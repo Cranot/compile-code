@@ -201,13 +201,18 @@ def test_no_mode_and_no_upstream_fails_closed_instead_of_scanning_nothing(repo: 
     assert "no --range or --pre-push-updates" in result.stderr
 
 
-def test_own_test_corpus_file_is_exempt_across_its_whole_history(repo: Path) -> None:
+def test_heuristic_suppression_covers_the_exempt_path_across_its_whole_history(repo: Path) -> None:
     """Reproduces compile-code's own real false-positive shape: a commit adds
     tests/test_secret_scan.py's f-string template line un-annotated, and a
     LATER commit adds a '# secretsallow' marker to the tip version. Because
     the range scan reads every commit's own full blob, the marker at the tip
-    does not retroactively clean the earlier commit -- only the path
-    allowlist (scripts/secret_scan.py's _OWN_TEST_CORPUS_FILES) does that."""
+    does not retroactively clean the earlier commit.
+
+    This is the measured reason the heuristic half of the exemption survives
+    as a PATH rule rather than becoming per-line markers: three blobs in this
+    repository's own pending push carry the unmarked fixture line, so dropping
+    the path rule outright would refuse a push over a test fixture. The vendor
+    half is not suppressed anywhere -- see the test below."""
     base = _commit(repo, "readme.txt", "benign\n", "benign base commit")
     _commit(
         repo,
@@ -227,7 +232,7 @@ def test_own_test_corpus_file_is_exempt_across_its_whole_history(repo: Path) -> 
     assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}\n{result.stderr}"
 
 
-def test_own_test_corpus_exemption_is_one_file_not_a_directory(repo: Path) -> None:
+def test_heuristic_suppression_is_one_file_not_a_directory(repo: Path) -> None:
     """The allowlist must not silently widen into 'tests/ is exempt' -- a
     DIFFERENT file under tests/ carrying a real credential-shaped secret must
     still be caught."""
@@ -628,18 +633,26 @@ def test_the_unread_path_refusal_states_a_remedy_that_is_true(repo: Path) -> Non
     assert "git rm --cached" in result.stderr, "the remedy does not say how to untrack the path"
 
 
-def test_own_test_corpus_exemption_does_not_trip_the_unopened_range_refusal(repo: Path) -> None:
-    """The one named, reviewed path exemption stays outside the denominator.
-    Its content is secret-shaped by construction -- a decided exemption, not a
-    guess about unknown content -- so a push that only touches it is still
-    clean, and the exemption is disclosed rather than silent."""
-    _commit(repo, "tests/test_secret_scan.py", 'planted = "AKIA" + "W" * 16\n', "extend the scanner's own corpus")
+def test_the_scanners_own_test_path_is_scanned_like_any_other(repo: Path) -> None:
+    """The inverse of the exemption test this replaces.
 
+    ``_path_disposition`` inherited a WHOLE-FILE exemption from
+    ``secret_scan``, so a contiguous live-format credential committed at that
+    path published under the word "clean", exit 0. A split fixture still
+    passes -- real credentials do not arrive pre-split, which is the discipline
+    that made the blanket unnecessary in the first place.
+    """
+    split = _commit(repo, "tests/test_secret_scan.py", 'planted = "AKIA" + "W" * 16\n', "split fixture")
     result = _run(repo, "--range", "HEAD")
+    assert result.returncode == 0, f"a SPLIT fixture was refused:\n{result.stdout}{result.stderr}"
 
-    assert result.returncode == 0, f"expected clean, got exit {result.returncode}:\n{result.stdout}{result.stderr}"
-    assert "corpus-exempt" in result.stdout
-    assert "tests/test_secret_scan.py" in result.stdout
+    token = "sk-" + "ant-" + "oat" + "01-" + "Aa9_-" * 12
+    tip = _commit(repo, "tests/test_secret_scan.py", f'leaked = "{token}"\n', "contiguous credential")
+
+    result = _run(repo, "--range", f"{split}..{tip}")
+
+    assert result.returncode == 2, f"a contiguous credential published clean:\n{result.stdout}"
+    assert "tests/test_secret_scan.py" in result.stderr
 
 
 def test_credential_past_the_first_line_batch_is_found_with_a_true_line_number(repo: Path) -> None:

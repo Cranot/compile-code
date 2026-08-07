@@ -167,9 +167,11 @@ def test_mask_secret_never_returns_the_full_value() -> None:
 
 
 # --- name-vs-value discrimination -------------------------------------------
-# These test cases can use plain contiguous literals (not string-concatenation
-# tricks) because this file is on the scanner's own OWN_TEST_CORPUS_FILES
-# allowlist -- see the module docstring's "NOTE ON TEST FIXTURES".
+# These test cases use plain contiguous literals because they exercise the
+# HEURISTIC half of the catalogue (Generic Secret Assignment), which is the
+# only half suppressed on this path -- see secret_scan._HEURISTIC_EXEMPT_FILES.
+# A VENDOR shape must still be split here like anywhere else: this file is
+# read and vendor-scanned like every other candidate.
 
 
 def test_screaming_snake_identifier_value_is_not_flagged() -> None:
@@ -183,7 +185,7 @@ def test_screaming_snake_rule_does_not_swallow_a_real_looking_secret() -> None:
     """The identifier-value discrimination must be narrow: a value with
     mixed case and digits (i.e. actual entropy, not just an identifier
     shape) still has to fire Generic Secret Assignment."""
-    hits = _detect('API_SECRET = "aB3xQ7zRt9LmZp2w"')
+    hits = _detect('API_SECRET = "aB3xQ7zRt9LmZp2w"')  # secretsallow
     assert "Generic Secret Assignment" in hits
 
 
@@ -206,18 +208,114 @@ def test_unresolved_template_placeholder_value_is_not_flagged() -> None:
     assert not _detect("API_KEY = '%(secret)s'")
 
 
-# --- scanner-own-test-corpus path exemption ---------------------------------
+# --- no file is exempt from the VENDOR catalogue -----------------------------
+#
+# This file used to be skipped WHOLE, on the argument that a secret scanner
+# cannot be tested without secret-shaped strings. Measured, that argument
+# covered 1 line out of 538 -- every other fixture is already split across
+# string-literal concatenations by this file's own documented discipline --
+# while the blanket removed the file from 2 of the 3 catalogues that read the
+# tree. 11 of 15 provider families had ZERO coverage inside it.
+#
+# What survives is a suppression of the seven HEURISTIC shapes on this one
+# path, which is as far as the argument actually reaches: a fixture that trips
+# "Generic Secret Assignment" is doing its job, and nothing legitimate here
+# produces an sk-ant-oat01- or an AKIA.
 
 
-def test_own_test_corpus_predicate_is_one_file_not_a_directory() -> None:
-    """A path allowlist, not a directory rule: only this exact file is
-    exempt, so the exemption cannot quietly grow into "tests/ is exempt"
-    (which would reopen the coverage gap this scanner exists to close)."""
-    assert secret_scan._is_own_test_corpus("tests/test_secret_scan.py")
-    assert secret_scan._is_own_test_corpus("tests\\test_secret_scan.py")
-    assert not secret_scan._is_own_test_corpus("tests/test_secret_scan_other.py")
-    assert not secret_scan._is_own_test_corpus("tests/test_prepush_leak_scan.py")
-    assert not secret_scan._is_own_test_corpus("scripts/secret_scan.py")
+def test_only_heuristic_shapes_are_suppressed_and_only_on_one_path() -> None:
+    """The exemption is a CATALOGUE narrowing, not a skip, on one named path."""
+    assert secret_scan._HEURISTIC_EXEMPT_FILES == frozenset({"tests/test_secret_scan.py"})
+    assert secret_scan._is_heuristic_exempt("tests/test_secret_scan.py")
+    assert secret_scan._is_heuristic_exempt("tests\\test_secret_scan.py")
+    assert not secret_scan._is_heuristic_exempt("tests/test_secret_scan_other.py")
+    assert not secret_scan._is_heuristic_exempt("tests/test_prepush_leak_scan.py")
+    assert not secret_scan._is_heuristic_exempt("scripts/secret_scan.py")
+
+
+def test_every_suppressed_name_is_a_real_catalogue_entry() -> None:
+    """A rename in ``SECRET_PATTERN_DEFS`` must not silently widen or empty the
+    suppressed half. The two lists live apart so the catalogue stays a verbatim
+    port, which is exactly the drift this pins."""
+    catalogue = {d["name"] for d in secret_scan.SECRET_PATTERN_DEFS}
+
+    assert secret_scan.HEURISTIC_PATTERN_NAMES <= catalogue
+    vendor = catalogue - secret_scan.HEURISTIC_PATTERN_NAMES
+    # Every provider family in the reproduction matrix has to be on the vendor
+    # side, or suppressing "heuristics" would still hide a real credential.
+    for name in (
+        "Anthropic OAuth Token",
+        "Anthropic API Key",
+        "OpenAI Project Key",
+        "OpenAI API Key",
+        "AWS Access Key",
+        "GitHub Token",
+        "GitLab Token",
+        "Stripe Secret Key",
+        "Google API Key",
+        "NPM Token",
+        "PyPI Token",
+        "Private Key",
+    ):
+        assert name in vendor, f"{name} would be suppressed on the exempt path"
+
+
+def test_heuristic_shapes_are_still_suppressed_on_the_exempt_path() -> None:
+    """Conservation: the half of the argument that was always sound.
+
+    A fixture line asserting that ``SECRET = "<value>"`` fires the generic rule
+    is doing its job. Suppressed only where the exemption applies -- the same
+    line anywhere else is a finding.
+    """
+    line = 'API_SECRET = "aB3xQ7zRt9LmZp2w"'  # secretsallow
+
+    exempt = secret_scan.scan_text("tests/test_secret_scan.py", line, skip_heuristics=True)
+    elsewhere = secret_scan.scan_text("tests/test_secret_scan.py", line)
+
+    assert exempt == []
+    assert [f["pattern_name"] for f in elsewhere] == ["Generic Secret Assignment"]
+
+
+def test_a_live_credential_in_this_scanners_own_test_file_is_refused(tmp_path, monkeypatch, capsys) -> None:
+    """The inverse of the test this replaces, and the whole point of the fix.
+
+    Measured on the shipped scanner with a CONTIGUOUS live-format token
+    appended to the real tracked file: ``secret scan: PASS ... 1 corpus-exempt
+    ... 0 findings`` exit 0, ``check.leak_scan()`` True, ``artifact_scan()``
+    True, and ``prepush_leak_scan`` clean exit 0 -- four gates, all green,
+    over a credential in a tracked file. 11 of 15 provider families evaded
+    every gate there; the 4 that did not were caught only by the overlap with
+    ``check.py``'s 8-pattern catalogue, which is coincidence, not design.
+    """
+    token = "sk-" + "ant-" + "oat" + "01-" + "Aa9_-" * 12
+    root = _repo_with(
+        tmp_path,
+        {
+            "tests/test_secret_scan.py": f'LEAKED_TOKEN = "{token}"\n'.encode(),
+            "readme.md": b"benign\n",
+        },
+    )
+    monkeypatch.setattr(secret_scan, "ROOT", root)
+
+    assert secret_scan.main([]) == 1
+    error = capsys.readouterr().err
+    assert "tests/test_secret_scan.py" in error
+    assert "Anthropic OAuth Token" in error
+
+
+def test_the_surviving_suppression_has_no_residents_at_the_tip() -> None:
+    """The real tracked file scans clean under the FULL catalogue.
+
+    This is the cost side of the fix, pinned rather than asserted. The one line
+    that trips a heuristic carries the per-line ``# secretsallow`` marker, so
+    the remaining exemption suppresses nothing today -- and if a future fixture
+    starts relying on it, this test says so instead of the reliance being
+    invisible.
+    """
+    path = secret_scan.ROOT / "tests" / "test_secret_scan.py"
+    findings = secret_scan.scan_text("tests/test_secret_scan.py", path.read_text(encoding="utf-8"))
+
+    assert findings == [], f"this scanner's own test file no longer scans clean: {findings}"
 
 
 # --- the gate must never report clean without having read anything ----------
@@ -282,7 +380,7 @@ def test_clean_secret_scan_reports_established_and_examined_counts(tmp_path, mon
     assert secret_scan.main([]) == 0
     assert (
         "established 2 candidate paths; examined 2 text files; 0 binary-skipped; "
-        "0 path-skipped; 0 corpus-exempt; 0 absent; 0 unscannable; 0 findings" in capsys.readouterr().out
+        "0 path-skipped; 0 absent; 0 unscannable; 0 heuristics-suppressed; 0 findings" in capsys.readouterr().out
     )
 
 
@@ -516,8 +614,12 @@ def test_every_candidate_path_lands_in_exactly_one_bucket(tmp_path) -> None:
 
     scan = secret_scan._scan_repo(root)
 
-    assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (4, 1, 1)
-    assert (scan.path_skipped, scan.corpus_exempt) == (("build/generated.py",), ("tests/test_secret_scan.py",))
+    # The scanner's own test file is now READ like any other candidate, so it
+    # lands in ``files_examined``. ``heuristics_suppressed`` is a disclosure
+    # about WHICH catalogue ran there, not a bucket outside the denominator.
+    assert (scan.candidates, scan.files_examined, scan.binary_skipped) == (4, 2, 1)
+    assert scan.path_skipped == ("build/generated.py",)
+    assert scan.heuristics_suppressed == ("tests/test_secret_scan.py",)
     assert scan.unaccounted == 0
 
 

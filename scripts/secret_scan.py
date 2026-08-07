@@ -41,14 +41,17 @@ Planted test secrets must therefore be split across string-literal
 concatenations so the raw source text never contains a contiguous match
 (see tests/test_secret_scan.py); real secrets do not arrive pre-split.
 
-The ONE narrow exception is ``tests/test_secret_scan.py`` itself
-(``_OWN_TEST_CORPUS_FILES`` below): a secret scanner cannot be tested
-without planting secret-shaped strings, so that file matching its own
-patterns is a structural certainty, not a finding -- not a loophole a real
-leak could hide behind, since it is one named path, not a directory rule.
-Same idiom as roam-code's ``WHITELIST_FILES`` in
-``scripts/internal_language_patterns.py``, which exempts that pattern
-catalogue's own test file for the identical reason.
+``tests/test_secret_scan.py`` is READ like every other candidate. What it
+gets is not an exemption from the scan but a narrower CATALOGUE: the seven
+``HEURISTIC_PATTERN_NAMES`` shapes are suppressed there
+(``_HEURISTIC_EXEMPT_FILES`` below) and every vendor shape still runs. A
+secret scanner cannot be tested without secret-shaped strings, and that fact
+justifies suppressing the half of the catalogue whose match means "this looks
+like a place credentials live" -- it does not justify suppressing the half
+whose match means "this is an Anthropic key". Measured before that
+distinction was drawn: the whole-file form covered 538 lines to serve 1, and
+a contiguous live-format credential planted at that path passed every gate in
+this repository, with 11 of 15 provider families uncovered inside it.
 
 Exit codes: 0 = clean, and the verdict publishes the denominator that
 produced it. 1 = finding(s). 3 = candidates were established but none of
@@ -229,6 +232,33 @@ _COMPILED_PATTERNS: list[dict] = [
 
 _ENTROPY_THRESHOLD = 4.5
 
+# The catalogue splits in two, and the halves carry different evidence.
+#
+# A VENDOR entry matches a shape only one issuer produces: ``sk-ant-oat01-``,
+# ``AKIA``, ``ghp_``, a PEM header. A match is a credential or a deliberate
+# forgery of one -- there is no third reading.
+#
+# A HEURISTIC entry matches a CONTEXT that credentials often appear in --
+# ``SECRET = "..."``, a bearer token, a base64 run, a high-entropy string. It
+# is the half that a scanner's own fixtures trip by construction, and the half
+# whose match is evidence of a shape rather than of an issuer.
+#
+# Named here rather than flagged in ``SECRET_PATTERN_DEFS`` because that list
+# is a verbatim port and must stay diffable against its source. A test pins
+# every name below to a real catalogue entry, so a rename cannot silently
+# empty this set.
+HEURISTIC_PATTERN_NAMES = frozenset(
+    {
+        "Generic Password Assignment",
+        "Generic Secret Assignment",
+        "Generic Bearer Token",
+        "JWT Token",
+        "Base64 Encoded Secret",
+        "Database Connection String",
+        "High Entropy String",
+    }
+)
+
 
 def _shannon_entropy(value: str) -> float:
     if not value:
@@ -338,13 +368,21 @@ def _line_is_allowlisted(line: str) -> bool:
     return _ALLOWLIST_RE.search(line) is not None
 
 
-def scan_text(rel_path: str, text: str) -> list[dict]:
-    """Scan one file's text content, returning masked findings."""
+def scan_text(rel_path: str, text: str, *, skip_heuristics: bool = False) -> list[dict]:
+    """Scan one file's text content, returning masked findings.
+
+    ``skip_heuristics`` drops the seven ``HEURISTIC_PATTERN_NAMES`` entries and
+    NOTHING else. It exists for one named path -- this scanner's own test
+    corpus, see ``_HEURISTIC_EXEMPT_FILES`` -- which used to be skipped whole.
+    Every vendor shape still runs there.
+    """
     findings: list[dict] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
         if _line_is_allowlisted(line):
             continue
         for pat in _COMPILED_PATTERNS:
+            if skip_heuristics and pat["name"] in HEURISTIC_PATTERN_NAMES:
+                continue
             for match in pat["regex"].finditer(line):
                 if _is_explicit_placeholder(match):
                     continue
@@ -404,18 +442,40 @@ def _in_skip_dir(rel_path: str) -> bool:
     return any(is_untrackable_directory_segment(p) for p in rel_path.split("/")[:-1])
 
 
-# The scanner's OWN test fixture corpus: a path allowlist, not a directory
-# rule, so it can't quietly grow into "tests/ is exempt" (which would reopen
-# the coverage gap this scanner exists to close). Precedent: roam-code's
-# ``WHITELIST_FILES`` in scripts/internal_language_patterns.py exempts that
-# pattern catalogue's own test file the same way, for the same reason --
-# a scanner cannot be tested without secret-shaped strings, so its own test
-# file matching its own patterns is a structural certainty, not a finding.
-_OWN_TEST_CORPUS_FILES = frozenset({"tests/test_secret_scan.py"})
+# The scanner's OWN test fixture corpus. This file is READ and scanned like
+# every other candidate; only the seven ``HEURISTIC_PATTERN_NAMES`` shapes are
+# suppressed on it.
+#
+# It used to be skipped WHOLE, on the argument that a secret scanner cannot be
+# tested without secret-shaped strings. That argument is sound and it justifies
+# exactly this much. Measured on the shipped scanner, the blanket covered 538
+# lines while 1 needed it -- and the cost of the other 537 was total: a
+# CONTIGUOUS live-format credential planted at this path passed every gate in
+# the repository, and 11 of 15 provider families had zero coverage inside it.
+# The 4 that were still caught were caught only by ``check.py``'s narrow
+# 8-pattern catalogue, which reads this path -- coincidence of overlap, not
+# design.
+#
+# The remaining suppression is bounded by what a heuristic match MEANS: a
+# fixture that trips ``Generic Secret Assignment`` is doing its job, whereas
+# nothing legitimate here produces an ``sk-ant-oat01-`` or an ``AKIA``. It is
+# also inert today -- the one fixture line that still trips a heuristic carries
+# the per-line ``# secretsallow`` marker, pinned by a test, so this set has
+# zero residents at the tip. It stays because a per-line marker cannot clean a
+# blob already committed WITHOUT it, and the range scanner reads each commit's
+# own text: dropping the set outright would refuse three blobs in the currently
+# pending push over a test fixture, which is how a gate gets bypassed.
+_HEURISTIC_EXEMPT_FILES = frozenset({"tests/test_secret_scan.py"})
 
 
-def _is_own_test_corpus(rel_path: str) -> bool:
-    return rel_path.replace("\\", "/") in _OWN_TEST_CORPUS_FILES
+def _is_heuristic_exempt(rel_path: str) -> bool:
+    """Whether the HEURISTIC half of the catalogue is suppressed for this path.
+
+    A path allowlist, not a directory rule, so it cannot quietly grow into
+    "tests/ is exempt" -- and it no longer decides whether the file is read at
+    all, only which half of the catalogue runs.
+    """
+    return rel_path.replace("\\", "/") in _HEURISTIC_EXEMPT_FILES
 
 
 def _without_git_controls() -> dict[str, str]:
@@ -477,6 +537,13 @@ class RepoScan(NamedTuple):
     holding a tracked credential, and the three missing paths were the whole
     defect, disclosed as nothing but a gap between two numbers. A path can no
     longer leave this scan without saying which bucket it left by.
+
+    ``heuristics_suppressed`` is deliberately NOT one of those buckets and is
+    not part of ``accounted``: those files were read and vendor-scanned, so
+    they are already inside ``files_examined``. It rides in the verdict purely
+    so a reader can see that a narrower catalogue ran on a named path. It used
+    to be a ``corpus_exempt`` bucket -- a path removed from the denominator
+    entirely -- which is what a whole-file exemption is.
     """
 
     findings: list[dict]
@@ -484,20 +551,13 @@ class RepoScan(NamedTuple):
     files_examined: int
     binary_skipped: int
     path_skipped: tuple[str, ...] = ()
-    corpus_exempt: tuple[str, ...] = ()
+    heuristics_suppressed: tuple[str, ...] = ()
     absent: int = 0
     unscannable: int = 0
 
     @property
     def accounted(self) -> int:
-        return (
-            self.files_examined
-            + self.binary_skipped
-            + len(self.path_skipped)
-            + len(self.corpus_exempt)
-            + self.absent
-            + self.unscannable
-        )
+        return self.files_examined + self.binary_skipped + len(self.path_skipped) + self.absent + self.unscannable
 
     @property
     def unaccounted(self) -> int:
@@ -511,13 +571,10 @@ def _scan_repo(root: Path) -> RepoScan:
     files_examined = 0
     binary_skipped = 0
     path_skipped: list[str] = []
-    corpus_exempt: list[str] = []
+    heuristics_suppressed: list[str] = []
     absent = 0
     unscannable = 0
     for rel_path in candidates:
-        if _is_own_test_corpus(rel_path):
-            corpus_exempt.append(rel_path)
-            continue
         if _in_skip_dir(rel_path):
             # Counted and named, never merely absent. Safe only because
             # ``check.artifact_scan`` fails the build on exactly these paths
@@ -573,9 +630,12 @@ def _scan_repo(root: Path) -> RepoScan:
             )
             continue
         files_examined += 1
+        skip_heuristics = _is_heuristic_exempt(rel_path)
+        if skip_heuristics:
+            heuristics_suppressed.append(rel_path)
         prior_view_findings: set[tuple[object, ...]] = set()
         for text in decode_views(data):
-            view_findings = scan_text(rel_path, text)
+            view_findings = scan_text(rel_path, text, skip_heuristics=skip_heuristics)
             findings.extend(
                 finding for finding in view_findings if _finding_identity(finding) not in prior_view_findings
             )
@@ -589,7 +649,7 @@ def _scan_repo(root: Path) -> RepoScan:
         files_examined,
         binary_skipped,
         tuple(path_skipped),
-        tuple(corpus_exempt),
+        tuple(heuristics_suppressed),
         absent,
         unscannable,
     )
@@ -662,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
             f"REFUSED: {scan.unaccounted} of {scan.candidates} candidate path(s) reached no disposition -- "
             "this scan cannot say what happened to them.\n"
             f"  examined {scan.files_examined}, binary-skipped {scan.binary_skipped}, "
-            f"path-skipped {len(scan.path_skipped)}, corpus-exempt {len(scan.corpus_exempt)}, "
+            f"path-skipped {len(scan.path_skipped)}, "
             f"absent {scan.absent}, unscannable {scan.unscannable}\n"
             "A path that leaves this scan silently is a path whose content nothing measured, which is\n"
             "the exact defect this denominator exists to make impossible. Fix _scan_repo; do not push.",
@@ -685,15 +745,16 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"secret scan: PASS (established {scan.candidates} candidate paths; "
         f"examined {scan.files_examined} text files; {scan.binary_skipped} binary-skipped; "
-        f"{len(scan.path_skipped)} path-skipped; {len(scan.corpus_exempt)} corpus-exempt; "
-        f"{scan.absent} absent; {scan.unscannable} unscannable; 0 findings)"
+        f"{len(scan.path_skipped)} path-skipped; "
+        f"{scan.absent} absent; {scan.unscannable} unscannable; "
+        f"{len(scan.heuristics_suppressed)} heuristics-suppressed; 0 findings)"
     )
     for rel_path in scan.path_skipped[:10]:
         print(f"  not opened (untrackable directory; check.artifact_scan fails the build on it): {rel_path}")
     if len(scan.path_skipped) > 10:
         print(f"  ... and {len(scan.path_skipped) - 10} more")
-    for rel_path in scan.corpus_exempt:
-        print(f"  exempt (this scanner's own test corpus): {rel_path}")
+    for rel_path in scan.heuristics_suppressed:
+        print(f"  read and vendor-scanned; heuristic shapes suppressed (this scanner's own test corpus): {rel_path}")
     return 0
 
 
