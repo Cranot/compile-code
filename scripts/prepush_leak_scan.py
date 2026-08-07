@@ -11,6 +11,20 @@ bytes may already be cloned, cached, or indexed. This is the same failure
 shape that forced a history purge for a customer-name leak elsewhere in this
 project's toolchain (roam-code / stoa's ROADMAP 4.3).
 
+A PUSH PUBLISHES MORE THAN COMMITS, and "no commits" is not "nothing to
+read". An ANNOTATED TAG is its own object carrying its own message and
+tagger line, and it normally points at a commit the remote already has --
+so its update resolves to an EMPTY commit range. Measured on the shipped
+scanner against git's own captured pre-push stream, a tag whose message
+carried a live-format ``ghp_`` token printed ``prepush_leak_scan: clean (0
+commits in range)`` and exited 0, while the identical string in a commit
+message on the same repository exited 2 with three findings. This
+repository publishes releases by tag, so that channel is live. Ref NAMES
+publish verbatim too, on every update. Tag objects and ref names are now
+scanned alongside the commit range, and an update whose object this gate
+cannot classify is a REFUSAL rather than an empty range -- see
+``prepush_refs.resolve_push_surfaces``.
+
 This script closes that gap by scanning the EXACT commit range about to
 leave the machine, not the working tree: every commit's message and the
 full new content of every path it touches, using the same two pattern
@@ -80,8 +94,9 @@ drops the tail is caught too). If either planted credential is not found, the
 scanner reports BROKEN and exits 4 rather than reporting 0 findings.
 
 Exit codes: 0 = clean. 2 = leak(s) found. 3 = content this gate did not read
--- at least one blob was unanalyzable, or at least one changed path was
-excluded by name ("I could not check this" is a failure of the gate, not a pass).
+-- at least one blob was unanalyzable, at least one changed path was
+excluded by name, or an updated ref pointed at an object type this gate
+cannot read ("I could not check this" is a failure of the gate, not a pass).
 4 = the scanner's own positive control failed -- it is broken, and its
 verdict means nothing. 1 = usage error or a git command needed to resolve
 the range failed (fail closed -- never silently pass). When more than one
@@ -172,6 +187,10 @@ class _Ledger:
     blobs_scanned: int = 0
     bytes_scanned: int = 0
     considered: int = 0
+    commits_scanned: int = 0
+    tag_objects_scanned: int = 0
+    ref_names_scanned: int = 0
+    ref_deletions: int = 0
     path_filtered: list[str] = field(default_factory=list)
     binary_skipped: list[tuple[str, int]] = field(default_factory=list)
     unanalyzable: list[tuple[str, int, str]] = field(default_factory=list)
@@ -180,6 +199,21 @@ class _Ledger:
     def opened(self) -> int:
         """Blobs whose bytes this scanner actually held and classified."""
         return self.blobs_scanned + len(self.binary_skipped) + len(self.unanalyzable)
+
+    def surfaces(self) -> str:
+        """What the push publishes, counted per surface.
+
+        Commits are no longer the whole denominator. An annotated tag object
+        and a ref name both publish author-controlled text on updates that
+        resolve to ZERO commits, and the verdict used to say only ``0 commits
+        in range`` -- a sentence that is true and that answers a different
+        question than the one a reader is asking.
+        """
+        return (
+            f"{self.commits_scanned} commit(s), {self.tag_objects_scanned} annotated tag object(s), "
+            f"{self.ref_names_scanned} ref name(s) scanned, {self.ref_deletions} ref deletion(s) "
+            "(publish nothing)"
+        )
 
     def summary(self) -> str:
         return (
@@ -380,11 +414,19 @@ def _batch_changed_paths(repo_root: str, shas: list[str]) -> dict[str, list[tupl
 
 
 def _batch_blobs_and_messages(
-    repo_root: str, commit_shas: list[str], blob_oids: list[str]
-) -> tuple[dict[str, str], dict[str, bytes]]:
-    """One `git cat-file --batch` call for every commit object (kept whole)
-    and every blob object (its content) needed anywhere in the range.
-    Returns ({commit_sha: full_commit_object_text}, {blob_oid: raw_bytes}).
+    repo_root: str, commit_shas: list[str], blob_oids: list[str], tag_oids: list[str] | None = None
+) -> tuple[dict[str, str], dict[str, bytes], dict[str, str]]:
+    """One `git cat-file --batch` call for every commit object (kept whole),
+    every blob object (its content), and every annotated tag object (kept
+    whole) needed anywhere in the range. Returns ({commit_sha: full commit
+    object text}, {blob_oid: raw bytes}, {tag_oid: full tag object text}).
+
+    Tag objects used to be read and DISCARDED here, on the note that no
+    surface needed them. That note was the hole: a tag object is the one
+    piece of a tag push that carries free text, and discarding it is why a
+    credential in a tag message travelled to the remote under the word
+    "clean". It is kept whole for the same reason a commit object is -- the
+    ``tagger`` line publishes a name and an address exactly like ``author``.
 
     The commit object is kept WHOLE -- header included -- because the
     `author` and `committer` header lines carry a name and an email address
@@ -395,9 +437,10 @@ def _batch_blobs_and_messages(
     label with its own line numbers."""
     commit_objs: dict[str, str] = {}
     blobs: dict[str, bytes] = {}
-    all_oids = list(dict.fromkeys([*commit_shas, *blob_oids]))
+    tag_objs: dict[str, str] = {}
+    all_oids = list(dict.fromkeys([*commit_shas, *blob_oids, *(tag_oids or [])]))
     if not all_oids:
-        return commit_objs, blobs
+        return commit_objs, blobs, tag_objs
 
     stdin = ("\n".join(all_oids) + "\n").encode("ascii")
     proc = subprocess.run(
@@ -438,28 +481,44 @@ def _batch_blobs_and_messages(
             commit_objs[oid] = content.decode("utf-8", errors="replace")
         elif obj_type == "blob":
             blobs[oid] = content
-        # tree/tag objects can appear if a caller ever asks for one; neither
-        # surface needs them, so they're read (keeping the stream aligned)
-        # and discarded.
+        elif obj_type == "tag":
+            tag_objs[oid] = content.decode("utf-8", errors="replace")
+        # A tree can still appear if a caller ever asks for one; it carries no
+        # text surface of its own (path names arrive through diff-tree), so it
+        # is read -- keeping the stream aligned -- and discarded.
 
     missing = set(all_oids) - seen
     if missing:
         raise prepush_refs.PrePushGitError(f"cat-file --batch: no record returned for {sorted(missing)[:5]}")
-    return commit_objs, blobs
+    return commit_objs, blobs, tag_objs
 
 
-def _scan_range(repo_root: str, shas: list[str]) -> tuple[list[Finding], _Ledger]:
-    """Scan every commit's message and the full new content of every path it
-    touches. Full-blob content (not just the commit's own diff) matters
-    because a pure rename or a change elsewhere in the file can leave a
-    leaked line present without it ever appearing as an added line in that
-    commit's own patch.
+def _scan_range(repo_root: str, surfaces: prepush_refs.PushSurfaces) -> tuple[list[Finding], _Ledger]:
+    """Scan every surface *surfaces* publishes.
+
+    For each commit: its identity header, its message, and the full new
+    content of every path it touches. Full-blob content (not just the
+    commit's own diff) matters because a pure rename or a change elsewhere in
+    the file can leave a leaked line present without it ever appearing as an
+    added line in that commit's own patch.
+
+    For each annotated tag object: its tagger line and its message, under
+    their own labels. A tag update whose target is already on the remote
+    resolves to ZERO commits, so this is the only pass that ever reads it.
+
+    For the ref names: all of them at once, since a name has no line of its
+    own to report.
 
     Returns the findings AND the ledger of what was read to produce them, so
     the caller can publish the denominator and refuse to call an unanalyzable
     blob clean."""
     findings: list[Finding] = []
     ledger = _Ledger()
+    shas = surfaces.commits
+    ledger.commits_scanned = len(shas)
+    ledger.tag_objects_scanned = len(surfaces.tag_objects)
+    ledger.ref_names_scanned = len(surfaces.ref_names)
+    ledger.ref_deletions = surfaces.deletions
 
     changed = _batch_changed_paths(repo_root, shas)
 
@@ -478,7 +537,24 @@ def _scan_range(repo_root: str, shas: list[str]) -> tuple[list[Finding], _Ledger
         for path, oid in keep:
             wanted_paths[oid] = path
 
-    commit_objs, blobs = _batch_blobs_and_messages(repo_root, shas, list(wanted_paths.keys()))
+    commit_objs, blobs, tag_objs = _batch_blobs_and_messages(
+        repo_root, shas, list(wanted_paths.keys()), surfaces.tag_objects
+    )
+
+    # Ref names publish verbatim on every non-deleting update and belong to no
+    # object, so they are scanned as one surface of their own.
+    if surfaces.ref_names:
+        findings += _scan_text("(pushed ref names)", "\n".join(surfaces.ref_names))
+
+    for oid in surfaces.tag_objects:
+        short = oid[:10]
+        raw_tag = tag_objs.get(oid, "")
+        header, sep, message = raw_tag.partition("\n\n")
+        if not sep:
+            header, message = raw_tag, ""
+        tagger = "\n".join(line for line in header.splitlines() if line.startswith("tagger "))
+        findings += _scan_text(f"{short} (tag identity)", tagger)
+        findings += _scan_text(f"{short} (tag message)", message)
 
     for sha in shas:
         short = sha[:10]
@@ -524,7 +600,10 @@ def _dedupe(findings: list[Finding]) -> list[Finding]:
 
 
 def _print_report(findings: list[Finding]) -> None:
-    sys.stderr.write(f"\nBLOCKED: {len(findings)} potential leak(s) in the commits about to be pushed:\n")
+    # "in the commits about to be pushed" was accurate while commits were the
+    # only surface. A finding can now come from a tag object or a ref name, so
+    # the header names the publication rather than one of its parts.
+    sys.stderr.write(f"\nBLOCKED: {len(findings)} potential leak(s) in what this push would publish:\n")
     for label, line_no, kind, detail in findings[:20]:
         loc = f"{label}:{line_no}" if line_no else label
         sys.stderr.write(f"  {loc}  [{kind}] {detail}\n")
@@ -536,6 +615,9 @@ def _print_report(findings: list[Finding]) -> None:
         "  - Fixing the tree in a later commit does not un-publish history --\n"
         "    the earlier commit's blob still travels to the remote. Amend or\n"
         "    rebase the offending commit(s) (or drop them) and push again.\n"
+        "  - A (tag message) / (tag identity) / (pushed ref names) finding is\n"
+        "    not in any commit. Retag (git tag -f -a) or rename the ref; the\n"
+        "    tag object and the ref name publish on their own.\n"
         "  - False positive on a credential-shaped pattern? Tighten or exempt\n"
         "    it in scripts/secret_scan.py's SECRET_PATTERN_DEFS.\n"
         "  - False positive on a LEAK_PATTERNS entry? Tighten it in\n"
@@ -582,6 +664,31 @@ def _print_unread_paths(ledger: _Ledger) -> None:
         "    repository can inspect; keep it out of git (release asset, LFS,\n"
         "    generated at build time).\n"
         "  - Prove them by hand, then bypass this one push deliberately:\n"
+        "    git push --no-verify\n"
+    )
+
+
+def _print_unreadable_refs(unreadable: list[tuple[str, str, str]]) -> None:
+    """Refuse over ref updates whose object this gate has no reader for.
+
+    A commit and an annotated tag are the only two object types this scanner
+    knows how to turn into text. Anything else -- git permits a ref to point
+    at a blob or a tree -- would resolve to an empty commit range and print
+    ``clean``, which is the same false-clean shape as an unread blob: the
+    verdict would be about content nobody looked at.
+    """
+    sys.stderr.write(f"\nUNSCANNED: {len(unreadable)} updated ref(s) point at an object this gate cannot read:\n")
+    for ref, oid, kind in unreadable[:20]:
+        sys.stderr.write(f"  {ref}  {oid[:12]}  [git object type {kind!r}, no reader]\n")
+    if len(unreadable) > 20:
+        sys.stderr.write(f"  ... and {len(unreadable) - 20} more\n")
+    sys.stderr.write(
+        "\n"
+        "This is NOT a pass. The object publishes with the push and no pattern\n"
+        "from either catalogue was applied to it. Options:\n"
+        "  - Do not publish this ref. A ref pointing at a blob or a tree is\n"
+        "    almost never intended; check what you are pushing.\n"
+        "  - Prove it by hand, then bypass this one push deliberately:\n"
         "    git push --no-verify\n"
     )
 
@@ -651,10 +758,19 @@ def _self_test_failures() -> list[str]:
     return [f"planted control credential not detected: {name}" for name in _CONTROL_EXPECTED if name not in kinds]
 
 
-def _resolve_commits(repo_root: str, args: argparse.Namespace) -> list[str]:
+def _resolve_surfaces(repo_root: str, args: argparse.Namespace) -> prepush_refs.PushSurfaces:
+    """Every readable surface this invocation is responsible for.
+
+    Only the ``--pre-push-updates`` path can see tag objects and ref names,
+    because only git's own update stream names the refs. A ``--range`` or
+    ``@{u}`` run is a commit range by definition and reports zero of both
+    rather than pretending it looked -- the counts print either way, so the
+    difference is visible in the verdict instead of implied by it.
+    """
     if args.range:
         raw = _git_bytes(repo_root, ["rev-list", args.range], operation=f"resolve range {args.range}")
-        return [s for s in raw.decode("ascii", errors="strict").split() if s]
+        commits = [s for s in raw.decode("ascii", errors="strict").split() if s]
+        return prepush_refs.PushSurfaces(commits=commits, tag_objects=[], ref_names=[], unreadable=[])
 
     if args.pre_push_updates:
         if args.pre_push_updates == "-":
@@ -675,7 +791,7 @@ def _resolve_commits(repo_root: str, args: argparse.Namespace) -> list[str]:
             # here means the capture step itself is broken. Fail closed.
             sys.stderr.write("ERROR: --pre-push-updates contained no ref updates.\n")
             raise SystemExit(1)
-        return prepush_refs.resolve_commits(repo_root, updates, remote_name=args.remote_name)
+        return prepush_refs.resolve_push_surfaces(repo_root, updates, remote_name=args.remote_name)
 
     # No stdin capture supplied (manual/standalone run). Fall back to the
     # conventional "what am I about to push" range IF this branch has an
@@ -696,7 +812,8 @@ def _resolve_commits(repo_root: str, args: argparse.Namespace) -> list[str]:
         raise SystemExit(1)
     upstream = proc.stdout.decode("utf-8", errors="replace").strip()
     raw = _git_bytes(repo_root, ["rev-list", f"{upstream}..HEAD"], operation=f"resolve {upstream}..HEAD")
-    return [s for s in raw.decode("ascii", errors="strict").split() if s]
+    commits = [s for s in raw.decode("ascii", errors="strict").split() if s]
+    return prepush_refs.PushSurfaces(commits=commits, tag_objects=[], ref_names=[], unreadable=[])
 
 
 def main(argv: list[str]) -> int:
@@ -730,17 +847,21 @@ def main(argv: list[str]) -> int:
 
     repo_root = _repo_root()
     try:
-        commits = _resolve_commits(repo_root, args)
+        surfaces = _resolve_surfaces(repo_root, args)
     except prepush_refs.PrePushGitError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 1
 
-    if not commits:
-        print("prepush_leak_scan: clean (0 commits in range)")
-        return 0
+    # An updated ref pointing at an object that is neither a commit nor a tag
+    # is content this gate has no reader for. That is the same epistemic state
+    # as an unanalyzable blob, so it takes the same exit code rather than
+    # falling through to a range that would resolve empty and print clean.
+    if surfaces.unreadable:
+        _print_unreadable_refs(surfaces.unreadable)
+        return 3
 
     try:
-        raw_findings, ledger = _scan_range(repo_root, commits)
+        raw_findings, ledger = _scan_range(repo_root, surfaces)
     except prepush_refs.PrePushGitError as exc:
         sys.stderr.write(f"ERROR: {exc}\n")
         return 1
@@ -759,12 +880,17 @@ def main(argv: list[str]) -> int:
     # blob that publishes unread publishes permanently, whatever the reason it
     # went unread. Measured: 0 binary blobs across this repository's 424
     # commits, so the refusal costs nothing that has ever been pushed here.
+    #
+    # The surface counts ride here too. ``0 commits in range`` was a true
+    # sentence printed at exit 0 for a push that published a brand-new tag
+    # object nobody had read; the reader has no way to tell that apart from a
+    # push that published nothing. Every surface is now counted in the line.
     unread_paths = bool(ledger.path_filtered) or bool(ledger.binary_skipped)
     if not findings and not ledger.unanalyzable and not unread_paths:
-        print(f"prepush_leak_scan: clean ({len(commits)} commit(s) scanned, 0 findings; {ledger.summary()})")
+        print(f"prepush_leak_scan: clean ({ledger.surfaces()}, 0 findings; {ledger.summary()})")
         return 0
 
-    sys.stderr.write(f"prepush_leak_scan: {len(commits)} commit(s) scanned; {ledger.summary()}\n")
+    sys.stderr.write(f"prepush_leak_scan: {ledger.surfaces()}; {ledger.summary()}\n")
     if findings:
         _print_report(findings)
     if ledger.unanalyzable:

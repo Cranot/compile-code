@@ -115,7 +115,8 @@ def test_allow_empty_commit_has_a_complete_zero_path_inventory(repo: Path) -> No
     result = _run(repo, "--range", f"{base}..{tip}")
 
     assert result.returncode == 0, f"a proven empty path set was mistaken for an absent inventory:\n{result.stderr}"
-    assert "1 commit(s) scanned, 0 findings" in result.stdout
+    assert "1 commit(s)" in result.stdout
+    assert "0 findings" in result.stdout
 
 
 def test_partial_per_commit_path_inventory_fails_closed(monkeypatch) -> None:
@@ -177,8 +178,14 @@ def test_malformed_updates_file_fails_closed(repo: Path) -> None:
     assert "malformed" in result.stderr.lower()
 
 
-def test_deletion_update_scans_nothing_and_passes(repo: Path) -> None:
-    """A branch-deletion push (local oid all-zero) publishes no new bytes."""
+def test_deletion_update_scans_nothing_and_says_which_nothing(repo: Path) -> None:
+    """A branch-deletion push (local oid all-zero) publishes no new bytes.
+
+    It must also be DISTINGUISHABLE from a push that published something this
+    gate did not read. ``0 commits in range`` was printed for both, and that
+    is how an annotated tag carrying a credential rode out at exit 0. The
+    deletion is now counted under its own name.
+    """
     tip = _commit(repo, "readme.txt", "benign\n", "benign base commit")
     updates_file = repo / "updates.txt"
     zero = "0" * 40
@@ -187,7 +194,144 @@ def test_deletion_update_scans_nothing_and_passes(repo: Path) -> None:
     result = _run(repo, "--pre-push-updates", "updates.txt")
 
     assert result.returncode == 0
-    assert "0 commits" in result.stdout
+    assert "0 commit(s)" in result.stdout
+    assert "0 annotated tag object(s)" in result.stdout
+    assert "1 ref deletion(s)" in result.stdout
+
+
+# --- surfaces a push publishes that are not commits --------------------------
+# A tag update normally points at a commit the remote ALREADY has, so its
+# commit range is empty and the whole scan used to be skipped with
+# ``clean (0 commits in range)`` at exit 0. Measured against git's own captured
+# pre-push stream on this repository before the fix: an annotated tag whose
+# message carried a live-format ``ghp_`` token printed exactly that and exited
+# 0, while the identical string in a commit message exited 2 with three
+# findings. These tests drive the REAL update-stream path (never ``_scan_text``
+# directly), because the hole was in what the resolver handed the scanner, not
+# in the catalogues -- a unit test on the text would have passed before the fix
+# and proved nothing.
+
+
+def _publish_base(repo: Path, remote: str = "origin") -> str:
+    """A commit the target remote already has, so nothing new is in range."""
+    tip = _commit(repo, "readme.txt", "benign\n", "benign base commit")
+    _git(repo, "update-ref", f"refs/remotes/{remote}/main", tip)
+    return tip
+
+
+def _updates(repo: Path, line: str) -> None:
+    (repo / "updates.txt").write_text(line + "\n", encoding="utf-8")
+
+
+def test_a_credential_in_an_annotated_tag_message_blocks_the_push(repo: Path) -> None:
+    _publish_base(repo)
+    secret = "AKIA" + "W" * 16
+    _git(repo, "tag", "-a", "v9.9.9", "-m", f"release cut with {secret}")
+    tag_oid = _git(repo, "rev-parse", "v9.9.9")
+    zero = "0" * 40
+    _updates(repo, f"refs/tags/v9.9.9 {tag_oid} refs/tags/v9.9.9 {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 2, (
+        "a tag object publishes its own message; an empty commit range is not "
+        f"evidence it is clean (exit {result.returncode}):\n{result.stdout}\n{result.stderr}"
+    )
+    assert "0 commit(s)" in result.stderr, "the commit range really is empty -- that is the point"
+    assert "1 annotated tag object(s)" in result.stderr
+    assert "tag message" in result.stderr
+    assert "AWS access key" in result.stderr
+
+
+def test_a_credential_in_the_tagger_identity_blocks_the_push(repo: Path) -> None:
+    """The ``tagger`` line publishes exactly like ``author`` on a commit."""
+    _publish_base(repo)
+    _git(repo, "config", "user.name", "int" + "ernal/planning/owner")
+    _git(repo, "tag", "-a", "v9.9.8", "-m", "ordinary release note")
+    tag_oid = _git(repo, "rev-parse", "v9.9.8")
+    zero = "0" * 40
+    _updates(repo, f"refs/tags/v9.9.8 {tag_oid} refs/tags/v9.9.8 {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 2, f"tagger identity went unscanned:\n{result.stdout}\n{result.stderr}"
+    assert "tag identity" in result.stderr
+
+
+def test_a_credential_in_a_pushed_ref_name_blocks_the_push(repo: Path) -> None:
+    """A ref NAME publishes verbatim and belongs to no object."""
+    tip = _publish_base(repo)
+    secret = "AKIA" + "V" * 16
+    zero = "0" * 40
+    _updates(repo, f"refs/heads/{secret} {tip} refs/heads/{secret} {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 2, f"the ref name went unscanned:\n{result.stdout}\n{result.stderr}"
+    assert "pushed ref names" in result.stderr
+
+
+def test_a_tag_pointing_at_a_tag_is_followed_to_every_object(repo: Path) -> None:
+    """A chain of tag objects is a chain of messages, not one."""
+    _publish_base(repo)
+    _git(repo, "tag", "-a", "inner", "-m", "inner note")
+    inner = _git(repo, "rev-parse", "inner")
+    secret = "AKIA" + "U" * 16
+    outer_obj = (
+        f"object {inner}\ntype tag\ntag outer\ntagger t <t@example.invalid> 1700000000 +0000\n\nouter {secret}\n"
+    )
+    # Bytes, not text: git's fsck rejects the object if the platform's newline
+    # translation turns the header separators into CRLF.
+    proc = subprocess.run(["git", "mktag"], cwd=repo, input=outer_obj.encode("utf-8"), capture_output=True, check=False)
+    assert proc.returncode == 0, f"git mktag failed: {proc.stderr.decode('utf-8', 'replace')}"
+    outer = proc.stdout.decode("ascii").strip()
+    zero = "0" * 40
+    _updates(repo, f"refs/tags/outer {outer} refs/tags/outer {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 2, f"a nested tag object went unread:\n{result.stdout}\n{result.stderr}"
+    assert "2 annotated tag object(s)" in result.stderr
+
+
+def test_a_clean_annotated_tag_still_passes_and_publishes_its_denominator(repo: Path) -> None:
+    """Conservation: reading tag objects must not make ordinary tagging refuse."""
+    _publish_base(repo)
+    _git(repo, "tag", "-a", "v1.0.0", "-m", "ordinary release note")
+    tag_oid = _git(repo, "rev-parse", "v1.0.0")
+    zero = "0" * 40
+    _updates(repo, f"refs/tags/v1.0.0 {tag_oid} refs/tags/v1.0.0 {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 0, f"a clean tag must pass:\n{result.stdout}\n{result.stderr}"
+    assert "1 annotated tag object(s)" in result.stdout
+    assert "1 ref name(s) scanned" in result.stdout
+
+
+def test_a_ref_update_pointing_at_an_unreadable_object_refuses(repo: Path) -> None:
+    """A blob or tree behind a ref is content this gate has no reader for."""
+    _publish_base(repo)
+    proc = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=repo,
+        input="loose text\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    blob = proc.stdout.strip()
+    zero = "0" * 40
+    _updates(repo, f"refs/heads/odd {blob} refs/heads/odd {zero}")
+
+    result = _run(repo, "--pre-push-updates", "updates.txt", "--remote-name", "origin")
+
+    assert result.returncode == 3, (
+        f"an unclassifiable ref object must refuse, not resolve to an empty range (exit {result.returncode}):"
+        f"\n{result.stdout}\n{result.stderr}"
+    )
+    assert "cannot read" in result.stderr
 
 
 def test_no_mode_and_no_upstream_fails_closed_instead_of_scanning_nothing(repo: Path) -> None:
