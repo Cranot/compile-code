@@ -26,6 +26,8 @@ gate it is testing. Real secrets do not arrive pre-split like this.
 
 from __future__ import annotations
 
+import math
+import random
 import subprocess
 
 import pytest
@@ -644,3 +646,136 @@ def test_unreconciled_denominator_refuses_instead_of_passing(tmp_path, monkeypat
 
     assert secret_scan.main([]) == 5
     assert "reached no disposition" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A THRESHOLD NO INPUT CAN REACH IS NOT A STRICT FILTER, IT IS A DEAD DETECTOR.
+#
+# Shannon entropy of a length-n string peaks at log2(n), so the shipped
+# absolute floor of 4.5 bits was unsatisfiable for every value shorter than
+# ceil(2**4.5) = 23 characters -- which is the first three lengths its own
+# pattern can match. Measured on the shipped scanner: 0 of 20000 uniformly
+# random base64url values cleared it at n=20, at n=21 and at n=22.
+#
+# The consequence was a live false negative, not redundancy: "High Entropy
+# String" is the ONLY entry in this catalogue -- and there is none in
+# ``check.LEAK_PATTERNS`` either -- that covers ``key = "..."`` and
+# ``auth = "..."``. Every other identifier in its alternation is backstopped
+# by Generic Secret/Password Assignment.
+# ---------------------------------------------------------------------------
+
+
+def _minimum_capture_length(pattern: str) -> int:
+    """Shortest string the first capture group of *pattern* can match.
+
+    Derived from the regex itself rather than restated as a literal, because a
+    literal would be the second place the ``{20,}`` bound lives and the two
+    would drift. Fails closed: an unparseable pattern raises rather than
+    returning a permissive default.
+    """
+    try:
+        from re import _parser as regex_parser  # Python 3.11+
+    except ImportError:  # pragma: no cover - Python 3.10
+        import sre_parse as regex_parser  # type: ignore[no-redef]
+
+    def find(sub) -> object | None:
+        for opcode, argument in sub:
+            if str(opcode).upper().endswith("SUBPATTERN"):
+                group, _, _, body = argument
+                if group == 1:
+                    return body
+                nested = find(body)
+                if nested is not None:
+                    return nested
+            elif isinstance(argument, tuple):
+                for item in argument:
+                    if hasattr(item, "getwidth"):
+                        nested = find(item)
+                        if nested is not None:
+                            return nested
+        return None
+
+    body = find(regex_parser.parse(pattern))
+    if body is None:
+        raise AssertionError(f"no capture group found in {pattern!r}; the floor's population is unknown")
+    return body.getwidth()[0]
+
+
+@pytest.mark.parametrize("name", sorted(secret_scan._ENTROPY_GATED_PATTERNS))
+def test_entropy_floor_is_satisfiable_at_the_gated_patterns_own_minimum_length(name: str) -> None:
+    """The general form of the defect: a floor above log2(n) is unreachable.
+
+    Pinned for every entry the floor gates, at the shortest value that entry
+    can match, so widening ``_ENTROPY_GATED_PATTERNS`` to a pattern with a
+    shorter capture bound -- or raising the constant again -- fails here
+    instead of shipping as an active-looking control.
+    """
+    entry = next(d for d in secret_scan.SECRET_PATTERN_DEFS if d["name"] == name)
+    minimum = _minimum_capture_length(entry["pattern"])
+    ceiling = math.log2(minimum)
+    floor = secret_scan._entropy_floor(minimum)
+
+    assert floor < ceiling, (
+        f"{name}: floor {floor:.4f} exceeds log2({minimum}) = {ceiling:.4f} -- "
+        "no value of the shortest length this pattern matches could ever clear it"
+    )
+
+    # Satisfiable in arithmetic is not the same as reachable in practice, so
+    # this also measures the pass rate over a deterministic random sample.
+    rng = random.Random(20260807)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    cleared = sum(
+        1
+        for _ in range(2000)
+        if secret_scan._shannon_entropy("".join(rng.choice(alphabet) for _ in range(minimum))) >= floor
+    )
+    assert cleared >= 1000, f"{name}: only {cleared}/2000 random values of length {minimum} clear the floor"
+
+
+SHORT_OPAQUE_VALUE = "Qw7zX" + "2mNp9Vk" + "4Rt6Ls1B"  # 20 chars, no contiguous literal in this file
+
+
+@pytest.mark.parametrize("identifier", ["key", "signing_key", "auth", "PRIVATE_KEY", "deploy_key"])
+def test_a_short_opaque_value_under_a_key_or_auth_identifier_is_detected(identifier: str) -> None:
+    """The false negative the dead floor left open, at the exact lengths it
+    made unreachable.
+
+    20-22 characters is not an odd length to pick: the unpadded base64url of
+    16 random bytes -- the canonical on-disk form of a 128-bit symmetric key --
+    is exactly 22 characters. Nothing else in either catalogue covers these
+    identifiers, so a miss here is a miss everywhere.
+    """
+    for value in (SHORT_OPAQUE_VALUE, SHORT_OPAQUE_VALUE + "k", SHORT_OPAQUE_VALUE + "kM"):
+        hits = _detect(f'{identifier} = "{value}"')
+        assert "High Entropy String" in hits, f"{identifier} at length {len(value)} was missed: {sorted(hits)}"
+
+
+def test_the_floor_still_rejects_the_benign_population_it_was_bought_for() -> None:
+    """The cost side, pinned at the closest measured benign value.
+
+    ``X-GitHub-Api-Version`` is the highest ratio of entropy to length ceiling
+    reached by any genuinely benign quoted opaque run in this tree (0.8900 of
+    log2(n) over 648 of them). The chosen fraction sits above it deliberately;
+    if a future edit lowers it far enough to admit ordinary identifiers, this
+    is where that shows up.
+    """
+    assert not _detect('key = "X-GitHub-Api-Version"')
+    assert not _detect('auth = "compile_code_release_guard"')
+    assert not _detect('token = "' + "A" * 32 + '"')
+
+
+def test_the_floor_is_unchanged_for_values_of_32_characters_and_up() -> None:
+    """The cap only ever loosens. At n >= 32 it reaches the absolute constant,
+    so long values are judged by exactly the rule that shipped."""
+    for length in (32, 40, 48, 64, 128):
+        assert secret_scan._entropy_floor(length) == secret_scan._ENTROPY_THRESHOLD
+
+
+def test_the_entropy_floor_gates_one_entry_and_no_vendor_pattern() -> None:
+    """An AWS access key ID is 20 characters, so its ceiling is 4.3219 and it
+    could never clear an absolute 4.5 -- it is detected anyway because this
+    floor never runs on vendor shapes. Pinned so the floor cannot quietly
+    acquire a population it would kill."""
+    assert secret_scan._ENTROPY_GATED_PATTERNS <= {d["name"] for d in secret_scan.SECRET_PATTERN_DEFS}
+    assert secret_scan._ENTROPY_GATED_PATTERNS <= secret_scan.HEURISTIC_PATTERN_NAMES
+    assert "AWS Access Key" in _detect("AWS_KEY = 'AKIA" + "Q" * 16 + "'")

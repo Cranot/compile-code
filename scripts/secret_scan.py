@@ -254,7 +254,78 @@ _COMPILED_PATTERNS: list[dict] = [
     {"name": d["name"], "regex": re.compile(d["pattern"]), "severity": d["severity"]} for d in SECRET_PATTERN_DEFS
 ]
 
+# A PER-STRING ENTROPY FLOOR ABOVE log2(n) CANNOT BE CLEARED BY ANY STRING OF
+# LENGTH n. Shannon entropy of a length-n string is maximised when every
+# character is distinct, and that maximum is exactly log2(n) -- so an absolute
+# floor is a claim about a length as much as about randomness, and 4.5 bits is
+# a claim that no value shorter than ``ceil(2**4.5) = 23`` characters can ever
+# satisfy.
+#
+# The only pattern this floor gates is "High Entropy String" (see
+# ``_high_entropy_passes``), whose capture group is ``{20,}``. Its three
+# shortest matchable values -- 20, 21 and 22 characters, ceilings 4.3219,
+# 4.3923 and 4.4594 -- were therefore UNSATISFIABLE by construction. Measured
+# over 20000 uniformly random base64url values at each of those lengths: 0
+# cleared, at all three. That is not a strict filter, it is a detector that
+# cannot fire, and it read as protection. 22 characters is the canonical
+# on-disk form of a 128-bit symmetric key (unpadded base64url of 16 bytes),
+# and ``key = "..."`` / ``auth = "..."`` are shapes NO other entry in this
+# catalogue and none of ``check.LEAK_PATTERNS`` covers -- for those two
+# identifiers this pattern is the only detector there is, so the dead floor
+# was a live false negative, not mere redundancy.
+#
+# The fix is not "lower the number": an absolute 3.5 admits 445 of the 648
+# quoted opaque-charclass runs in this tree (measured), i.e. it would flag
+# ordinary identifiers. The floor is instead capped at what the candidate's
+# own length can physically produce, so it can never again be set above its
+# own ceiling.
 _ENTROPY_THRESHOLD = 4.5
+
+# The fraction of the length ceiling log2(n) the floor may claim. 0.90 is
+# measured, not chosen by taste, against the two populations that matter:
+#
+#   TRUE POSITIVES, 20000 uniformly random base64url values per length --
+#   detection at n=20/21/22/23/24 goes 0.00%/0.00%/0.00%/1.09%/5.21% (shipped)
+#   -> 83.77%/85.80%/80.59%/81.20%/83.94%. At n>=32 the cap reaches 4.5 and
+#   the rule is byte-identical to the shipped one, so nothing about long
+#   values changes.
+#
+#   BENIGN, every quoted ``[A-Za-z0-9+/=\-_]{20,}`` run in the tracked tree
+#   (648 of them, whatever identifier precedes them) -- 2 clear this floor,
+#   the same 2 the shipped floor clears, and both are deliberately random
+#   32-character test fixtures. The highest ratio H/log2(n) reached by a
+#   genuinely benign value here is 0.8900 (a 20-character HTTP header name),
+#   so 0.90 sits above the whole benign population with 0.043 bits of margin
+#   at n=20 and admits none of it. 0.85 admits 77 of the 648 and is refused
+#   on that measurement.
+#
+# A BARE ``r * log2(n)`` normalisation without the ``min`` is a different and
+# worse rule: past n≈64 the 67-symbol character class, not the length, is the
+# binding constraint, so the floor would keep rising past anything a real
+# credential produces and detection would COLLAPSE at long lengths. The cap
+# only ever loosens; it never raises the floor above 4.5.
+_ENTROPY_LENGTH_FRACTION = 0.90
+
+
+def _entropy_floor(length: int) -> float:
+    """The entropy floor applicable to a candidate value of *length* characters.
+
+    Never above ``log2(length)``, which is the most entropy a string of that
+    length can carry, so the floor is always satisfiable by some value the
+    pattern can actually match.
+    """
+    if length < 2:
+        return 0.0
+    return min(_ENTROPY_THRESHOLD, _ENTROPY_LENGTH_FRACTION * math.log2(length))
+
+
+# The entries whose findings the floor may suppress -- named as data, not
+# spelled inline in ``_high_entropy_passes``, so a test can walk this set,
+# derive each entry's minimum matchable capture length from its own regex, and
+# refuse a floor that no value of that length could reach. Widening this set to
+# a pattern with a shorter capture bound is exactly the edit that re-creates
+# the dead gate, and it now has to survive that test.
+_ENTROPY_GATED_PATTERNS = frozenset({"High Entropy String"})
 
 # The catalogue splits in two, and the halves carry different evidence.
 #
@@ -293,10 +364,20 @@ def _shannon_entropy(value: str) -> float:
 
 
 def _high_entropy_passes(pat: dict, match: "re.Match[str]") -> bool:
-    if pat["name"] != "High Entropy String":
+    """Whether *match* clears the entropy floor for its own value length.
+
+    THE FLOOR GATES EXACTLY ONE ENTRY, and reading it as a filter over the
+    catalogue is the misreading this early return invites: every vendor
+    pattern short-circuits to True here, so an ``AKIA`` key -- 20 characters,
+    ceiling 4.3219, which no AWS key can ever clear -- is detected 20000/20000
+    because this function never looks at it. The comment above
+    ``_ENTROPY_THRESHOLD`` is about "High Entropy String" and about nothing
+    else.
+    """
+    if pat["name"] not in _ENTROPY_GATED_PATTERNS:
         return True
     value = match.group(1) if match.lastindex else match.group()
-    return _shannon_entropy(value) >= _ENTROPY_THRESHOLD
+    return _shannon_entropy(value) >= _entropy_floor(len(value))
 
 
 def mask_secret(matched_text: str) -> str:
