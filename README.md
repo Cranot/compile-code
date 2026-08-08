@@ -230,12 +230,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1247',
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1250',
        'edge': 'call', 'call_line': 'if _require_index():',
-       'call_location': 'src/compile_code/cli.py:1256'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4195', 'edge': 'call',
+       'call_location': 'src/compile_code/cli.py:1259'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4348', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:4205'}
+       'call_location': 'src/compile_code/cli.py:4358'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.

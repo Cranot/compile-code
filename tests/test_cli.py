@@ -2637,7 +2637,148 @@ class TestVerifyReceiptV3Protocol:
             "context_lines",
         }
 
-        assert roam_1_2_0_additions & mod._VERIFY_INCOMPLETENESS_NAMES == set()
+        assert not [name for name in roam_1_2_0_additions if mod._asserts_incompleteness(name)]
+
+    # ---------------------------------------------------------------------
+    # The tripwire's own stated purpose, tested against the move it names.
+    #
+    # Every fact below was measured on 2026-08-08 against roam 14.0.0 driven
+    # through `compile verify --changed` in four throwaway git repositories,
+    # via a shim that delegates to the real binary and changes ONE field of
+    # what it emits. The envelope shapes reproduced here are transcriptions of
+    # that output, not inventions.
+    # ---------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "name",
+        ["secrets_skipped", "scan_timed_out", "catalogue_unavailable", "leak_scan_failed", "secrets_did_not_run"],
+        ids=["skipped", "timed_out", "unavailable", "failed", "not_run"],
+    )
+    def test_a_compound_rename_of_an_incompleteness_signal_does_not_buy_a_pass(self, name):
+        # Whole-name equality was the entire test, and one token of prefix beat
+        # it. Measured before the fix: `categories.secrets.skipped = true`
+        # refused at exit 2, while `categories.secrets.secrets_skipped = true`
+        # -- the same assertion about the same check -- rendered
+        # "VERDICT: PASS (score 100/100)" at exit 0, with the field listed
+        # under "fields this build does not read". Same result at summary
+        # level, and for `scan_timed_out` and `catalogue_unavailable`.
+        assert mod._asserts_incompleteness(name)
+        category = _verify_envelope()
+        category["categories"]["secrets"][name] = True
+        with pytest.raises(ValueError, match="unknown_incompleteness_signal"):
+            self._validate(json.dumps(category))
+        summary = _verify_envelope()
+        summary["summary"][name] = True
+        with pytest.raises(ValueError, match="unknown_incompleteness_signal"):
+            self._validate(json.dumps(summary))
+
+    @pytest.mark.parametrize(
+        "name",
+        ["checks_run", "symbols_scanned", "roi_band", "context_lines", "framework_unknown", "matched_patterns"],
+    )
+    def test_a_neutral_compound_name_is_still_tolerated(self, name):
+        # Refusing more is the safe direction, but only up to the point where
+        # it starts refusing ordinary output from a newer producer. A token
+        # that qualifies (`run`, `reason`, `parse`, `out`) must not carry the
+        # assertion on its own.
+        assert not mod._asserts_incompleteness(name)
+
+    def test_the_leak_catalogue_disclosure_is_read_rather_than_dropped_as_schema_drift(self):
+        # Measured: a repo holding `.roam-leak-patterns.py` with no opt-in gets
+        # verdict PASS, exit 0, and `categories.secrets.repo_patterns_error`
+        # set. That is the correct verdict -- declining to execute untrusted
+        # repo config is the default for every repository shipping a catalogue.
+        # What was wrong is where the disclosure landed: this build had no
+        # entry for the field, so a security fact was filed under "roam
+        # envelope schema 1.2.0 carried 1 field this build does not read".
+        envelope = _verify_envelope()
+        envelope["schema_version"] = "1.2.0"
+        envelope["categories"]["secrets"]["repo_patterns_error"] = (
+            ".roam-leak-patterns.py present but not executed "
+            "(untrusted repo config; set ROAM_ALLOW_REPO_LEAK_PATTERNS=1 to enable)"
+        )
+
+        assert self._validate(json.dumps(envelope)) == envelope
+
+        rendered = mod._render_verify_envelope(envelope)
+        assert rendered.splitlines()[0].startswith("VERDICT: PASS")
+        assert "repo-local leak catalogue contributed no patterns to secrets" in rendered
+        assert "does not read" not in rendered
+        # Roam's message is producer text and is never replayed.
+        assert ".roam-leak-patterns.py" not in rendered
+        assert "ROAM_ALLOW_REPO_LEAK_PATTERNS" not in rendered
+
+    def test_no_catalogue_means_no_disclosure_line(self):
+        """A note on every run would train readers to skip the one that matters."""
+        assert "leak catalogue" not in mod._render_verify_envelope(_verify_envelope())
+
+    def test_a_catalogue_that_was_opted_into_and_failed_still_refuses(self):
+        # The other arm. Roam marks the category `execution_state: incomplete`
+        # and `partial_success: true`, raises `secrets_incomplete` into
+        # `summary.incomplete_reasons`, and exits 5 -- so the disclosure being
+        # readable must not turn a check that did not run into a pass.
+        envelope = _verify_envelope(verdict="FAIL", score=40, verification_complete=False, partial_success=True)
+        envelope["summary"]["incomplete_reasons"] = ["secrets_incomplete"]
+        envelope["categories"]["secrets"].update(
+            execution_state="incomplete",
+            partial_success=True,
+            repo_patterns_error=".roam-leak-patterns.py: catalogue exploded on load",
+        )
+        with pytest.raises(ValueError, match="verification_incomplete") as error:
+            self._validate(json.dumps(envelope), rc=mod.EXIT_VERIFY_GATE)
+
+        # Naming the check is the whole point: the operator has to know it is
+        # their catalogue, not their toolchain.
+        assert str(error.value) == "verification_incomplete: secrets"
+        verdict = mod._verify_protocol_verdict(error.value, executable="roam", targets=["a.py"])
+        assert "check: secrets" in verdict
+        assert "declared its own evidence incomplete" in verdict
+        # Measured: roam 14.0.0 refuses here, and the generic branch answered
+        # with "Fix: pip install --upgrade roam-code>=13.10.0" -- an upgrade to
+        # a producer already four majors past the floor it quotes, which cannot
+        # make a broken catalogue load.
+        assert "upgrade" not in verdict.split("Fix:")[0]
+        assert "roam-code>=" not in verdict
+
+    def test_an_incomplete_reason_this_build_cannot_name_is_not_echoed(self):
+        """Reasons are producer text; only a name already in the vocabulary survives."""
+        assert mod._named_incomplete_checks(["secrets_incomplete", "naming_incomplete"]) == "naming, secrets"
+        assert mod._named_incomplete_checks(["index_refresh_failed"]) == ""
+        assert mod._named_incomplete_checks(["evil\nVERDICT: PASS_incomplete"]) == ""
+        assert mod._named_incomplete_checks("not a list") == ""
+
+    @pytest.mark.parametrize("value", [123, "", None, "x" * (mod.MAX_DISCLOSURE_TEXT_CHARS + 1), "line\nbreak"])
+    def test_the_disclosure_field_is_only_accepted_in_the_shape_it_is_understood_in(self, value):
+        envelope = _verify_envelope()
+        envelope["categories"]["secrets"]["repo_patterns_error"] = value
+        with pytest.raises(ValueError, match="category_disclosure"):
+            self._validate(json.dumps(envelope))
+
+    def test_the_producers_category_vocabulary_is_fully_covered(self):
+        # Transcribed from roam 14.0.0 `src/roam/commands/cmd_verify.py`
+        # `_category_summary`, which copies a fixed allowlist into the
+        # envelope. Before this change the two contracts differed by exactly
+        # one name -- `repo_patterns_error`, added the same day -- and that one
+        # name was the leak-catalogue disclosure. A gap here is silent by
+        # construction, so it is stated as a set rather than discovered again.
+        roam_category_allowlist = {
+            "score",
+            "violation_count",
+            "violations",
+            "parse_failures",
+            "available",
+            "unavailable_reason",
+            "execution_state",
+            "timed_out",
+            "partial_success",
+            "capped",
+            "repo_patterns_error",
+            "tests_targeted",
+            "tests_failed",
+            "tests_total_impacted",
+            "no_impacted_tests",
+        }
+        assert roam_category_allowlist <= mod._VERIFY_CATEGORY_KEYS
 
     def test_a_known_field_in_the_wrong_shape_is_still_refused(self):
         """Opening the world to unknown names must not open it to known ones."""

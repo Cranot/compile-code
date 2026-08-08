@@ -202,6 +202,9 @@ _ENVELOPE_SCHEMA_VERSION_VALUE = re.compile(r"^(\d{1,4})\.(\d{1,4})\.(\d{1,4})$"
 # a disclosure must not be a place to inject lines or flood the block.
 _SAFE_FIELD_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
 MAX_DISCLOSED_UNKNOWN_FIELDS = 8
+# Ceiling on one producer-supplied disclosure string this build accepts as a
+# known field. Matches the finding-message bound already applied above.
+MAX_DISCLOSURE_TEXT_CHARS = 4096
 _GIT_HEAD_VALUE = re.compile(r"(?:ref: refs/\S+|[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _MAX_GIT_CONTROL_FILE_BYTES = 4096
@@ -2701,6 +2704,21 @@ _VERIFY_CATEGORY_KEYS = frozenset(
         "tests_failed",
         "tests_total_impacted",
         "no_impacted_tests",
+        # Why a repo-local leak catalogue contributed no patterns to this
+        # category. Roam ships this on `secrets` and it is NOT a gate on its
+        # own: the overwhelmingly common cause is a repository that contains a
+        # catalogue nobody opted into executing, which is roam declining to run
+        # untrusted repo config and is the correct, expected default. The other
+        # cause -- a catalogue that was opted into and then failed to load -- is
+        # a security check the operator asked for that did not run, and roam
+        # signals THAT by additionally marking the category `execution_state:
+        # incomplete`, which the category loop below already refuses. Read this
+        # build's own limit plainly: the two causes are one free-text string
+        # here, so nothing in this file can tell them apart, and the gating
+        # decision rests on roam's `execution_state`. It is carried as a known
+        # field rather than left unknown so the disclosure is rendered as the
+        # security fact it is instead of as unreadable schema drift.
+        "repo_patterns_error",
     }
 )
 # Forward tolerance is for fields that are unknown AND neutral. A field this
@@ -2752,6 +2770,47 @@ _VERIFY_INCOMPLETENESS_NAMES = frozenset(
         "warnings",
     }
 )
+# Tokens that carry the assertion above inside a COMPOUND field name. Whole-name
+# equality against the set above was the entire test for eight releases, and it
+# is defeated by exactly the move it exists to stop: measured against roam
+# 14.0.0 through a shim that delegates to the real binary and changes one field,
+# `categories.secrets.skipped = true` refuses at exit 2, while
+# `categories.secrets.secrets_skipped = true` -- the same assertion, one token
+# of prefix -- renders VERDICT: PASS at exit 0 with the field listed under
+# "fields this build does not read". `scan_timed_out` and
+# `catalogue_unavailable` bought the same pass, at category and summary level
+# alike. This is not a hypothetical naming style: the producer already writes
+# compound names in this exact position (`repo_patterns_error`, now known
+# above), so the next incompleteness signal roam names after the thing it is
+# about would have gone straight through.
+#
+# Derived from the names rather than hand-listed, so the two cannot drift, minus
+# the tokens too generic to carry the assertion alone (`run` would refuse a
+# neutral `symbols_run`; `reason`, `parse`, `list`, `counts`, `out`, `best`,
+# `effort`, `did` are qualifiers, not claims) and plus the morphological
+# variants those names only spell in compound (`timed`, `failures`). Over-
+# refusal is the safe direction here and is bounded: it can only bite a field
+# this build has no interpretation for, and it fails loudly, naming the field.
+_VERIFY_INCOMPLETENESS_GENERIC_TOKENS = frozenset(
+    {"best", "counts", "did", "effort", "list", "out", "parse", "reason", "run"}
+)
+_VERIFY_INCOMPLETENESS_TOKENS = (
+    frozenset(token for name in _VERIFY_INCOMPLETENESS_NAMES for token in name.split("_"))
+    - _VERIFY_INCOMPLETENESS_GENERIC_TOKENS
+) | {"failures", "timed"}
+
+
+def _asserts_incompleteness(name: object) -> bool:
+    """Whether one field NAME claims something did not fully run.
+
+    Only ever asked about names this build has no interpretation for; a name in
+    a level's vocabulary keeps its existing precise handling.
+    """
+    if not isinstance(name, str):
+        return False
+    return name in _VERIFY_INCOMPLETENESS_NAMES or bool(set(name.split("_")) & _VERIFY_INCOMPLETENESS_TOKENS)
+
+
 _VERIFY_CATEGORY_REQUIRED_KEYS = frozenset({"score", "violation_count", "violations"})
 _VERIFY_NO_CHANGES_CATEGORY_KEYS = frozenset({"score", "violations"})
 _VERIFY_NO_CHANGES_VERIFICATION_KEYS = frozenset({"score", "violations", "available"})
@@ -3482,16 +3541,17 @@ def _require_known_shape(
         raise ValueError(reason)
     # Name the colliding field. This branch is the one place where an entirely
     # NEUTRAL addition by a newer producer can hard-refuse: every other unknown
-    # key is tolerated and disclosed, but a key whose bare name is in the
-    # incompleteness vocabulary is refused, because a rename must not buy a
-    # pass. That trade is right and stays. What was wrong is that the refusal
+    # key is tolerated and disclosed, but a key whose name asserts an incomplete
+    # run -- as a whole name, or as one token inside a compound one -- is
+    # refused, because a rename must not buy a pass. That trade is right and
+    # stays. What was wrong is that the refusal
     # said nothing about WHICH name tripped it, so a producer that added a
     # neutral field called `warnings` produced a verdict indistinguishable from
     # a broken receipt, and the reader had no way to find the cause on either
     # side of the contract. The name is rendered through the same safe filter
     # as every other disclosed field, so no producer-supplied text reaches the
     # verdict unfiltered.
-    colliding = sorted((present - vocabulary) & _VERIFY_INCOMPLETENESS_NAMES)
+    colliding = sorted(name for name in (present - vocabulary) if _asserts_incompleteness(name))
     if colliding:
         raise ValueError(
             "unknown_incompleteness_signal: " + ", ".join(_disclosable_field_name(name) for name in colliding)
@@ -3501,6 +3561,55 @@ def _require_known_shape(
 def _disclosable_field_name(name: object) -> str:
     """Render one producer-supplied field name safely inside a verdict block."""
     return name if isinstance(name, str) and _SAFE_FIELD_NAME.fullmatch(name) else "<unprintable>"
+
+
+def _named_incomplete_checks(reasons: object) -> str:
+    """Which named checks roam declared incomplete, drawn from a fixed vocabulary."""
+    if not isinstance(reasons, list):
+        return ""
+    named = {
+        reason[: -len("_incomplete")]
+        for reason in reasons
+        if isinstance(reason, str)
+        and reason.endswith("_incomplete")
+        and reason[: -len("_incomplete")] in _VERIFY_CHECK_NAMES
+    }
+    return ", ".join(sorted(named))
+
+
+def _is_bounded_disclosure_text(value: object) -> bool:
+    """Whether a producer-supplied disclosure string is non-empty and bounded."""
+    return isinstance(value, str) and 0 < len(value) <= MAX_DISCLOSURE_TEXT_CHARS and all(ord(c) >= 32 for c in value)
+
+
+def _leak_catalogue_note(envelope: Mapping[str, object]) -> str | None:
+    """Say that a PASS does not rest on a repo-local leak catalogue, or nothing.
+
+    Before this build read `repo_patterns_error`, the one visible trace of a
+    skipped leak catalogue was the forward-compatibility line -- "roam envelope
+    schema 1.2.0 carried 1 field this build does not read" -- which files a
+    security disclosure under schema drift and is exactly the sentence a reader
+    is trained to skip. Roam's own message is not replayed: it is producer text,
+    and the two causes it distinguishes in prose are not separable here anyway.
+    Only the category names are printed, and those are checked against a fixed
+    set before this runs.
+    """
+    categories = envelope.get("categories")
+    if not isinstance(categories, Mapping):
+        return None
+    named = sorted(
+        _disclosable_field_name(name)
+        for name, result in categories.items()
+        if isinstance(result, Mapping) and result.get("repo_patterns_error")
+    )
+    if not named:
+        return None
+    return (
+        f"note: a repo-local leak catalogue contributed no patterns to {', '.join(named)}; "
+        "roam's built-in secret checks still ran, and this verdict does not rest on the catalogue. "
+        "A catalogue nobody opted into executing is the expected default and gates nothing; one that "
+        "was opted into and failed to load is reported as an incomplete check and refuses instead."
+    )
 
 
 def _unrecognised_envelope_fields(envelope: Mapping[str, object]) -> tuple[str, ...]:
@@ -3653,11 +3762,22 @@ def _validate_verify_protocol(
         or summary.get("truncated") is True
     ):
         raise ValueError("summary_binding")
-    if summary.get("verification_complete") is not True or summary.get("partial_success") is not False:
-        raise ValueError("verification_incomplete")
     incomplete_reasons = summary.get("incomplete_reasons")
-    if incomplete_reasons not in (None, []):
-        raise ValueError("verification_incomplete")
+    # Carry WHICH check roam said was incomplete into every refusal below, not
+    # just the last one. Roam sets `verification_complete: false` and
+    # `incomplete_reasons` together, so the flag branch always won the race and
+    # the reason list -- the only part that names anything -- was never read.
+    # Every reason is producer text, so nothing is echoed: a reason survives
+    # only by matching `<check>_incomplete` for a check name already in this
+    # build's fixed vocabulary, and what reaches the verdict is that
+    # vocabulary entry.
+    named_incomplete = _named_incomplete_checks(incomplete_reasons)
+    if (
+        summary.get("verification_complete") is not True
+        or summary.get("partial_success") is not False
+        or incomplete_reasons not in (None, [])
+    ):
+        raise ValueError("verification_incomplete" + (f": {named_incomplete}" if named_incomplete else ""))
 
     if expected_count == 0:
         _require_known_shape(
@@ -3742,6 +3862,12 @@ def _validate_verify_protocol(
         for counter in ("tests_targeted", "tests_failed", "tests_total_impacted"):
             if counter in result:
                 _plain_int(result[counter])
+        if "repo_patterns_error" in result and not _is_bounded_disclosure_text(result["repo_patterns_error"]):
+            # Accepting a field means accepting its shape. This one is never
+            # replayed into a verdict, so the bound is not the only thing
+            # standing between producer text and the output -- but a field this
+            # build now claims to understand has to actually be understood.
+            raise ValueError("category_disclosure")
         if "no_impacted_tests" in result and type(result["no_impacted_tests"]) is not bool:
             raise ValueError("category_counter")
         if (
@@ -3753,7 +3879,9 @@ def _validate_verify_protocol(
             or ("timed_out" in result and result["timed_out"] is not False)
             or ("capped" in result and result["capped"] is not False)
         ):
-            raise ValueError("category_incomplete")
+            # `category_name` is drawn from the fixed set checked above, so
+            # naming it here carries no producer text into the verdict.
+            raise ValueError(f"category_incomplete: {category_name}")
         for finding in nested:
             validated = _validate_finding(finding, expected_root=expected_root)
             if validated.get("category") != category_name:
@@ -3850,6 +3978,9 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> 
         f"{targets_checked} changed file{'s' if targets_checked != 1 else ''}"
         f"{_narrowed_scope_suffix(excluded)}"
     ]
+    catalogue_note = _leak_catalogue_note(envelope)
+    if catalogue_note:
+        lines.append(catalogue_note)
     note = _forward_compatibility_note(envelope)
     if note:
         lines.append(note)
@@ -4041,6 +4172,28 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
             "must not buy a pass, so this is refused rather than ignored and disclosed like other unknown "
             "fields. If that field is neutral, this build is too old to know it. "
             "Fix: python -m pip install --upgrade compile-code"
+        )
+    if reason in {"verification_incomplete", "category_incomplete"}:
+        # Roam ran to completion and said so; what it withheld is evidence, not
+        # a receipt. Measured on a repository whose opted-in
+        # `.roam-leak-patterns.py` raises on load: roam 14.0.0 refuses with
+        # `secrets` incomplete, and this branch used to answer with the generic
+        # protocol failure -- "did not return one complete, bound Verify receipt
+        # v3. Fix: pip install --upgrade roam-code>=13.10.0" -- naming neither
+        # the check nor the cause, and prescribing an upgrade to a producer
+        # already four majors past the floor it quotes. Reinstalling roam
+        # cannot make a broken catalogue load, and a reader who follows that
+        # remedy and watches it change nothing is being taught that this gate
+        # is the thing in the way.
+        _, _, named = str(error).partition(": ")
+        checks = f" (check{'s' if ',' in named else ''}: {named})" if named else ""
+        return (
+            f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+            f"scope target indices {indices}; executable `{executable}` ran to completion but declared its own "
+            f"evidence incomplete{checks}, so part of what this gate is asked to prove did not run. A check that "
+            "did not run cannot be passed. Fix: repair what that check depends on in THIS repository (its "
+            "configuration, index, or inputs) and rerun `compile verify --changed`; upgrading roam does not make "
+            "an unrun check run."
         )
     if reason in {"post_verify_content_changed", "post_verify_scope_changed"}:
         # Raised by this CLI's own post-run recheck, never by roam's receipt:
