@@ -2780,6 +2780,69 @@ class TestVerifyReceiptV3Protocol:
         }
         assert roam_category_allowlist <= mod._VERIFY_CATEGORY_KEYS
 
+    def test_the_producers_summary_vocabulary_is_fully_covered(self):
+        # The other half of the same parity, and the half the tripwire actually
+        # bit on: `summary.secrets_skipped` bought a pass exactly as
+        # `categories.secrets.secrets_skipped` did. Only the category side was
+        # stated, so the summary side held by luck rather than by contract.
+        #
+        # Transcribed from roam 14.0.0 `_build_verify_summary`, plus the two
+        # names its caller stamps on afterwards (`quality_band`,
+        # `targets_checked`). Every one of these is in the vocabulary, which is
+        # what keeps the token rule off ordinary output: a name the build knows
+        # keeps its precise handling and is never asked whether it asserts
+        # incompleteness. Measured by parsing that function: producer surface
+        # and vocabulary agree exactly, at both levels.
+        roam_summary_surface = {
+            "verdict",
+            "score",
+            "threshold",
+            "files_checked",
+            "violation_count",
+            "checks_run",
+            "verification_complete",
+            "partial_success",
+            "state",
+            "severity_filter",
+            "shown_count",
+            "total_count",
+            "suppressed",
+            "diff_scoped",
+            "baseline",
+            "baselined",
+            "max_blast_radius",
+            "blast_radius_definition",
+            "scope",
+            "file_remaining",
+            "target_wave_violation_count",
+            "residual_violation_count",
+            "residual_findings_non_gating",
+            "incomplete_reasons",
+            "index_refresh",
+            "verification_receipt",
+            "quality_band",
+            "targets_checked",
+        }
+        assert roam_summary_surface <= mod._VERIFY_SUMMARY_KEYS
+
+    def test_a_category_name_is_never_asked_whether_it_asserts_incompleteness(self):
+        # The token rule's worst possible over-refusal, and the reason the
+        # `categories` mapping is gated by exact set equality against
+        # `_VERIFY_CATEGORY_NAMES` rather than by `_require_known_shape`:
+        # `error_handling` is one of roam's own check names, it carries the
+        # `error` token, and routing that mapping through the tripwire would
+        # exit 2 on every honest roam verify run there has ever been. Measured
+        # against roam 14.0.0 through a delegating shim: an unmutated
+        # `compile verify` renders PASS at exit 0 with `error_handling` among
+        # the checks. The refusal has to stay pointed at fields, not at names
+        # this build itself requires to be present.
+        assert mod._asserts_incompleteness("error_handling")
+        assert "error_handling" in mod._VERIFY_CATEGORY_NAMES
+
+        envelope = _verify_envelope()
+        assert set(envelope["categories"]) == mod._VERIFY_CATEGORY_NAMES
+        assert self._validate(json.dumps(envelope)) == envelope
+
     def test_a_known_field_in_the_wrong_shape_is_still_refused(self):
         """Opening the world to unknown names must not open it to known ones."""
         expected = _bound_verify_receipt(target_file_count=0)
