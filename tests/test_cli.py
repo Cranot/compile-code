@@ -543,17 +543,33 @@ class TestVersionReporting:
 
 
 class TestDependencyFloor:
-    def test_runtime_and_package_metadata_share_the_closed_compatibility_interval(self):
+    def test_the_runtime_requirement_is_a_floor_with_no_product_major_ceiling(self):
         assert mod.MIN_ROAM_VERSION == "13.10.0"
-        assert mod.MAX_ROAM_MAJOR_EXCLUSIVE == 14
-        assert mod.ROAM_VERSION_REQUIREMENT == ">=13.10.0,<14"
-        assert mod.ROAM_PACKAGE_REQUIREMENT == "roam-code>=13.10.0,<14"
+        assert mod.ROAM_VERSION_REQUIREMENT == ">=13.10.0"
+        assert mod.ROAM_PACKAGE_REQUIREMENT == "roam-code>=13.10.0"
+        # The deleted ceiling must not return as a constant, a comparison, or a
+        # clause. It detected nothing -- it deferred every compatibility
+        # question to a human typing a bigger number -- while costing a total
+        # outage on every kernel major bump.
+        assert not hasattr(mod, "MAX_ROAM_MAJOR_EXCLUSIVE")
+        assert "<" not in mod.ROAM_VERSION_REQUIREMENT
+        source = (ROOT / "src" / "compile_code" / "cli.py").read_text(encoding="utf-8")
+        assert "MAX_ROAM_MAJOR_EXCLUSIVE" not in source
+
+    def test_the_packaging_pin_keeps_a_ceiling_and_shares_only_the_floor(self):
+        # The pin is a RESOLVER input naming the newest major a receipt-v3
+        # transaction has been run against; the runtime requirement is a
+        # REFUSAL. They deliberately differ, and the floor is the only clause
+        # they share -- a stale pin costs a dependency resolution, not a
+        # verify outage.
         floor = mod.MIN_ROAM_VERSION
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        assert f'"roam-code<14,>={floor}"' in pyproject
+        assert f'"roam-code<15,>={floor}"' in pyproject
         package_spec = re.search(r'"roam-code([^"\r\n]+)"', pyproject)
         assert package_spec is not None
-        assert set(package_spec.group(1).split(",")) == set(mod.ROAM_VERSION_REQUIREMENT.split(","))
+        clauses = set(package_spec.group(1).split(","))
+        assert clauses == {"<15", f">={floor}"}
+        assert clauses & set(mod.ROAM_VERSION_REQUIREMENT.split(",")) == {f">={floor}"}
         for name in ("README.md", "AGENTS.md"):
             contents = (ROOT / name).read_text(encoding="utf-8")
             assert re.search(rf"roam-code[^\n]{{0,80}}>=\s*{re.escape(floor)}", contents)
@@ -591,9 +607,12 @@ class TestRoamVersionEnforcement:
             ("13.10.0dev1", False),
             ("13.99.0", True),
             ("13.99.0rc1", False),
+            # No product-major ceiling: a newer kernel major clears the floor.
+            # A PRERELEASE of it still does not, because the floor carries no
+            # prerelease and an unreleased build is not a supported one.
             ("14.0.0rc1", False),
-            ("14.0.0", False),
-            ("99.0.0", False),
+            ("14.0.0", True),
+            ("99.0.0", True),
             ("not-a-version", False),
         ],
     )
@@ -731,43 +750,46 @@ class TestRoamVersionEnforcement:
         assert "reports 13.9.9" in res.output
         assert "Python metadata reports roam-code 13.10.4" in res.output
 
-    def test_verify_blocks_unsupported_future_major_before_receipt_execution(self, runner, monkeypatch):
+    def test_verify_does_not_refuse_a_future_major_at_the_toolchain_gate(self, runner, monkeypatch):
+        # The inverse of a refusal this build used to make. A product-major
+        # ceiling turned every kernel major bump into `compile verify` exit 2
+        # with no verification, against a roam whose own envelope declared
+        # itself compatible. The gate must now stop at the floor and hand the
+        # compatibility question to the envelope contract.
         path = r"C:\future-bin\roam.exe"
+        reached = []
+
+        class _ReachedVerifier(Exception):
+            pass
+
+        def _capture(*args, **kwargs):
+            reached.append(True)
+            raise _ReachedVerifier
+
         monkeypatch.setattr(
             mod,
             "_inspect_roam",
-            lambda timeout=10: _roam_info(path=path, executable_version="14.0.0", metadata_version="14.0.0"),
+            lambda timeout=10: _roam_info(path=path, executable_version="99.0.0", metadata_version="99.0.0"),
         )
-        monkeypatch.setattr(mod, "_roam_capture", lambda *args, **kwargs: pytest.fail("Verify must not run"))
+        monkeypatch.setattr(mod, "_roam_capture", _capture)
 
         result = runner.invoke(mod.cli, ["verify", "src/cli.py"])
 
-        assert result.exit_code == mod.EXIT_TOOLCHAIN
-        assert "toolchain version mismatch" in result.output
-        assert "requires >=13.10.0,<14" in result.output
-        # The interval is closed at both ends, so the remediation must name the
-        # direction it actually resolves. For a caller ABOVE the ceiling the pin
-        # installs an older roam than the one on PATH; calling that an upgrade
-        # describes the opposite of what happens, and naming only that option
-        # hides the other valid answer for a caller who wants the newer roam.
-        assert 'pip install "roam-code>=13.10.0,<14"' in result.output
-        assert "installs an OLDER roam" in result.output
-        assert "pip install --upgrade compile-code" in result.output
-        assert 'pip install --upgrade "roam-code>=13.10.0,<14"' not in result.output
+        assert reached == [True], "a future major must reach the verifier, not a version refusal"
+        assert isinstance(result.exception, _ReachedVerifier)
+        assert "toolchain version mismatch" not in result.output
 
-    def test_a_version_below_the_floor_is_still_told_to_upgrade_roam(self):
-        # The other half of the closed interval must not drift with it.
-        below = mod._roam_remediation("13.9.9")
+    def test_the_only_remediation_left_is_the_upgrade_that_is_actually_true(self):
+        # The constraint is a floor, so a version refusal has exactly one cause
+        # and "upgrade roam" is the true description of it. The second arm --
+        # for callers above a ceiling, where pip resolved DOWNWARD and the word
+        # "upgrade" described the opposite of what happened -- went with the
+        # ceiling it existed to describe.
+        fix = mod._roam_remediation()
 
-        assert below == 'python -m pip install --upgrade "roam-code>=13.10.0,<14"'
-        assert "OLDER" not in below
-
-    @pytest.mark.parametrize("version", [None, "", "not-a-version", 14, object()])
-    def test_an_unreadable_version_falls_back_to_the_plain_upgrade(self, version):
-        # Reached from the `missing`, `timeout` and `broken` states, where no
-        # version was ever observed. An absent measurement must not be read as
-        # "above the ceiling".
-        assert mod._roam_remediation(version) == 'python -m pip install --upgrade "roam-code>=13.10.0,<14"'
+        assert fix == 'python -m pip install --upgrade "roam-code>=13.10.0"'
+        assert "OLDER" not in fix
+        assert "<" not in fix
 
     def test_doctor_reports_path_version_and_metadata_separately(self, runner, monkeypatch, tmp_path):
         path = r"C:\old-bin\roam.exe"
@@ -784,8 +806,91 @@ class TestRoamVersionEnforcement:
         assert res.exit_code == mod.EXIT_TOOLCHAIN
         assert "toolchain : INCOMPATIBLE" in res.output
         assert f"roam path : {path}" in res.output
-        assert "roam version: 13.9.9 (required >=13.10.0,<14)" in res.output
+        assert "roam version: 13.9.9 (required >=13.10.0)" in res.output
         assert "python metadata: roam-code 13.10.4" in res.output
+
+
+class TestFutureRoamMajorIsVerifiedNotRefused:
+    """A newer kernel major is verified; the CONTRACT decides, not the number.
+
+    Deleting the runtime product-major ceiling is only safe if the guards that
+    read the actual contract still refuse at that future major. The ceiling
+    itself refused there and detected nothing -- constructed drift probes run
+    through the real verify path were caught by these guards, never by the
+    version number -- so this class pins both halves at once: a future major
+    with a readable envelope runs to a real verdict, and each envelope-level
+    refusal still fires AT that same future major.
+    """
+
+    FUTURE = "99.0.0"
+
+    @pytest.fixture(autouse=True)
+    def _future_major_roam(self, monkeypatch):
+        monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: [(" M", "changed.py")])
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(executable_version=self.FUTURE, metadata_version=self.FUTURE),
+        )
+
+    def _invoke(self, runner, monkeypatch, mutate=None):
+        def fake(*args, timeout=600, executable="roam", env=None):
+            receipt = {
+                "schema": mod.VERIFY_RECEIPT_SCHEMA,
+                "request_nonce": env["ROAM_VERIFY_REQUEST_NONCE"],
+                "scope_sha256": env["ROAM_VERIFY_SCOPE_SHA256"],
+                "content_sha256": env["ROAM_VERIFY_CONTENT_SHA256"],
+                "content_sha256_before": env["ROAM_VERIFY_CONTENT_SHA256"],
+                "content_sha256_after": env["ROAM_VERIFY_CONTENT_SHA256"],
+                "target_file_count": int(env["ROAM_VERIFY_SCOPE_COUNT"]),
+                "scope_stable": True,
+                "request_match": True,
+            }
+            envelope = _verify_envelope(receipt=receipt)
+            envelope["version"] = self.FUTURE
+            if mutate is not None:
+                mutate(envelope)
+
+            class _P:
+                stdout = json.dumps(envelope)
+                stderr = ""
+                returncode = 0
+
+            return _P()
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        return runner.invoke(mod.cli, ["verify"])
+
+    def test_a_readable_envelope_from_a_future_major_is_verified(self, runner, monkeypatch):
+        result = self._invoke(runner, monkeypatch)
+
+        assert result.exit_code == 0
+        assert "VERDICT: PASS" in result.output
+        assert "toolchain version mismatch" not in result.output
+
+    def test_a_different_envelope_major_still_refuses_at_a_future_product_major(self, runner, monkeypatch):
+        result = self._invoke(runner, monkeypatch, lambda e: e.update(schema_version="2.0.0"))
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "envelope_schema_incompatible" in result.output
+
+    def test_an_unknown_incompleteness_signal_still_refuses_and_names_the_field(self, runner, monkeypatch):
+        result = self._invoke(runner, monkeypatch, lambda e: e.update(warnings=["something"]))
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "unknown_incompleteness_signal" in result.output
+        assert "warnings" in result.output
+
+    def test_a_neutral_additive_field_passes_and_is_disclosed_as_unread(self, runner, monkeypatch):
+        result = self._invoke(
+            runner,
+            monkeypatch,
+            lambda e: e.update(schema_version="1.3.0", provenance_note="built by a newer kernel"),
+        )
+
+        assert result.exit_code == 0
+        assert "VERDICT: PASS" in result.output
+        assert "provenance_note" in result.output
 
 
 @pytest.mark.usefixtures("compatible_roam")

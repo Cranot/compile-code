@@ -134,7 +134,7 @@ COMBINED_INSTALL_LOCKS = (
 )
 OSV_QUERY_BATCH_URL = "https://api.osv.dev/v1/querybatch"
 BUILD_REQUIRES = ["setuptools==83.0.0", "wheel==0.47.0"]
-RUNTIME_REQUIRES = ["roam-code<14,>=13.10.0", "click>=8.3.3"]
+RUNTIME_REQUIRES = ["roam-code<15,>=13.10.0", "click>=8.3.3"]
 DEV_REQUIRES = ["pytest==9.1.1", "PyYAML==6.0.3", "ruff==0.15.22", "zizmor==1.29.0"]
 PROJECT_URLS = {
     "Homepage": "https://github.com/Cranot/compile-code",

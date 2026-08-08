@@ -52,18 +52,39 @@ EXIT_TIMEOUT = 124
 EXIT_VERIFY_GATE = 5
 BASELINE_TIMEOUT = 1200
 MIN_ROAM_VERSION = "13.10.0"
-# This ceiling GATES the envelope forward-compatibility machinery below, and
-# the two are not separable decisions. `_verify` inspects the executable and
-# exits on `_roam_problem` BEFORE it ever delegates, so an envelope from a roam
-# outside this interval is never parsed: every tolerance `_require_known_shape`
-# offers a newer producer is reachable only for a SAME-MAJOR roam that adds
-# fields. Raising this ceiling is therefore what makes that machinery apply to
-# the next major at all; leaving it is a deliberate refusal of that major, not
-# an independent setting that the envelope layer can compensate for.
-# `test_verify_blocks_unsupported_future_major_before_receipt_execution` pins
-# the ordering.
-MAX_ROAM_MAJOR_EXCLUSIVE = 14
-ROAM_VERSION_REQUIREMENT = f">={MIN_ROAM_VERSION},<{MAX_ROAM_MAJOR_EXCLUSIVE}"
+# There is deliberately NO runtime product-major ceiling on this line. One used
+# to live here and it checked the wrong property. Roam's PRODUCT major says
+# nothing about the contract this CLI consumes: measured against the real roam
+# 14.0.0 binary, the verify envelope declared `schema_version` 1.2.0 — a MINOR
+# bump ACROSS a product major bump — and added zero top-level keys. Roam's own
+# contract said "compatible" while the ceiling said "refuse".
+#
+# Removing it is not a relaxation, because the ceiling never detected anything.
+# Nine constructed drift mutations were run through the real verify path
+# against a shim delegating to the real roam: seven were caught at exit 2 by
+# the contract guards below (`failure_contradiction`, `success_contradiction`,
+# `completion_binding`, `invalid_json_document`), and the ceiling caught none
+# of them, because a version ceiling defers the whole question to a human
+# typing a bigger number — and the deferral ends at exactly the moment the risk
+# arrives, since the only way forward is to type it. What it did instead was
+# cost a total outage: with the ceiling in place a roam one major up turned
+# `compile verify` into exit 2 with no verification at all, while `compile
+# report` drove that same binary to a PASS in the same tree.
+#
+# The guards that DO read the contract stay, and they are what carries this:
+# `_envelope_schema_compatible` refuses a different ENVELOPE major,
+# `_require_known_shape` refuses an unknown incompleteness-vocabulary key, and
+# the receipt/scope/verdict cross-derivations re-derive every gate-determining
+# value rather than trusting it. The two residual drifts nothing catches
+# (`checks_run` re-defined, roam's DEFAULT threshold moving) are disclosure
+# -level, not gate-level, and the ceiling would have deferred them exactly once
+# before they became uncaught anyway.
+#
+# The one exclusive ceiling that remains is the PACKAGING pin in
+# pyproject.toml. That is a resolver preference, never a runtime refusal;
+# `scripts/check.py::_floor_drift` keeps it honest, and going stale there costs
+# a dependency resolution, not a user outage.
+ROAM_VERSION_REQUIREMENT = f">={MIN_ROAM_VERSION}"
 ROAM_PACKAGE_REQUIREMENT = f"roam-code{ROAM_VERSION_REQUIREMENT}"
 MAX_VERIFY_JSON_BYTES = 2 * 1024 * 1024
 MAX_VERIFY_STDERR_BYTES = 64 * 1024
@@ -486,15 +507,19 @@ def _parse_version_value(raw: str) -> tuple[tuple[int, int, int], bool] | None:
 
 
 def _version_meets_minimum(raw: str, minimum: str = MIN_ROAM_VERSION) -> bool:
-    """Enforce the closed Roam compatibility interval without ``packaging``."""
+    """Enforce the Roam compatibility FLOOR without ``packaging``.
+
+    A floor only: there is no product-major ceiling, by decision. See the
+    comment on ``ROAM_VERSION_REQUIREMENT`` for why the envelope-schema major
+    and the receipt cross-derivations are the compatibility question, and the
+    product major is not.
+    """
     parsed = _parse_version_value(raw)
     floor = _parse_version_value(minimum)
     if parsed is None or floor is None:
         return False
     release, prerelease = parsed
     floor_release, floor_prerelease = floor
-    if release[0] >= MAX_ROAM_MAJOR_EXCLUSIVE:
-        return False
     if prerelease and not floor_prerelease:
         return False
     if release != floor_release:
@@ -699,29 +724,16 @@ def _inspect_roam(timeout: int = 10) -> dict[str, str | None]:
     return info
 
 
-def _roam_remediation(version: object = None) -> str:
-    """Remediation that names the direction the constraint actually resolves.
+def _roam_remediation() -> str:
+    """The one remediation a runtime version refusal can now have.
 
-    The compatibility interval is closed at BOTH ends, so a version mismatch
-    has two opposite causes and one printed fix used to serve both. For a
-    caller below the floor, "upgrade roam" is exactly right. For a caller above
-    the ceiling -- the state every roam major bump produces -- the same
-    sentence describes the opposite of what happens: pip resolves the pin
-    DOWNWARD and installs an older roam than the one already on PATH.
-    (Measured: `pip install --upgrade "<pkg>>=a,<b>"` against an installed
-    version above `b` exits 0 and downgrades. The command works; the word
-    "upgrade" is what is false.) Worse, it names only one of the two valid
-    answers -- a caller who wants to keep the newer roam is never told that
-    moving compile-code forward is the other one.
+    The constraint is a floor, so a version refusal has exactly one cause and
+    one printed fix, and "upgrade roam" is the true description of it. This
+    function previously carried a second arm for callers ABOVE a product-major
+    ceiling, where the same sentence described the opposite of what happens:
+    pip resolved the pin DOWNWARD and installed an older roam than the one
+    already on PATH. That arm went with the ceiling it existed to describe.
     """
-    pin = f'python -m pip install "{ROAM_PACKAGE_REQUIREMENT}"'
-    parsed = _parse_version_value(version) if isinstance(version, str) else None
-    if parsed is not None and parsed[0][0] >= MAX_ROAM_MAJOR_EXCLUSIVE:
-        return (
-            f"{pin} to pin roam back into the supported interval — this installs an OLDER roam than the "
-            "one on PATH — or keep that roam and move this side forward with "
-            "python -m pip install --upgrade compile-code"
-        )
     return f'python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
 
 
@@ -731,7 +743,7 @@ def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
     executable = info.get("path")
     version = info.get("version")
     metadata_version = info.get("metadata_version")
-    fix = _roam_remediation(version)
+    fix = _roam_remediation()
     if state == "missing":
         return EXIT_TOOLCHAIN, f"VERDICT: toolchain missing — `roam` is not on PATH. Fix: {fix}"
     if state == "timeout":

@@ -56,7 +56,7 @@ def _metadata() -> bytes:
         "License-Expression: Apache-2.0\n"
         "License-File: LICENSE\n"
         "Provides-Extra: dev\n"
-        "Requires-Dist: roam-code<14,>=13.10.0\n"
+        "Requires-Dist: roam-code<15,>=13.10.0\n"
         "Requires-Dist: click>=8.3.3\n"
         'Requires-Dist: pytest==9.1.1; extra == "dev"\n'
         'Requires-Dist: PyYAML==6.0.3; extra == "dev"\n'
@@ -941,7 +941,7 @@ def test_build_environment_is_closed_against_python_pip_and_setuptools_injection
 
 def test_runtime_dependency_contract_is_closed_to_the_tested_roam_major():
     project = release._read_pyproject(ROOT)["project"]
-    assert project["dependencies"] == ["roam-code<14,>=13.10.0", "click>=8.3.3"]
+    assert project["dependencies"] == ["roam-code<15,>=13.10.0", "click>=8.3.3"]
     assert release.RUNTIME_REQUIRES == project["dependencies"]
 
     docs = {name: (ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")}
@@ -953,13 +953,13 @@ def test_runtime_dependency_contract_is_closed_to_the_tested_roam_major():
     ("replacement", "expected"),
     [
         ("roam-code>=13.10.0", "inclusive floor and one exclusive ceiling"),
-        ("roam-code<15,>=13.10.0", "compatibility interval drifted"),
-        ("roam-code<14,>=13.9.0", "compatibility interval drifted"),
+        ("roam-code<16,>=13.10.0", "compatibility interval drifted"),
+        ("roam-code<15,>=13.9.0", "compatibility interval drifted"),
     ],
 )
 def test_compatibility_gate_rejects_open_or_drifted_roam_intervals(replacement: str, expected: str):
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    mutated = pyproject.replace("roam-code<14,>=13.10.0", replacement)
+    mutated = pyproject.replace("roam-code<15,>=13.10.0", replacement)
     docs = {name: (ROOT / name).read_text(encoding="utf-8") for name in ("README.md", "AGENTS.md")}
 
     assert any(expected in problem for problem in prepush_check._floor_drift(mutated, docs))
@@ -1997,15 +1997,15 @@ def _root_with_runtime_dependencies(tmp_path: Path, dependencies: list[str], mon
 @pytest.mark.parametrize(
     ("dependencies", "message"),
     [
-        (["roam-code<14,>=13.10.0", "click"], "exactly one inclusive >= floor is required"),
-        (["roam-code<14,>=13.10.0", "click<9"], "exactly one inclusive >= floor is required"),
-        (["roam-code<14,>=13.10.0", "click>=8.3.3,>=8.4"], "exactly one inclusive >= floor is required"),
-        (["roam-code<14,>=13.10.0", "click>=8"], "must name a complete release version"),
-        (["roam-code<14,>=13.10.0", 'click>=8.3.3; python_version < "3.11"'], "environment marker"),
-        (["roam-code<14,>=13.10.0", "click[colour]>=8.3.3"], "not audited here"),
-        (["roam-code<14,>=13.10.0", "click>=8.3.3.post1"], "exact operator and release version"),
-        (["roam-code<14,>=13.10.0", "click>=8.3.3", "requests>=2.34.2"], "must remain exactly 2"),
-        (["roam-code<14,>=13.10.0"], "must remain exactly 2"),
+        (["roam-code<15,>=13.10.0", "click"], "exactly one inclusive >= floor is required"),
+        (["roam-code<15,>=13.10.0", "click<9"], "exactly one inclusive >= floor is required"),
+        (["roam-code<15,>=13.10.0", "click>=8.3.3,>=8.4"], "exactly one inclusive >= floor is required"),
+        (["roam-code<15,>=13.10.0", "click>=8"], "must name a complete release version"),
+        (["roam-code<15,>=13.10.0", 'click>=8.3.3; python_version < "3.11"'], "environment marker"),
+        (["roam-code<15,>=13.10.0", "click[colour]>=8.3.3"], "not audited here"),
+        (["roam-code<15,>=13.10.0", "click>=8.3.3.post1"], "exact operator and release version"),
+        (["roam-code<15,>=13.10.0", "click>=8.3.3", "requests>=2.34.2"], "must remain exactly 2"),
+        (["roam-code<15,>=13.10.0"], "must remain exactly 2"),
     ],
 )
 def test_runtime_floor_audit_refuses_a_declaration_it_cannot_name_a_version_for(

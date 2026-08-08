@@ -25,9 +25,13 @@ classifiers = [
     "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
-    # >=13.10.0,<14: tested receipt-v3 Verify + MCP-default mode enforcement;
-    # CLI/hook enforcement remains explicit at the launcher boundary.
-    "roam-code<14,>=13.10.0",
+    # >=13.10.0,<15: tested receipt-v3 Verify + MCP-default mode enforcement;
+    # CLI/hook enforcement remains explicit at the launcher boundary. This
+    # ceiling is a RESOLVER PREFERENCE naming the newest major a receipt-v3
+    # transaction has actually been run against — not a runtime refusal. The
+    # CLI enforces the floor only; see ROAM_VERSION_REQUIREMENT in cli.py.
+    # Going stale here costs a dependency resolution, never a verify outage.
+    "roam-code<15,>=13.10.0",
     # click below 8.3.3 carries CVE-2026-7246 / PYSEC-2026-2132: click.edit()
     # passes its editor command through a shell, so an attacker-controlled
     # EDITOR value runs arbitrary commands. This package never calls

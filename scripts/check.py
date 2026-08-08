@@ -1149,7 +1149,7 @@ def _floor_drift(pyproject: str, docs: dict[str, str]) -> list[str]:
         return ["roam-code pin must contain exactly one inclusive floor and one exclusive ceiling"]
     floor = floors[0]
     ceiling = ceilings[0]
-    if floor != "13.10.0" or ceiling != "14":
+    if floor != "13.10.0" or ceiling != "15":
         return [f"roam-code compatibility interval drifted to >={floor},<{ceiling}"]
     problems = []
     comments = re.findall(r"#\s*>=([\d.]+),\s*<([\d.]+):", pyproject)

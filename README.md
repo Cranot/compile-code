@@ -41,9 +41,12 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 ## Install and use in 60 seconds
 
 Release `0.2.0` is deliberately dependency-gated, and that gate is now open:
-`roam-code 13.10.0` is available on PyPI, so the tested `>=13.10.0,<14`
-compatibility interval resolves. The installer fails instead of silently
-substituting an older or future-major kernel.
+`roam-code 13.10.0` is available on PyPI, so the tested `>=13.10.0,<15`
+packaging interval resolves. The installer fails instead of silently
+substituting an older kernel. That upper bound is a resolver preference — the
+newest kernel major a receipt-v3 transaction has been run against — not a
+runtime refusal: the CLI enforces the floor and lets the envelope-schema major
+decide compatibility.
 
 compile-code itself is not on PyPI yet and `v0.2.0` is not tagged yet, so
 install the unpinned `main` today:
@@ -63,9 +66,10 @@ python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code
 ```
 
 Every path resolves the `compile` CLI and its roam-code engine together. The
-closed compatibility interval makes the command auditable, admits compatible
-13.x fixes, and prevents an untested future major from entering the immutable
-0.2.0 release.
+packaging interval makes the command auditable and keeps an untested future
+major out of what the immutable 0.2.0 release *resolves* by default. It is not
+a runtime refusal: a newer kernel already on your PATH is verified against the
+envelope contract rather than rejected on its version number.
 
 That's it. In the default fully wired mode, each prompt is compiled when the
 local optimizer succeeds; optimizer failures pass the original prompt through
@@ -201,8 +205,8 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code 0.2.0 supports `roam-code >= 13.10.0,<14` and picks up compatible
-13.x kernel releases — so the published losses above are not static marketing:
+compile-code 0.2.0 requires `roam-code >= 13.10.0` and picks up compatible
+kernel releases — so the published losses above are not static marketing:
 each one was attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped
 to a −26% win; the cycles cell went from +56% to **−89%** ($0.65 → $0.07).
@@ -226,12 +230,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1215',
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1227',
        'edge': 'call', 'call_line': 'if _require_index():',
-       'call_location': 'src/compile_code/cli.py:1224'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4113', 'edge': 'call',
+       'call_location': 'src/compile_code/cli.py:1236'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4125', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:4123'}
+       'call_location': 'src/compile_code/cli.py:4135'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
@@ -355,10 +359,15 @@ one-line `VERDICT:` with the fix — never a traceback. Exit codes: `0` ok,
 `130` interrupted. `compile verify` additionally propagates the toolchain's
 own exit code, including `5` for a quality-gate failure.
 
-The supported package interval is `roam-code >= 13.10.0,<14`. Doctor resolves
-the exact `roam` executable selected by PATH and reports that executable's path
-and version separately from Python package metadata, because a stale
-console-script shim can disagree with the installed distribution.
+The packaging interval is `roam-code >= 13.10.0,<15`; the runtime requirement
+the CLI enforces is the floor alone, `>=13.10.0`. There is no product-major
+ceiling at runtime, deliberately: roam's product major does not describe the
+contract this CLI consumes, so compatibility is decided by the envelope schema
+major plus the receipt cross-derivations, and a newer kernel with a readable
+envelope is verified rather than refused. Doctor resolves the exact `roam`
+executable selected by PATH and reports that executable's path and version
+separately from Python package metadata, because a stale console-script shim
+can disagree with the installed distribution.
 
 Prompt compilation remains fail-open so an unavailable optimizer never blocks
 work. Post-edit verification is fail-closed for edited turns: malformed,
@@ -505,7 +514,7 @@ and GitHub preflight even when an intermediate publication job failed or was
 skipped, so a missing PyPI publication or missing/still-draft GitHub release cannot
 produce a green workflow.
 
-Maintainer sequence: publish a compatible `roam-code>=13.10.0,<14` release, run
+Maintainer sequence: publish a compatible `roam-code>=13.10.0,<15` release, run
 `python scripts/check.py`, verify the protected `pypi` environment and Trusted
 Publisher, immutable releases, and the protected `release-guard` environment
 with its read-only owner token;
