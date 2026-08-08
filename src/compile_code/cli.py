@@ -771,6 +771,26 @@ def _roam_problem(info: dict[str, str | None]) -> tuple[int, str] | None:
     return None
 
 
+def _exit_on_roam_problem() -> dict[str, str | None]:
+    """Refuse before delegating when PATH roam is not one this build supports.
+
+    Every verb that emits an assurance claim shares this preamble. It used to
+    live only inside `_verify`, and the result was that `compile verify` exited
+    2 calling the toolchain unusable while `compile report` drove that same
+    binary to a PASS in the same tree, from the same shell — one install
+    publishing two opposite answers about one executable. At a product boundary
+    the exit code IS the claim: a CI job branches on it, and `compile report`
+    exiting 0 asserts a verdict it never read.
+    """
+    roam_info = _inspect_roam()
+    problem = _roam_problem(roam_info)
+    if problem is not None:
+        exit_code, verdict = problem
+        click.echo(verdict)
+        raise SystemExit(exit_code)
+    return roam_info
+
+
 def _require_index(path: str = ".") -> bool:
     """True when a compile index exists at *path*."""
     root = Path(path)
@@ -1276,7 +1296,15 @@ def _claude_hook_args_for_canonical_write_order(
 def _exit_after_canonical_claude_hook_update(
     *, uninstall: bool = False, no_verify: bool = False, user_level: bool = False
 ) -> None:
-    """Exit through one Claude hook mutation path so wire/unwire cannot drift."""
+    """Exit through one Claude hook mutation path so wire/unwire cannot drift.
+
+    UNGATED BY DECISION — recovery path. `wire` and `unwire` are the two verbs
+    a user needs precisely when the toolchain is unsupported: refusing here
+    means they cannot install the loop that would tell them what is wrong, and
+    worse, cannot un-wire a loop that is already failing on every agent turn.
+    Neither emits a verdict about the code, and neither writes state any gated
+    verb consumes, so the exemption costs no assurance.
+    """
     rc = _delegate(
         *_claude_hook_args_for_canonical_write_order(uninstall=uninstall, no_verify=no_verify, user_level=user_level)
     )
@@ -2160,6 +2188,10 @@ def cli() -> None:
 @click.option("--force", is_flag=True, help="Rebuild the index from scratch.")
 def _init(force: bool) -> None:
     """Index the current repo (one-time; incremental afterwards)."""
+    # GATED: the index this writes is the substrate every later gated verify
+    # reads, and nothing downstream records which toolchain produced it. An
+    # unsupported roam must not be allowed to lay that foundation quietly.
+    _exit_on_roam_problem()
     args = ["init"]
     if force:
         args = ["index", "--force"]
@@ -2208,6 +2240,10 @@ def _baseline(paths: tuple[str, ...]) -> None:
     avoids the silent no-op shapes that the natural verify invocations hit.
     Optional directory targets let callers spell the whole repo explicitly.
     """
+    # GATED: this writes the accepted-debt file that tells
+    # `compile verify --new-only` which findings to SUPPRESS. A roam the gate
+    # refuses to RUN must not get to decide what the gate ignores.
+    _exit_on_roam_problem()
     rc, status = _git_status_porcelain()
     if rc != 0:
         raise SystemExit(rc)
@@ -2231,8 +2267,14 @@ def _baseline(paths: tuple[str, ...]) -> None:
 
 @cli.command("report")
 def _report() -> None:
-    """Persist a whole-repo verify report without gating."""
-    # Report mode composes with accepted-debt --new-only; it does not add a second gate.
+    """Persist a whole-repo verify report without a quality gate."""
+    # Report mode composes with accepted-debt --new-only; it does not add a
+    # second QUALITY gate. It is toolchain-GATED all the same: this verb does
+    # not write the report, roam does, and compile-code's single contribution
+    # is adopting roam's exit code as its own. That adoption is the assurance
+    # claim, and `.roam/verify-report.json` is state a reader treats as a
+    # verdict about this tree.
+    _exit_on_roam_problem()
     raise SystemExit(_delegate("verify", "--report", "--persist"))
 
 
@@ -2466,6 +2508,10 @@ def _run(task: str, json_out: bool) -> None:
             'Pass a navigation prompt, e.g. compile run "who calls handleSave?"'
         )
         raise SystemExit(1)
+    # UNGATED BY DECISION — advisory only. This prints a compiled navigation
+    # envelope: it asserts nothing about whether the code is correct, and it
+    # writes no state any gated verb later reads. An unsupported roam that can
+    # still answer "who calls this" is more useful than a refusal.
     args = (["--json"] if json_out else []) + ["compile", task, "--artifact", "auto"]
     with _default_agent_mode("compile"):
         raise SystemExit(_delegate(*args))
@@ -2474,6 +2520,9 @@ def _run(task: str, json_out: bool) -> None:
 @cli.command("stats")
 def _stats() -> None:
     """Show compile telemetry for this repo (routing, latency, cache)."""
+    # UNGATED BY DECISION — advisory only. Reads this repo's local telemetry
+    # log and prints it. No verdict, no assurance claim, no state a gated verb
+    # consumes.
     raise SystemExit(_delegate("compile-stats"))
 
 

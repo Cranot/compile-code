@@ -4117,23 +4117,52 @@ class TestClaudeStructuralReadiness:
 
 
 class TestToolchainVersionGatingPartition:
-    """Which verbs refuse an out-of-interval roam, pinned as an exact partition.
+    """Which verbs refuse an unsupported roam, and WHY each exemption exists.
 
-    Two independent reviews of the same tree published two different, both
-    wrong, lists of the commands that delegate to roam WITHOUT checking its
-    version -- one named `wire` as not delegating (its whole body is one call
-    that delegates), the other dropped `wire` and still missed `unwire`. A
-    residual that two readers cannot state correctly from the source is not a
-    residual anyone can decide about, so it is derived here instead of
-    described.
+    Two independent reviews of this tree published two different, both wrong,
+    lists of the commands that delegate to roam WITHOUT checking its version --
+    one named `wire` as not delegating (its whole body is one call that
+    delegates), the other dropped `wire` and still missed `unwire`. So the
+    partition is derived from the call graph here rather than described.
 
-    This pins a REAL and deliberate asymmetry: `compile verify` refuses a roam
-    outside `ROAM_VERSION_REQUIREMENT`, while seven other verbs will happily
-    drive that same roam. Closing it refuses MORE and is allowed; leaving it
-    keeps a working escape hatch on the day a new roam major lands. Either way
-    the next command added must land on one side of this list on purpose --
-    adding one that delegates without gating fails here until it is listed.
+    The split it used to pin was an ACCIDENT, not a design. `_roam_problem` was
+    born inside the verify sealing work and was simply never added anywhere
+    else; no artifact in the tree or in its history records a decision to
+    exempt any verb, and the commit that introduced it stated the requirement
+    GLOBALLY. Pinning that accident as an exact equality made it permanent:
+    gating a single verb failed BOTH assertions, and one assertion existed only
+    to forbid gating `report`.
+
+    What is pinned now is the RULE, not the membership. A verb may be exempt
+    only if it makes no assurance claim and writes no state a gated verb later
+    consumes -- and the reason has to be written down, because a membership
+    list with no reasons is exactly what let the accident survive two reviews.
+    The assertions are one-directional on purpose: gating MORE is always
+    allowed, and a new delegating verb fails here until someone lists it with a
+    reason.
     """
+
+    # Verbs that must refuse a roam this build does not support.
+    REQUIRED_GATED = frozenset({"verify", "claude", "doctor", "report", "baseline", "init"})
+
+    # Delegating verbs allowed to run an unsupported roam, each with the reason.
+    DOCUMENTED_EXEMPT = {
+        "run": (
+            "advisory only: prints a compiled navigation envelope, asserts nothing about "
+            "correctness, and writes no state any gated verb reads"
+        ),
+        "stats": ("advisory only: prints this repo's local compile telemetry, asserts nothing, and writes nothing"),
+        "wire": (
+            "recovery path: installs the agent hooks. It must keep working while the "
+            "toolchain is unsupported, or a user cannot install the loop that would tell "
+            "them so. It emits no verdict about the code."
+        ),
+        "unwire": (
+            "recovery path: removes the agent hooks. It must keep working while the "
+            "toolchain is unsupported, or a user cannot un-wire a loop that is failing on "
+            "every turn. It emits no verdict about the code."
+        ),
+    }
 
     @staticmethod
     def _call_graph() -> dict[str, ast.FunctionDef]:
@@ -4161,21 +4190,99 @@ class TestToolchainVersionGatingPartition:
                 delegating.add(name)
         return gated, delegating
 
-    def test_only_these_verbs_check_the_roam_version(self):
+    def test_every_verb_that_emits_an_assurance_claim_checks_the_toolchain(self):
+        # `>=`, not `==`: refusing MORE is always allowed and must never fail
+        # here. `report` and `baseline` are in this set because compile-code
+        # adopts roam's exit code as its own -- at a product boundary that IS
+        # the assurance claim, and `compile report` exiting 0 asserts a PASS it
+        # never read. `baseline` additionally writes the accepted-debt file
+        # that tells `verify --new-only` which findings to SUPPRESS, and `init`
+        # writes the index every later gated verify reads.
         gated, _ = self._partition()
-        assert gated == {"verify", "claude", "doctor"}
+        assert self.REQUIRED_GATED <= gated
 
-    def test_every_other_delegating_verb_drives_an_unchecked_roam(self):
+    def test_no_delegating_verb_runs_an_unsupported_roam_without_a_written_reason(self):
         gated, delegating = self._partition()
-        # Seven, not the five either review reported. `wire` and `unwire` each
-        # consist of a single call whose only exit is through `_delegate`.
-        assert delegating - gated == {"baseline", "init", "report", "run", "stats", "wire", "unwire"}
+        ungated = delegating - gated
+        assert ungated <= set(self.DOCUMENTED_EXEMPT), (
+            f"{sorted(ungated - set(self.DOCUMENTED_EXEMPT))} delegate to roam without checking it "
+            "and without a recorded reason; gate them or list them with one"
+        )
+
+    @pytest.mark.parametrize("verb", sorted(DOCUMENTED_EXEMPT))
+    def test_each_exemption_states_why_and_not_merely_that(self, verb):
+        reason = self.DOCUMENTED_EXEMPT[verb]
+        assert isinstance(reason, str) and len(reason.split()) >= 8
+        # The rule an exemption has to satisfy, restated where it is checked:
+        # no assurance claim, and no state a gated verb consumes.
+        assert "advisory only" in reason or "recovery path" in reason
+
+    def test_the_reason_is_carried_in_the_source_too_not_only_in_this_test(self):
+        # A reason that lives only in a test is a reason the next editor of
+        # cli.py never sees.
+        source = (ROOT / "src" / "compile_code" / "cli.py").read_text(encoding="utf-8")
+        assert source.count("UNGATED BY DECISION") >= 3
 
     def test_the_asymmetry_is_reachable_and_not_a_parsing_artifact(self):
         # `wire`'s entire body is the delegating call, so "it does not
         # delegate" cannot be true of any code path.
         assert "_exit_after_canonical_claude_hook_update" in inspect.getsource(mod._wire.callback)
         assert "_delegate(" in inspect.getsource(mod._exit_after_canonical_claude_hook_update)
-        # And the gate that `verify` has really is absent from theirs.
+        # And the gate really is present on the verbs that make a claim. The
+        # assertion this replaces was the opposite -- `_roam_problem` NOT in
+        # `_report` -- whose only function was to forbid this fix.
         assert "_roam_problem" in inspect.getsource(mod._verify.callback)
-        assert "_roam_problem" not in inspect.getsource(mod._report.callback)
+        for callback in (mod._report.callback, mod._baseline.callback, mod._init.callback):
+            assert "_exit_on_roam_problem" in inspect.getsource(callback)
+
+
+class TestUnsupportedRoamIsRefusedByEveryAssuranceVerb:
+    """The runtime half of the partition: an unsupported roam is never driven.
+
+    Measured before this closed, with a roam outside the supported interval on
+    PATH: `compile verify` and `compile doctor` exited 2 calling the toolchain
+    incompatible while `compile report`, `compile baseline` and `compile init`
+    drove that same binary to completion and exited 0 in the same tree -- and
+    `compile report` wrote a PASS report from a toolchain the same install
+    called unusable.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _below_floor_roam(self, monkeypatch):
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(executable_version="13.9.9", metadata_version="13.9.9"),
+        )
+        monkeypatch.setattr(mod, "_git_status_porcelain", lambda: (0, ""))
+
+    @pytest.mark.parametrize("argv", [["report"], ["baseline"], ["init"]])
+    def test_an_assurance_verb_refuses_instead_of_running_it(self, argv, runner, monkeypatch):
+        monkeypatch.setattr(mod, "_delegate", lambda *a, **kw: pytest.fail(f"{argv} must not run an unsupported roam"))
+
+        result = runner.invoke(mod.cli, argv)
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert "toolchain version mismatch" in result.output
+
+    @pytest.mark.parametrize("argv", [["run", "who calls add?"], ["stats"]])
+    def test_an_exempt_verb_still_runs_so_the_recovery_path_stays_open(self, argv, runner, monkeypatch):
+        ran = []
+        monkeypatch.setattr(mod, "_delegate", lambda *a, **kw: ran.append(a) or 0)
+
+        result = runner.invoke(mod.cli, argv)
+
+        assert ran, f"{argv} is exempt by decision and must keep working on an unsupported roam"
+        assert "toolchain version mismatch" not in result.output
+        assert result.exit_code == 0
+
+    @pytest.mark.parametrize("argv", [["wire", "claude"], ["unwire", "claude"]])
+    def test_hook_management_still_works_so_a_broken_loop_can_be_undone(self, argv, runner, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        ran = []
+        monkeypatch.setattr(mod, "_exit_after_canonical_claude_hook_update", lambda **kw: ran.append(kw))
+
+        result = runner.invoke(mod.cli, argv)
+
+        assert ran, f"{argv} is exempt by decision and must keep working on an unsupported roam"
+        assert "toolchain version mismatch" not in result.output

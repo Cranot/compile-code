@@ -230,12 +230,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1227',
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1247',
        'edge': 'call', 'call_line': 'if _require_index():',
-       'call_location': 'src/compile_code/cli.py:1236'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4125', 'edge': 'call',
+       'call_location': 'src/compile_code/cli.py:1256'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4174', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:4135'}
+       'call_location': 'src/compile_code/cli.py:4184'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
@@ -314,7 +314,7 @@ planted hallucinations caught in both languages.
 | `compile run "task"` | Headless: print the compiled envelope (`--json` for scripts/CI) |
 | `compile verify [files...]` | Scoped review of the changed files (`--changed`, `--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
 | `compile baseline [dirs...]` | Snapshot accepted debt for a clean whole-repo tree (refuses a dirty tree) |
-| `compile report` | Persist a whole-repo verify report without gating |
+| `compile report` | Persist a whole-repo verify report without a quality gate (the toolchain is still checked) |
 | `compile stats` | Routing/latency/cache telemetry for this repo |
 | `compile commands` | Print a deterministic inventory of all CLI verbs (for scripts/CI) |
 | `compile doctor` | Check toolchain, index, and wiring (project + user-global) |
@@ -364,7 +364,17 @@ the CLI enforces is the floor alone, `>=13.10.0`. There is no product-major
 ceiling at runtime, deliberately: roam's product major does not describe the
 contract this CLI consumes, so compatibility is decided by the envelope schema
 major plus the receipt cross-derivations, and a newer kernel with a readable
-envelope is verified rather than refused. Doctor resolves the exact `roam`
+envelope is verified rather than refused.
+
+A roam *below* the floor is refused by every verb that makes an assurance claim
+or writes state a later gate reads — `verify`, `claude`, `doctor`, `report`,
+`baseline`, `init`. Four verbs deliberately keep working on an unsupported
+toolchain, because they are the recovery path and none of them claims anything
+about your code: `run` and `stats` are advisory output, and `wire`/`unwire`
+have to stay available or you could neither install the loop that reports the
+problem nor un-wire one that is failing on every turn.
+
+Doctor resolves the exact `roam`
 executable selected by PATH and reports that executable's path and version
 separately from Python package metadata, because a stale console-script shim
 can disagree with the installed distribution.
