@@ -17,6 +17,7 @@ PYTHON_GATES = (
     "scripts/check.py",
     "scripts/prepush_leak_scan.py",
     "scripts/release_artifacts.py",
+    "scripts/roam_pin_drift.py",
     "scripts/secret_scan.py",
 )
 

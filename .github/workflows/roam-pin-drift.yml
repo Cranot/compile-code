@@ -1,0 +1,61 @@
+# Staleness notice for the hand-maintained roam-code packaging ceiling.
+#
+# There used to be a RUNTIME product-major ceiling on roam, and it was deleted:
+# it detected nothing, it deferred every compatibility question to a human
+# typing a bigger number, and its measured effect was a total `compile verify`
+# outage on every kernel major bump while `compile report` drove the same
+# binary to a PASS. What remains is a packaging pin in pyproject.toml -- a
+# resolver preference naming the newest kernel major a receipt-v3 transaction
+# has actually been run against.
+#
+# That pin is still a number a person has to move, and the failure mode of such
+# a number is that nobody is told it went stale. This job is what tells them.
+# Failing it is a NOTICE with a named action, not a user outage: nothing
+# refuses at runtime on a product major any more.
+#
+# Placement: its own workflow, on a schedule plus push-to-main.
+#   * Not in scripts/check.py, which is the blocking quality gate and must stay
+#     offline, token-free and runnable by hand on a laptop.
+#   * On a schedule because the answer changes when someone ELSE publishes a
+#     release, with no commit in this repository at all. Only a periodic run
+#     can see that; the push trigger catches a pin edited in the wrong
+#     direction within minutes.
+name: Roam pin drift
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Daily, off the hour to avoid the cron stampede, and away from the other
+    # scheduled job in this repository.
+    - cron: "18 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  roam-pin-drift:
+    name: Published roam-code majors vs the tested ceiling
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the reviewed source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up exact Python and pip
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13.14"
+          pip-version: "26.1.2"
+
+      # No dependencies: the checker is stdlib-only on purpose, so a stale-pin
+      # notice can never be blocked by a resolution problem of its own.
+      - name: Compare the declared ceiling against published releases
+        run: python scripts/roam_pin_drift.py
