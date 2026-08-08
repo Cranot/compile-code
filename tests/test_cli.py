@@ -3253,6 +3253,124 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError, match="summary_filter_shape"):
             self._validate(json.dumps(envelope), diff_only=True)
 
+    def _filtered_warn(self, filter_field: str, filter_value: object = True, *, score: int = 95) -> dict:
+        """Roam's post-filter recompute: WARN over a PASS band at score 95."""
+        envelope = _verify_envelope(verdict="WARN", score=score)
+        envelope["summary"][filter_field] = filter_value
+        return envelope
+
+    @pytest.mark.parametrize(
+        ("filter_field", "filter_value"),
+        [("diff_scoped", True), ("suppressed", 3), ("baselined", 4)],
+    )
+    def test_roams_post_filter_warn_over_a_pass_band_is_ordinary_output(self, filter_field, filter_value):
+        # Reproduced against roam 14.0.0 with NO mutation, through a shim that
+        # delegates to the real binary, on all three entrances: `--diff-only`
+        # emitted `diff_scoped: true`, a checked-in `.roam-suppressions.yml` on
+        # a DEFAULT `compile verify` with no flag at all emitted `suppressed: 3`,
+        # and `--new-only` over a written baseline emitted `baselined: 4`. Each
+        # carried verdict WARN, score 95, quality_band PASS, receipt bound --
+        # and each was refused at exit 2 as `completion_binding`, with a remedy
+        # telling the operator to reinstall a roam that was working correctly.
+        # Roam asks two different questions: `_filtered_verdict_score` asks
+        # whether any gating finding survived the filter, `quality_band` asks
+        # what band the score falls in.
+        envelope = self._filtered_warn(filter_field, filter_value)
+
+        assert self._validate(json.dumps(envelope), diff_only=filter_field == "diff_scoped") == envelope
+
+    def test_an_unfiltered_verdict_that_contradicts_its_band_is_still_refused(self):
+        # Re-derived from roam's source rather than assumed: with no filter its
+        # verdict is `_compute_verdict(score)` -- the band itself -- and neither
+        # adjuster that can move it beforehand produces this cell (the secrets
+        # floor pins score and verdict together; the syntax-degraded qualifier
+        # leaves the enum and is refused earlier as `verdict_enum`). So a
+        # mismatch with nothing declaring a filter is a contradiction, not
+        # ordinary output.
+        envelope = _verify_envelope(verdict="WARN", score=95)
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
+    @pytest.mark.parametrize(
+        ("verdict", "score", "band"),
+        [
+            ("PASS", 70, "WARN"),
+            ("PASS", 40, "FAIL"),
+            ("WARN", 40, "FAIL"),
+        ],
+    )
+    def test_only_the_pessimistic_direction_is_admitted(self, verdict, score, band):
+        # The carve-out is directional. A verdict ABOVE its own band is the only
+        # direction that could overstate a result -- PASS over a WARN or FAIL
+        # band, and WARN over a FAIL band, which is the cell that could launder
+        # a low score into an exit-0 transaction. Declaring a filter does not
+        # buy any of them.
+        envelope = _verify_envelope(verdict=verdict, score=score)
+        envelope["summary"]["quality_band"] = band
+        envelope["summary"]["suppressed"] = 9
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_declared_filter_removes_no_floor_from_the_success_branch(self):
+        # Trusting the producer's filter flag is only safe because WARN and PASS
+        # take the SAME success branch, so forging it buys a weaker label and
+        # nothing else. The floors are re-derived here regardless: a FAIL
+        # finding still contradicts success even with a filter declared.
+        finding = {
+            "severity": "FAIL",
+            "category": "error_handling",
+            "file": "src/app.py",
+            "message": "planted",
+            "line": 1,
+        }
+        envelope = _verify_envelope(verdict="WARN", score=95, violations=[finding])
+        envelope["summary"]["suppressed"] = 3
+
+        with pytest.raises(ValueError, match="success_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_declared_filter_does_not_lift_a_run_over_the_requested_threshold(self):
+        envelope = self._filtered_warn("suppressed", 3, score=90)
+        envelope["summary"]["threshold"] = 95
+
+        with pytest.raises(ValueError, match="success_contradiction"):
+            mod._validate_verify_protocol(
+                json.dumps(envelope),
+                returncode=0,
+                expected_receipt=_bound_verify_receipt(),
+                expected_roam_version=mod.MIN_ROAM_VERSION,
+                expected_threshold=95,
+            )
+
+    def test_a_band_that_contradicts_its_own_score_is_still_refused(self):
+        # `quality_band` is re-derived here from `score`; the carve-out reads
+        # roam's declared band only after that identity has held, so a producer
+        # cannot declare a band to unlock the exception.
+        envelope = self._filtered_warn("suppressed", 3)
+        envelope["summary"]["quality_band"] = "WARN"
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
+    @pytest.mark.parametrize("value", ["lots", {"n": 2}, -1, True, 2.0])
+    def test_a_baseline_count_that_is_not_a_plain_count_is_refused(self, value):
+        # `baselined` is now read rather than merely listed, and a field this
+        # build acts on has to be understood. Measured: roam emits a plain int
+        # (`baselined: 4`) and omits the key at zero.
+        envelope = _verify_envelope()
+        envelope["summary"]["baselined"] = value
+
+        with pytest.raises(ValueError, match="summary_filter_shape"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_zero_filter_count_does_not_unlock_the_exception(self):
+        envelope = self._filtered_warn("suppressed", 0)
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
     def test_the_narrowing_clause_names_only_fixed_directory_names(self):
         # Discovered paths are filesystem-supplied text; only names drawn from
         # NON_SOURCE_SCOPE_DIRECTORIES may reach a verdict block.

@@ -3234,6 +3234,53 @@ def _suppressed_findings_suffix(summary: Mapping[str, object]) -> str:
     return f"; {count} finding{'s' if count != 1 else ''} suppressed by .roam-suppressions.yml"
 
 
+def _declared_filter_warn(summary: Mapping[str, object], verdict: object, quality_band: str) -> bool:
+    """Whether WARN-over-a-PASS-band is roam's documented post-filter recompute.
+
+    Roam runs a SECOND verdict rule once a filter has removed findings. Read
+    from roam 14.0.0: `_filtered_verdict_score` (cmd_verify.py:5820) answers
+    "did any gating finding survive" -- `max(0, 100 - 5n)` with verdict WARN for
+    any surviving non-syntax finding -- while `quality_band` (cmd_verify.py:6533)
+    independently answers "what band does that score fall in". For 1..4
+    survivors those two questions give WARN over a PASS band at score
+    95/90/85/80. That is ordinary output, and this gate refused the whole
+    transaction as a broken receipt with a remedy that reinstalls a roam which
+    is behaving correctly.
+
+    Measured against roam 14.0.0 with no mutation, all three entrances:
+    `--diff-only` (`diff_scoped: true`), a checked-in `.roam-suppressions.yml`
+    on a DEFAULT `compile verify` with no flag at all (`suppressed: 3`), and
+    `--new-only` over a written baseline (`baselined: 4`). Each produced
+    verdict WARN, score 95, quality_band PASS, and exit 2.
+
+    Four properties keep this from being a relaxation:
+
+    * DIRECTIONAL. Only WARN under a PASS band is admitted. `verdict == "PASS"`
+      over a WARN or FAIL band -- the only direction that could overstate a
+      result -- stays refused, as does WARN over a FAIL band, which is the one
+      cell that could launder a low score into an exit-0 transaction.
+    * FILTER-DECLARED. An unfiltered run cannot honestly produce a mismatch:
+      re-derived from roam's source, the unfiltered verdict is
+      `_compute_verdict(score)` -- the band itself -- and the two adjusters that
+      can move it before the band is computed either move the score with it
+      (`_apply_secrets_verdict_floor` pins both to WARN) or leave the enum
+      (`_apply_syntax_degraded_verdict` appends a qualifier, refused earlier by
+      `verdict_enum`). So a mismatch with no declared filter stays refused.
+    * NO FLOOR REMOVED. The success branch still demands exit 0, `score >=` the
+      threshold this process requested, no FAIL finding anywhere in the
+      evidence, and roam's band agreeing with the band recomputed here.
+    * NOTHING BOUGHT. Trusting the producer's filter flag costs nothing,
+      because WARN and PASS take the SAME success branch: forging the flag only
+      lets a producer publish a weaker label. `diff_scoped` is separately bound
+      to the request, so it cannot even be forged on a run that did not ask.
+    """
+    if verdict != "WARN" or quality_band != "PASS":
+        return False
+    if summary.get("diff_scoped") is True:
+        return True
+    return any(type(summary.get(name)) is int and summary[name] > 0 for name in ("suppressed", "baselined"))
+
+
 def _diff_scope_suffix(diff_only: bool) -> str:
     """Render `--diff-only` as a clause the VERDICT line carries.
 
@@ -3859,11 +3906,16 @@ def _validate_verify_protocol(
     # through a pass-through shim: the real producer writes `sum(1 for ...)`
     # and omits the key entirely at zero, so a plain non-negative int refuses
     # nothing honest.
-    if "suppressed" in summary:
-        try:
-            _plain_int(summary["suppressed"])
-        except ValueError:
-            raise ValueError("summary_filter_shape") from None
+    # `baselined` is the `--new-only` counterpart and is shape-checked for the
+    # same reason: it is now READ, by `_declared_filter_warn`, and a field this
+    # build acts on has to be understood. Measured: roam emits a plain int
+    # (`baselined: 4` over a written baseline) and omits the key at zero.
+    for filter_count in ("suppressed", "baselined"):
+        if filter_count in summary:
+            try:
+                _plain_int(summary[filter_count])
+            except ValueError:
+                raise ValueError("summary_filter_shape") from None
     # `diff_scoped` is the OTHER kind of filter: unlike `suppressed` it has a
     # request-side correlate, so it is bound to the request rather than merely
     # disclosed. This process knows whether it passed `--diff-only`, so binding
@@ -4058,7 +4110,11 @@ def _validate_verify_protocol(
         summary.get("state") != "verified"
         or summary.get("targets_checked") != expected_count
         or summary.get("quality_band") != quality_band
-        or (verdict in {"PASS", "WARN"} and verdict != quality_band)
+        or (
+            verdict in {"PASS", "WARN"}
+            and verdict != quality_band
+            and not _declared_filter_warn(summary, verdict, quality_band)
+        )
         or not isinstance(index_refresh, dict)
         or set(index_refresh) != {"state", "refreshed_file_count"}
         or index_refresh.get("state") not in {"current", "refreshed"}
