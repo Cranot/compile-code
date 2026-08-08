@@ -9,7 +9,7 @@ still travels to the remote and is retrievable from history forever. For a
 public remote, purging history after the fact does not un-publish it -- the
 bytes may already be cloned, cached, or indexed. This is the same failure
 shape that forced a history purge for a customer-name leak elsewhere in this
-project's toolchain (roam-code / stoa's ROADMAP 4.3).
+project's toolchain (roam-code / prakteon's ROADMAP 4.3).
 
 A PUSH PUBLISHES MORE THAN COMMITS, and "no commits" is not "nothing to
 read". An ANNOTATED TAG is its own object carrying its own message and
@@ -36,7 +36,7 @@ credential catalogue, masked/entropy-filtered). Reusing the catalogues
 adding in one place to close a gap in both the tree scan and the range scan.
 
 RANGE RESOLUTION: see prepush_refs.py (stdlib-only, copy-portable; ported
-from stoa's autopilot/prepush_refs.py, itself ported from roam-code's
+from prakteon's autopilot/prepush_refs.py, itself ported from roam-code's
 scripts/prepush_refs.py). Reads git's pre-push stdin ref-update stream via
 --pre-push-updates (the authoritative source: local/remote ref + oid per
 updated ref, including the first-push-of-a-new-branch case where the remote

@@ -8,7 +8,15 @@ venv/
 .roam/
 internal/
 .claude/
+# Platform worktree scratch. Both names are listed on purpose: the platform is
+# being renamed stoa -> prakteon, and the tooling that CREATES these directories
+# (its swarm and bootstrap scripts) lives outside this repository. Dropping the
+# old name here before that tooling is renamed would stop ignoring directories
+# that are still being created, and they would surface in `git status` on a
+# checkout the platform is driving. Remove `.stoa/` once the platform side no
+# longer writes it.
 .stoa/
+.prakteon/
 # Tool state that was never ignored here, so `git add .` after a tox run or a
 # cache-writing linter staged the whole tree -- including any pip.conf inside
 # it. scripts/secret_scan.py declines to open these directories and

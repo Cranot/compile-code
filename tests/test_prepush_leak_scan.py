@@ -8,7 +8,7 @@ to either -- the final tree is clean -- but the earlier commit's blob still
 reaches the remote the moment the push completes, and purging history
 afterwards does not un-publish it (it may already be cloned, cached, or
 indexed). This is the exact shape that forced a history purge for a
-customer-name leak elsewhere in this project's toolchain (roam-code / stoa's
+customer-name leak elsewhere in this project's toolchain (roam-code / prakteon's
 ROADMAP 4.3); scripts/prepush_leak_scan.py closes the same gap here by
 scanning the exact pushed commit range instead of the working tree.
 
