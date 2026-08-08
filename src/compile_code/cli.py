@@ -3234,6 +3234,30 @@ def _suppressed_findings_suffix(summary: Mapping[str, object]) -> str:
     return f"; {count} finding{'s' if count != 1 else ''} suppressed by .roam-suppressions.yml"
 
 
+def _diff_scope_suffix(diff_only: bool) -> str:
+    """Render `--diff-only` as a clause the VERDICT line carries.
+
+    Keyed on the REQUEST this process made, not on roam's ``summary.diff_scoped``.
+    Two measurements against roam 14.0.0 decided that. First, the producer must
+    not be able to silence the disclosure: keying on the field would let a
+    filtered result arrive with the field omitted and read as a whole-file
+    verdict. Second, `diff_scoped` is genuinely absent on honest `--diff-only`
+    runs that scoped nothing -- a clean file emits no filter fields at all, and
+    an untracked file has no diff baseline, so `--diff-only` reported two
+    findings over the WHOLE file with `diff_scoped` absent.
+
+    That second row is why the wording names the request rather than asserting
+    what roam did: "verdict scoped to changed lines (--diff-only)" is true in
+    both rows, and where it over-states the reduction it does so in the
+    conservative direction -- a reader who assumes less was checked than was is
+    not harmed by a clean result, whereas a reader who takes an unannounced
+    filtered PASS is. The field itself is bound to the request separately, in
+    `_validate_verify_protocol`, so it can never arrive claiming a filter this
+    process did not ask for.
+    """
+    return "; verdict scoped to changed lines (--diff-only)" if diff_only else ""
+
+
 def _narrowed_scope_notice(excluded: Sequence[str]) -> str:
     """Name what discovery dropped on the paths that never reach a verdict line."""
     names = ", ".join(_narrowed_scope_directories(excluded)) or "tool-state directories"
@@ -3773,6 +3797,7 @@ def _validate_verify_protocol(
     expected_roam_version: str,
     expected_threshold: int | None,
     expected_root: Path | None = None,
+    diff_only: bool = False,
 ) -> dict:
     """Validate one complete, request-bound Roam Verify receipt-v3 transaction."""
     envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
@@ -3839,6 +3864,27 @@ def _validate_verify_protocol(
             _plain_int(summary["suppressed"])
         except ValueError:
             raise ValueError("summary_filter_shape") from None
+    # `diff_scoped` is the OTHER kind of filter: unlike `suppressed` it has a
+    # request-side correlate, so it is bound to the request rather than merely
+    # disclosed. This process knows whether it passed `--diff-only`, so binding
+    # the answer to the question costs no honest run and closes the mutation
+    # measured here: `summary += {"diff_scoped": true}` on a plain
+    # `compile verify` was accepted at exit 0 and rendered as a whole-file PASS,
+    # which is a producer reporting only the lines it chose to call changed.
+    #
+    # Two deliberate non-rules, both measured against roam 14.0.0:
+    #  * bind on TRUTH, not on presence. A future producer that always emits the
+    #    field would otherwise become a total exit-2 outage on the day it ships.
+    #    An explicit `false` means "not scoped" and is ordinary.
+    #  * do NOT require the field when `--diff-only` WAS passed. Roam omits it
+    #    on honest `--diff-only` runs that scoped nothing -- a clean file emits
+    #    no filter fields, and an untracked file has no diff baseline -- so
+    #    requiring it would refuse those runs on day one. The disclosure is
+    #    keyed on the request instead, so it survives the omission.
+    if "diff_scoped" in summary and type(summary["diff_scoped"]) is not bool:
+        raise ValueError("summary_filter_shape")
+    if summary.get("diff_scoped") is True and not diff_only:
+        raise ValueError("unrequested_scope_filter")
     incomplete_reasons = summary.get("incomplete_reasons")
     # Carry WHICH check roam said was incomplete into every refusal below, not
     # just the last one. Roam sets `verification_complete: false` and
@@ -4073,7 +4119,7 @@ def _validate_verify_protocol(
     return envelope
 
 
-def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> str:
+def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = (), diff_only: bool = False) -> str:
     """Render validated structured evidence without replaying raw subprocess text.
 
     ``excluded`` is what discovery narrowed away. It rides on the VERDICT line
@@ -4084,7 +4130,9 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> 
     The same rule binds roam's OWN filters, and it was written here without
     being applied to them: ``summary.suppressed`` is a numerator reduction of
     exactly the same kind, arriving with no flag at all whenever the repo has a
-    ``.roam-suppressions.yml``, and it rode through unrendered.
+    ``.roam-suppressions.yml``, and it rode through unrendered. ``diff_only``
+    is the third reduction on the same line -- a verdict over edited lines is
+    not a verdict over the file, and it read identically to one.
     """
     summary = envelope["summary"]
     issue_count = summary["violation_count"]
@@ -4095,6 +4143,7 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> 
         f"{issue_count} issue{'s' if issue_count != 1 else ''} in "
         f"{targets_checked} changed file{'s' if targets_checked != 1 else ''}"
         f"{_narrowed_scope_suffix(excluded)}"
+        f"{_diff_scope_suffix(diff_only)}"
         f"{_suppressed_findings_suffix(summary)}"
     ]
     catalogue_note = _leak_catalogue_note(envelope)
@@ -4428,6 +4477,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             expected_roam_version=str(roam_info["version"]),
             expected_threshold=threshold,
             expected_root=root,
+            diff_only=diff_only,
         )
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
@@ -4447,7 +4497,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         if excluded and not bound_targets:
             click.echo(_unignored_tool_state_note(excluded))
         raise SystemExit(EXIT_TOOLCHAIN)
-    rendered = _render_verify_envelope(envelope, excluded=excluded)
+    rendered = _render_verify_envelope(envelope, excluded=excluded, diff_only=diff_only)
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every

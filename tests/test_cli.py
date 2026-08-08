@@ -2237,7 +2237,13 @@ class TestVerifyReceiptV3Protocol:
         rc: int = 0,
         expected: dict[str, object] | None = None,
         root: Path | None = None,
+        diff_only: bool = False,
     ):
+        # `diff_only` is forwarded only when it is set, so the default path
+        # stays callable against a build that predates the parameter. That is
+        # what makes the fail-before for the request bind an assertion failure
+        # rather than a TypeError about the fix's own signature.
+        requested = {"diff_only": True} if diff_only else {}
         return mod._validate_verify_protocol(
             raw,
             returncode=rc,
@@ -2245,6 +2251,7 @@ class TestVerifyReceiptV3Protocol:
             expected_roam_version=mod.MIN_ROAM_VERSION,
             expected_threshold=70,
             expected_root=root,
+            **requested,
         )
 
     def test_accepts_one_complete_bound_receipt(self):
@@ -3166,6 +3173,85 @@ class TestVerifyReceiptV3Protocol:
             envelope = _verify_envelope()
             envelope["summary"]["suppressed"] = count
             assert self._validate(json.dumps(envelope)) == envelope
+
+    def test_a_verdict_scoped_to_edited_lines_says_so_on_the_verdict_line(self):
+        # Measured against roam 14.0.0 through a pass-through shim: the same
+        # two-file scope renders `PASS (score 94/100) -- 3 issues` by default
+        # and `PASS (score 100/100) -- 0 issues` under `--diff-only`, because
+        # the three broad-except findings sit on lines the edit did not touch.
+        # The envelope carries `diff_scoped: true`; the render carried nothing,
+        # so a verdict over edited lines read exactly like a verdict over the
+        # files.
+        rendered = mod._render_verify_envelope(_verify_envelope(), diff_only=True)
+
+        verdict_line = rendered.splitlines()[0]
+        assert verdict_line.startswith("VERDICT: PASS")
+        assert "verdict scoped to changed lines (--diff-only)" in verdict_line
+
+    def test_the_diff_scope_clause_is_keyed_on_the_request_not_the_producers_claim(self):
+        # Two measurements decided this, and they pull in opposite directions.
+        # A producer must not be able to silence the disclosure by omitting the
+        # field while still filtering -- so the clause cannot be keyed on
+        # `summary.diff_scoped`. And roam legitimately OMITS that field on
+        # `--diff-only` runs that scoped nothing (a clean file emits no filter
+        # fields; an untracked file has no diff baseline and reported two
+        # findings over the whole file with the key absent) -- so requiring the
+        # field would refuse honest runs. Keying the sentence on the request
+        # satisfies both: it is true in every row and no producer can suppress
+        # it.
+        envelope = _verify_envelope()
+        assert "diff_scoped" not in envelope["summary"]
+
+        assert "changed lines" in mod._render_verify_envelope(envelope, diff_only=True)
+        assert "changed lines" not in mod._render_verify_envelope(envelope, diff_only=False)
+
+    def test_a_scope_filter_this_process_never_requested_is_refused(self):
+        # `diff_scoped` differs from `suppressed` in exactly the way that
+        # decides the treatment: it HAS a request-side correlate. This process
+        # knows whether it passed `--diff-only`, so binding the answer to the
+        # question costs no honest run. Before this, injecting the field into a
+        # plain `compile verify` was accepted at exit 0 and rendered as an
+        # unqualified whole-file PASS.
+        envelope = _verify_envelope()
+        envelope["summary"]["diff_scoped"] = True
+
+        with pytest.raises(ValueError, match="unrequested_scope_filter"):
+            self._validate(json.dumps(envelope))
+
+        assert self._validate(json.dumps(envelope), diff_only=True) == envelope
+
+    def test_the_scope_filter_is_bound_on_truth_not_on_presence(self):
+        # Refusing the mere presence of the key would pass every test today --
+        # roam 14.0.0 omits it rather than emitting `false` -- and become a
+        # total exit-2 outage the first time a producer reports the field
+        # unconditionally. An explicit `false` means "not scoped" and is
+        # ordinary output in both directions.
+        envelope = _verify_envelope()
+        envelope["summary"]["diff_scoped"] = False
+
+        assert self._validate(json.dumps(envelope)) == envelope
+        assert self._validate(json.dumps(envelope), diff_only=True) == envelope
+
+    def test_a_requested_diff_scope_never_requires_the_field_to_be_present(self):
+        # Roam omits `diff_scoped` on `--diff-only` runs where it applied no
+        # line scoping. Both measured honest cases are here in spirit: a file
+        # with no violations, and an untracked file with no diff baseline.
+        # Requiring the field would refuse them on day one.
+        envelope = _verify_envelope()
+        assert "diff_scoped" not in envelope["summary"]
+
+        assert self._validate(json.dumps(envelope), diff_only=True) == envelope
+
+    @pytest.mark.parametrize("value", ["true", 1, {"scoped": True}, [], "yes"])
+    def test_a_scope_flag_that_is_not_a_boolean_is_refused(self, value):
+        # Accepting a field means accepting its shape, and a truthy non-bool
+        # would otherwise slip past the request bind on a plain `compile
+        # verify`. Measured: `diff_scoped: "yes"` was accepted at exit 0.
+        envelope = _verify_envelope()
+        envelope["summary"]["diff_scoped"] = value
+
+        with pytest.raises(ValueError, match="summary_filter_shape"):
+            self._validate(json.dumps(envelope), diff_only=True)
 
     def test_the_narrowing_clause_names_only_fixed_directory_names(self):
         # Discovered paths are filesystem-supplied text; only names drawn from
