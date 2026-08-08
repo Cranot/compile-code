@@ -3506,14 +3506,27 @@ def _plain_int(value: object, *, minimum: int = 0, maximum: int | None = None) -
     return value
 
 
-def _validate_finding(finding: object, *, expected_root: Path | None = None) -> dict:
+def _validate_finding(
+    finding: object,
+    *,
+    expected_root: Path | None = None,
+    allowed_categories: frozenset[str] = _VERIFY_CATEGORY_NAMES,
+) -> dict:
+    """Validate one finding, binding its category to the roster the envelope declared.
+
+    *allowed_categories* is this build's fixed roster widened by whatever extra
+    categories the SAME envelope declared in its `categories` mapping -- never
+    free-form. A finding may only name a detector the producer also declared
+    and ran, so a newer roam's findings are read rather than dropped, and a
+    finding in a category nobody declared is still refused.
+    """
     if not isinstance(finding, dict):
         raise ValueError("invalid_finding")
     severity = finding.get("severity")
     category = finding.get("category")
     file_path = finding.get("file")
     message = finding.get("message", "")
-    if severity not in _VERIFY_FINDING_SEVERITIES or category not in _VERIFY_CATEGORY_NAMES:
+    if severity not in _VERIFY_FINDING_SEVERITIES or category not in allowed_categories:
         raise ValueError("invalid_finding_severity")
     for value, limit in ((category, 128), (file_path, 4096), (message, 4096)):
         if not isinstance(value, str) or len(value) > limit or any(ord(char) < 32 for char in value):
@@ -3581,6 +3594,34 @@ def _require_known_shape(
 def _disclosable_field_name(name: object) -> str:
     """Render one producer-supplied field name safely inside a verdict block."""
     return name if isinstance(name, str) and _SAFE_FIELD_NAME.fullmatch(name) else "<unprintable>"
+
+
+def _extra_category_names(categories: Mapping[str, object], known: frozenset[str]) -> frozenset[str]:
+    """Categories a newer producer declared beyond *known*, refusing unrenderable names.
+
+    A missing known category and an extra unknown one are different events, the
+    same way they are for `_require_known_shape`: a missing gate is something
+    this build depends on going absent, an extra one is a producer that is
+    NEWER. Adding a detector is the most frequently exercised extension point
+    roam has -- 11 new category names in five weeks of its own history -- and
+    an exact set equality made every one of them a total verify outage.
+
+    The extras are NOT waved through: each is validated by the same category
+    rules as a known one, its findings enter the evidence multiset and the
+    FAIL floor, and the name itself must be renderable, because it reaches the
+    verdict block as a section heading and as a `checks:` entry. That last
+    check refuses more than today's equality did in one direction: a producer
+    cannot introduce a category whose name would inject text into the verdict.
+    """
+    extra = frozenset(categories) - known
+    unsafe = sorted(
+        _disclosable_field_name(name)
+        for name in extra
+        if not isinstance(name, str) or not _SAFE_FIELD_NAME.fullmatch(name)
+    )
+    if unsafe:
+        raise ValueError("unknown_category: " + ", ".join(unsafe))
+    return extra
 
 
 def _named_incomplete_checks(reasons: object) -> str:
@@ -3833,9 +3874,15 @@ def _validate_verify_protocol(
             or summary.get("state") != "no_changes"
             or summary.get("checks_run") != []
             or "verification_receipt" in summary
-            or set(categories) != _VERIFY_NO_CHANGES_CATEGORY_NAMES
+            or not _VERIFY_NO_CHANGES_CATEGORY_NAMES <= frozenset(categories)
         ):
             raise ValueError("no_changes_contract")
+        # A floor, not an equality, for the same reason as the changed-file
+        # branch below: a repo with nothing to check is the most common verify
+        # there is, and one new roam detector must not take it dark. Extra
+        # names buy nothing here -- the loop that follows pins every category,
+        # known or not, to score 100 and an empty violation list.
+        _extra_category_names(categories, _VERIFY_NO_CHANGES_CATEGORY_NAMES)
         for category_name, result in categories.items():
             expected_keys = (
                 _VERIFY_NO_CHANGES_VERIFICATION_KEYS
@@ -3859,8 +3906,23 @@ def _validate_verify_protocol(
                 raise ValueError("no_changes_category")
         return envelope
 
-    if set(categories) != _VERIFY_CATEGORY_NAMES:
+    # A FLOOR, not an equality. Every gate this build knows about must still be
+    # present -- a missing one is a check that did not run, and that stays a
+    # refusal. What is no longer refused is a category this build has not heard
+    # of: adding a detector is roam's most frequently exercised extension point
+    # (11 new category names in five weeks of its own history), and an exact
+    # set equality made each one a total verify outage on a producer that was
+    # working correctly. The extras are not ignored, which is the part that
+    # matters here: ignoring them would drop a new detector's FAIL findings on
+    # the floor and render a failing tree as PASS. They go through the same
+    # shape, completeness and counting rules as every known category below,
+    # their findings enter `category_findings` -- so the evidence multiset and
+    # the FAIL floor both see them -- and their names are bound to what the
+    # producer declared, never free-form.
+    if not _VERIFY_CATEGORY_NAMES <= frozenset(categories):
         raise ValueError("category_enum")
+    extra_categories = _extra_category_names(categories, _VERIFY_CATEGORY_NAMES)
+    declared_categories = _VERIFY_CATEGORY_NAMES | extra_categories
     verification_category = categories.get("verification")
     if not isinstance(verification_category, dict):
         raise ValueError("verification_category")
@@ -3877,7 +3939,10 @@ def _validate_verify_protocol(
         or verification_category.get("violations") != []
     ):
         raise ValueError("verification_category")
-    top_level_findings = [_validate_finding(finding, expected_root=expected_root) for finding in violations]
+    top_level_findings = [
+        _validate_finding(finding, expected_root=expected_root, allowed_categories=declared_categories)
+        for finding in violations
+    ]
     category_findings: list[dict] = []
     for category_name, result in categories.items():
         if not isinstance(category_name, str) or not category_name or not isinstance(result, dict):
@@ -3915,11 +3980,14 @@ def _validate_verify_protocol(
             or ("timed_out" in result and result["timed_out"] is not False)
             or ("capped" in result and result["capped"] is not False)
         ):
-            # `category_name` is drawn from the fixed set checked above, so
-            # naming it here carries no producer text into the verdict.
-            raise ValueError(f"category_incomplete: {category_name}")
+            # `category_name` is no longer drawn from a fixed set -- a newer
+            # producer's own detector name can reach here -- so it goes through
+            # the same safe filter as every other disclosed name. Extras are
+            # already `_SAFE_FIELD_NAME`-bound above; this keeps that the
+            # rendering rule rather than a fact one has to go and re-derive.
+            raise ValueError(f"category_incomplete: {_disclosable_field_name(category_name)}")
         for finding in nested:
-            validated = _validate_finding(finding, expected_root=expected_root)
+            validated = _validate_finding(finding, expected_root=expected_root, allowed_categories=declared_categories)
             if validated.get("category") != category_name:
                 raise ValueError("category_finding_contradiction")
             category_findings.append(validated)
@@ -3929,6 +3997,15 @@ def _validate_verify_protocol(
     has_fail = any(finding.get("severity") == "FAIL" for finding in evidence_findings)
 
     checks_run = summary.get("checks_run")
+    # The check roster widens with the category roster or not at all. A new
+    # detector arrives as a new category AND a new `checks_run` entry, so
+    # widening only the category equality converts a `category_enum` outage
+    # into a `completion_binding` one -- measured, not assumed. This grants no
+    # free-form name: `extra_categories` is exactly what the same envelope
+    # declared under `categories`, and `missing_category` below independently
+    # requires every run check to have a category, so a producer cannot invent
+    # a check it did not also declare and gate.
+    allowed_checks = _VERIFY_CHECK_NAMES | extra_categories
     quality_band = "PASS" if score >= 80 else "WARN" if score >= 60 else "FAIL"
     index_refresh = summary.get("index_refresh")
     if (
@@ -3946,7 +4023,7 @@ def _validate_verify_protocol(
         or not isinstance(checks_run, list)
         or not checks_run
         or any(not isinstance(check, str) or not check for check in checks_run)
-        or any(check not in _VERIFY_CHECK_NAMES for check in checks_run)
+        or any(check not in allowed_checks for check in checks_run)
         or len(set(checks_run)) != len(checks_run)
     ):
         raise ValueError("completion_binding")
@@ -4214,6 +4291,19 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
             "must not buy a pass, so this is refused rather than ignored and disclosed like other unknown "
             "fields. If that field is neutral, this build is too old to know it. "
             "Fix: python -m pip install --upgrade compile-code"
+        )
+    if reason == "unknown_category":
+        # Reached only by a name that cannot be safely rendered: a newer roam's
+        # own detector categories are accepted and gated, not refused, so this
+        # is never the "your compile-code is too old" case and must not read
+        # like one. The colliding name is deliberately not echoed -- it is
+        # unrenderable, which is the whole reason it is here.
+        return (
+            f"VERDICT: verifier protocol failure: receipt field/reason {reason}; "
+            f"scope target indices {indices}; executable `{executable}` declared a check category whose NAME "
+            "cannot be safely rendered inside a verdict block, so the receipt was refused rather than printed. "
+            "A category this build has never heard of is otherwise read and gated like any other; only the name "
+            f'is the problem here. Fix: python -m pip install --upgrade "{ROAM_PACKAGE_REQUIREMENT}"'
         )
     if reason in {"verification_incomplete", "category_incomplete"}:
         # Roam ran to completion and said so; what it withheld is evidence, not

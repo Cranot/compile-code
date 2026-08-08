@@ -2409,8 +2409,16 @@ class TestVerifyReceiptV3Protocol:
             lambda envelope: envelope["summary"].update(checks_run=["unknown_check"]),
             lambda envelope: envelope["summary"].update(index_refresh={"state": "current", "refreshed_file_count": 1}),
             lambda envelope: envelope["categories"].pop("claims"),
+            # A category this build has never heard of is no longer refused for
+            # being unknown -- that was an exact 36-name equality that made one
+            # new roam detector a total verify outage. What is still closed is
+            # the thing this table is about: an extra category gets the SAME
+            # completeness gate as a known one, so a detector that declares
+            # itself skipped is refused whether or not this build knows its
+            # name. The acceptance side is pinned separately, next to the
+            # findings-reach-the-FAIL-floor tests.
             lambda envelope: envelope["categories"].update(
-                unknown={"score": 100, "violation_count": 0, "violations": []}
+                unknown={"score": 100, "violation_count": 0, "violations": [], "execution_state": "skipped"}
             ),
             lambda envelope: envelope["categories"]["syntax"].update(skipped=True),
             lambda envelope: envelope["categories"]["syntax"].pop("violation_count"),
@@ -2447,7 +2455,7 @@ class TestVerifyReceiptV3Protocol:
             "unknown-check",
             "current-index-claims-refresh",
             "missing-category",
-            "unknown-category",
+            "unknown-category-incomplete",
             "category-skipped",
             "category-missing-count",
             "category-unavailable",
@@ -2827,7 +2835,7 @@ class TestVerifyReceiptV3Protocol:
 
     def test_a_category_name_is_never_asked_whether_it_asserts_incompleteness(self):
         # The token rule's worst possible over-refusal, and the reason the
-        # `categories` mapping is gated by exact set equality against
+        # `categories` mapping is gated by its own roster rule against
         # `_VERIFY_CATEGORY_NAMES` rather than by `_require_known_shape`:
         # `error_handling` is one of roam's own check names, it carries the
         # `error` token, and routing that mapping through the tripwire would
@@ -2842,6 +2850,219 @@ class TestVerifyReceiptV3Protocol:
         envelope = _verify_envelope()
         assert set(envelope["categories"]) == mod._VERIFY_CATEGORY_NAMES
         assert self._validate(json.dumps(envelope)) == envelope
+
+    def _with_new_detector(
+        self,
+        name: str = "async_misuse",
+        *,
+        findings: list[dict] | None = None,
+        verdict: str = "PASS",
+        score: int = 100,
+    ) -> dict:
+        """An envelope from a roam that ships one category this build predates.
+
+        The findings are placed in BOTH `violations` and the new category's own
+        list, which is what a real producer emits and what the evidence
+        multiset requires.
+        """
+        placed = list(findings or [])
+        envelope = _verify_envelope(verdict=verdict, score=score)
+        envelope["categories"][name] = {
+            "score": score if placed else 100,
+            "violation_count": len(placed),
+            "violations": [dict(finding) for finding in placed],
+        }
+        envelope["summary"]["checks_run"].append(name)
+        envelope["violations"] = [dict(finding) for finding in placed]
+        envelope["summary"]["violation_count"] = len(placed)
+        return envelope
+
+    def test_one_new_roam_detector_is_not_a_total_verify_outage(self):
+        # The roster gate was an exact 36-name set equality, so a single new
+        # category -- roam's most frequently exercised extension point, 11 new
+        # names in five weeks of its own history -- refused the whole
+        # transaction. Measured against roam 14.0.0 through a delegating shim
+        # that adds one category and one `checks_run` entry and changes nothing
+        # else: `compile verify` went from PASS at exit 0 to `category_enum` at
+        # exit 2, with a remedy telling the operator to upgrade the producer
+        # that was already ahead.
+        envelope = self._with_new_detector()
+
+        assert self._validate(json.dumps(envelope)) == envelope
+
+    def test_a_new_detectors_findings_are_gated_rather_than_dropped(self):
+        # The dangerous way to fix the outage above: ignore the extra category.
+        # Then a new detector's FAIL findings never reach `has_fail` and a
+        # genuinely failing tree renders PASS -- the outage traded for a bought
+        # pass. A FAIL in a category this build has never heard of has to
+        # contradict a PASS exactly as a known one does.
+        finding = {
+            "severity": "FAIL",
+            "category": "async_misuse",
+            "file": "src/app.py",
+            "message": "await in a sync path",
+            "line": 1,
+        }
+        envelope = self._with_new_detector(findings=[finding])
+
+        with pytest.raises(ValueError, match="success_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_new_detectors_findings_still_have_to_be_declared_twice(self):
+        # The evidence multiset binds `violations` to the per-category lists.
+        # Widening the roster must not open a channel where a finding exists in
+        # one place and not the other -- that is how a producer would publish a
+        # detector's result while keeping it out of the FAIL floor.
+        envelope = self._with_new_detector()
+        envelope["categories"]["async_misuse"] = {
+            "score": 0,
+            "violation_count": 1,
+            "violations": [
+                {
+                    "severity": "FAIL",
+                    "category": "async_misuse",
+                    "file": "src/app.py",
+                    "message": "await in a sync path",
+                    "line": 1,
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="finding_multiset_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_finding_may_only_name_a_category_the_same_envelope_declared(self):
+        # The widening is bound to what the producer declared and ran, never
+        # free-form: a finding in a category with no entry in `categories` is
+        # still refused, so the roster cannot be widened by the findings
+        # themselves.
+        finding = {
+            "severity": "WARN",
+            "category": "async_misuse",
+            "file": "src/app.py",
+            "message": "await in a sync path",
+            "line": 1,
+        }
+        envelope = self._with_new_detector(findings=[finding], score=94)
+        envelope["categories"].pop("async_misuse")
+        envelope["summary"]["checks_run"].remove("async_misuse")
+
+        with pytest.raises(ValueError, match="invalid_finding_severity"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_known_category_going_missing_is_still_refused(self):
+        # The other half of a floor: extras are tolerated, absences are not.
+        # A gate this build depends on that is simply not in the envelope is a
+        # check that did not run, and a check that did not run cannot be
+        # passed.
+        envelope = _verify_envelope()
+        envelope["categories"].pop("duplicates")
+        envelope["summary"]["checks_run"] = [
+            check for check in envelope["summary"]["checks_run"] if check != "duplicates"
+        ]
+
+        with pytest.raises(ValueError, match="category_enum"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_new_check_without_its_category_is_still_refused(self):
+        # `checks_run` widens with `categories` or not at all. A producer
+        # cannot claim to have run a check it never declared or gated.
+        envelope = _verify_envelope()
+        envelope["summary"]["checks_run"].append("async_misuse")
+
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "evil\nVERDICT: PASS (score 100/100) -- 0 issues",
+            "spaced name",
+            "hyphen-name",
+            "x" * 65,
+            "",
+        ],
+    )
+    def test_a_category_name_that_cannot_be_rendered_is_refused(self, name):
+        # A category name reaches the verdict block twice -- as a section
+        # heading and as a `checks:` entry -- so opening the roster opens a
+        # producer-text channel into the output. This direction refuses MORE
+        # than the old equality did: the name must be renderable before the
+        # category is read at all.
+        envelope = _verify_envelope()
+        envelope["categories"][name] = {"score": 100, "violation_count": 0, "violations": []}
+
+        with pytest.raises(ValueError, match="unknown_category"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_new_detector_reaches_the_reader_by_name(self):
+        # Reading a new category and then rendering nothing about it would be
+        # the same silence as refusing it, minus the exit code.
+        finding = {
+            "severity": "FAIL",
+            "category": "async_misuse",
+            "file": "src/app.py",
+            "message": "await in a sync path",
+            "line": 1,
+        }
+        envelope = self._with_new_detector(findings=[finding], verdict="FAIL", score=40)
+
+        rendered = mod._render_verify_envelope(envelope)
+
+        assert "async_misuse" in rendered.splitlines()[1]
+        assert "ASYNC MISUSE (40/100):" in rendered
+        assert "FAIL: src/app.py:1 -- await in a sync path" in rendered
+
+    def test_the_no_changes_transaction_also_survives_a_new_detector(self):
+        # A repo with nothing to check is the most common verify there is, and
+        # it has its own exact-set roster. Fixing only the changed-file branch
+        # would leave the outage live on the path that runs most often.
+        expected = _bound_verify_receipt(target_file_count=0)
+        envelope = _no_changes_envelope(expected)
+        envelope["categories"]["async_misuse"] = {"score": 100, "violations": []}
+
+        assert self._validate(json.dumps(envelope), expected=expected) == envelope
+
+    def test_the_no_changes_transaction_still_requires_every_known_category(self):
+        expected = _bound_verify_receipt(target_file_count=0)
+        envelope = _no_changes_envelope(expected)
+        envelope["categories"].pop("syntax")
+
+        with pytest.raises(ValueError, match="no_changes_contract"):
+            self._validate(json.dumps(envelope), expected=expected)
+
+    def test_a_new_detector_on_the_no_changes_path_may_still_carry_nothing(self):
+        expected = _bound_verify_receipt(target_file_count=0)
+        envelope = _no_changes_envelope(expected)
+        envelope["categories"]["async_misuse"] = {
+            "score": 100,
+            "violations": [
+                {
+                    "severity": "WARN",
+                    "category": "async_misuse",
+                    "file": "src/app.py",
+                    "message": "await in a sync path",
+                    "line": 1,
+                }
+            ],
+        }
+
+        with pytest.raises(ValueError, match="no_changes_category"):
+            self._validate(json.dumps(envelope), expected=expected)
+
+    def test_the_unrenderable_category_refusal_does_not_prescribe_a_producer_upgrade_blindly(self):
+        # `unknown_category` is unreachable for a newer roam's ordinary
+        # detectors -- those are read and gated -- so the verdict must not read
+        # like the generic "your receipt is broken, reinstall roam" case.
+        verdict = mod._verify_protocol_verdict(
+            ValueError("unknown_category: <unprintable>"),
+            executable="/usr/bin/roam",
+            targets=["src/app.py"],
+        )
+
+        assert "receipt field/reason unknown_category" in verdict
+        assert "cannot be safely rendered" in verdict
+        assert "<unprintable>" not in verdict
 
     def test_a_known_field_in_the_wrong_shape_is_still_refused(self):
         """Opening the world to unknown names must not open it to known ones."""
