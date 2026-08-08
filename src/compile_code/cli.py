@@ -3808,9 +3808,16 @@ def _validate_verify_protocol(
         # is a contradiction. There used to be a fifth rule -- a PASS could
         # carry WARN findings only in seven hard-coded category names -- and it
         # was a claim about roam that roam does not make: its verdict is
-        # `score >= 80` and nothing else, and which categories are advisory is
-        # DECLARED per category in the envelope rather than fixed in a list
-        # here. Both verdict floors that can override the band trigger on
+        # `score >= 80` and nothing else, so no category name enters it. An
+        # earlier version of this comment said advisory-ness is DECLARED per
+        # category in the envelope; that is false as measured -- roam sets an
+        # `advisory` flag on individual checks internally, but the per-category
+        # summary it emits is a strict allowlist whose key set is exactly
+        # `score`, `violation_count`, `violations`, and the string "advisory"
+        # appears nowhere in a real envelope. The deletion never rested on that
+        # claim, which is the only reason correcting it changes no behaviour:
+        # it rests on the verdict arithmetic above and on the floors below.
+        # Both verdict floors that can override the band trigger on
         # FAIL-severity findings only, so a roam that skipped one still emits a
         # FAIL finding and is caught by `has_fail`. What the rule actually did
         # was refuse ordinary output: a file containing nothing but

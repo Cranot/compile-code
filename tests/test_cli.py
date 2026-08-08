@@ -4370,3 +4370,91 @@ class TestUnsupportedRoamIsRefusedByEveryAssuranceVerb:
 
         assert ran, f"{argv} is exempt by decision and must keep working on an unsupported roam"
         assert "toolchain version mismatch" not in result.output
+
+
+class TestTheVerdictArithmeticIsPinnedAtItsBoundaries:
+    """The two constants that decide PASS/FAIL, pinned where they actually differ.
+
+    Mutation testing found both of these survive the entire suite: deleting
+    `score < threshold` from the success arm, and moving the PASS band from 80
+    to 85. Neither is exotic -- they are the arithmetic the verdict IS. They
+    survived because every fixture scores 100, where `>= 80` and `>= 85` agree
+    and no requested threshold is ever missed, so hundreds of assertions ran
+    through the band logic without once landing on a value that could tell two
+    versions of it apart. A rule is only pinned at the inputs where changing it
+    changes the answer.
+    """
+
+    @staticmethod
+    def _envelope(*, score: int, threshold: int, verdict: str, band: str | None = None) -> dict[str, object]:
+        envelope = _verify_envelope(verdict=verdict, score=score, threshold=threshold)
+        if band is not None:
+            envelope["summary"]["quality_band"] = band
+        return envelope
+
+    @staticmethod
+    def _run(envelope: dict[str, object], *, rc: int, threshold: int):
+        return mod._validate_verify_protocol(
+            json.dumps(envelope),
+            returncode=rc,
+            expected_receipt=_bound_verify_receipt(),
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            expected_threshold=threshold,
+            expected_root=None,
+        )
+
+    # --- the band constants, accepted exactly at the edge ---------------------
+
+    @pytest.mark.parametrize(
+        ("score", "threshold", "verdict", "rc"),
+        [
+            (80, 70, "PASS", 0),
+            (79, 70, "WARN", 0),
+            (60, 60, "WARN", 0),
+            (59, 70, "FAIL", mod.EXIT_VERIFY_GATE),
+        ],
+        ids=["pass-floor-80", "just-below-80", "warn-floor-60", "just-below-60"],
+    )
+    def test_a_correct_band_at_each_edge_is_accepted(self, score, threshold, verdict, rc):
+        # Moving either constant in either direction breaks one of these four:
+        # the band recomputed here stops matching the one roam declared, and a
+        # correct transaction is refused as `completion_binding`.
+        envelope = self._envelope(score=score, threshold=threshold, verdict=verdict)
+        assert self._run(envelope, rc=rc, threshold=threshold) == envelope
+
+    @pytest.mark.parametrize(
+        ("score", "threshold", "verdict", "band", "rc"),
+        [
+            (80, 70, "PASS", "WARN", 0),
+            (79, 70, "WARN", "PASS", 0),
+            (60, 60, "WARN", "FAIL", 0),
+            (59, 70, "FAIL", "WARN", mod.EXIT_VERIFY_GATE),
+        ],
+        ids=["80-called-warn", "79-called-pass", "60-called-fail", "59-called-warn"],
+    )
+    def test_a_band_that_disagrees_with_the_score_is_refused(self, score, threshold, verdict, band, rc):
+        # The other direction: the check must still FIRE at the edge, not merely
+        # agree there. A producer whose band and score disagree by one point is
+        # the exact case a boundary-blind suite would wave through.
+        envelope = self._envelope(score=score, threshold=threshold, verdict=verdict, band=band)
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._run(envelope, rc=rc, threshold=threshold)
+
+    # --- the requested threshold ---------------------------------------------
+
+    def test_a_pass_below_the_threshold_this_process_requested_is_refused(self):
+        # Isolates `score < threshold` from every neighbouring rule: the band is
+        # correct (85 is a genuine PASS band), the verdict agrees with it, the
+        # exit code is 0 and no finding is FAIL. The ONLY thing wrong is that
+        # the caller asked for 90 and got 85 -- so if this arm is deleted, this
+        # is the assertion that notices.
+        envelope = self._envelope(score=85, threshold=90, verdict="PASS")
+        assert envelope["summary"]["quality_band"] == "PASS"
+        with pytest.raises(ValueError, match="success_contradiction"):
+            self._run(envelope, rc=0, threshold=90)
+
+    def test_a_pass_exactly_at_the_requested_threshold_is_accepted(self):
+        # The boundary is inclusive, and saying so is what stops the fix for the
+        # case above from being an off-by-one that refuses a correct run.
+        envelope = self._envelope(score=90, threshold=90, verdict="PASS")
+        assert self._run(envelope, rc=0, threshold=90) == envelope

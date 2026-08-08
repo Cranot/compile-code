@@ -233,9 +233,9 @@ PREFETCHED ANSWERS (do not re-run the tools that produced these):
     - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1247',
        'edge': 'call', 'call_line': 'if _require_index():',
        'call_location': 'src/compile_code/cli.py:1256'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4188', 'edge': 'call',
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:4195', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:4198'}
+       'call_location': 'src/compile_code/cli.py:4205'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
