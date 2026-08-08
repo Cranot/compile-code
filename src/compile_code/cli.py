@@ -2606,9 +2606,11 @@ _VERIFY_CHECK_NAMES = frozenset(
     }
 )
 _VERIFY_CATEGORY_NAMES = _VERIFY_CHECK_NAMES | {"verification"}
-_VERIFY_PASS_ADVISORY_CATEGORIES = frozenset(
-    {"n1", "over_fetch", "dead", "magic_numbers", "llm_smells", "test_hermeticity", "smells"}
-)
+# There is deliberately no hand-copied "categories allowed to WARN on a PASS"
+# set here. Roam declares advisory-ness per category in the envelope it sends,
+# and derives its verdict from the score alone; a local copy of that judgement
+# was stale by construction and refused normal output. See the PASS branch of
+# `_validate_verify_protocol`.
 _VERIFY_NO_CHANGES_CATEGORY_NAMES = frozenset(
     {
         "naming",
@@ -3799,13 +3801,25 @@ def _validate_verify_protocol(
         if check not in categories:
             raise ValueError("missing_category")
     if verdict in {"PASS", "WARN"}:
+        # A PASS is pinned by four independently re-derived facts, all above:
+        # exit 0, score >= the threshold this process requested, no FAIL
+        # finding anywhere in the evidence, and roam's own `quality_band`
+        # agreeing with the band recomputed here from the score. Nothing else
+        # is a contradiction. There used to be a fifth rule -- a PASS could
+        # carry WARN findings only in seven hard-coded category names -- and it
+        # was a claim about roam that roam does not make: its verdict is
+        # `score >= 80` and nothing else, and which categories are advisory is
+        # DECLARED per category in the envelope rather than fixed in a list
+        # here. Both verdict floors that can override the band trigger on
+        # FAIL-severity findings only, so a roam that skipped one still emits a
+        # FAIL finding and is caught by `has_fail`. What the rule actually did
+        # was refuse ordinary output: a file containing nothing but
+        # `except Exception: pass` produced verdict PASS, score 96 and two WARN
+        # findings in `error_handling`, and the whole transaction was rejected
+        # at exit 2 as a malformed receipt, with a remedy that reinstalls a
+        # roam that was already correct.
         if returncode != 0 or score < threshold or has_fail:
             raise ValueError("success_contradiction")
-        if verdict == "PASS" and any(
-            finding.get("severity") != "WARN" or finding.get("category") not in _VERIFY_PASS_ADVISORY_CATEGORIES
-            for finding in evidence_findings
-        ):
-            raise ValueError("pass_finding_contradiction")
     elif returncode != EXIT_VERIFY_GATE or (score >= threshold and not has_fail):
         raise ValueError("failure_contradiction")
     return envelope

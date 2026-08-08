@@ -2227,6 +2227,59 @@ class TestVerifyReceiptV3Protocol:
         envelope = _verify_envelope()
         assert self._validate(json.dumps(envelope)) == envelope
 
+    @pytest.mark.parametrize(
+        "category",
+        ["error_handling", "naming", "imports", "duplicates", "secrets", "restore_loss"],
+    )
+    def test_a_pass_carrying_warnings_is_roam_behaving_normally(self, category):
+        # Reproduced live on a file containing nothing but `except Exception:
+        # pass`: roam returns verdict PASS, score 96, two WARN findings in
+        # `error_handling`, and `compile verify` refused the whole transaction
+        # at exit 2 with "did not return one complete, bound Verify receipt
+        # v3" plus a remedy that reinstalls a roam that is already correct.
+        # roam derives its verdict from the score alone (>=80 PASS), so a PASS
+        # carrying WARN findings in ANY category is its documented behaviour.
+        envelope = _verify_envelope(
+            verdict="PASS",
+            score=96,
+            violations=[
+                {
+                    "severity": "WARN",
+                    "category": category,
+                    "file": "changed.py",
+                    "line": 4,
+                    "message": "advisory finding that costs score but does not fail the gate",
+                }
+            ],
+        )
+        assert self._validate(json.dumps(envelope)) == envelope
+
+    def test_a_pass_hiding_a_failing_finding_is_still_refused(self):
+        # The property the deleted category allowlist could have been for is
+        # enforced independently, and more strongly, by `has_fail`.
+        envelope = _verify_envelope(
+            verdict="PASS",
+            score=96,
+            violations=[
+                {
+                    "severity": "FAIL",
+                    "category": "secrets",
+                    "file": "changed.py",
+                    "line": 4,
+                    "message": "hard-coded credential",
+                }
+            ],
+        )
+        with pytest.raises(ValueError, match="success_contradiction"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_pass_below_its_own_quality_band_is_still_refused(self):
+        # And a PASS whose score does not support it is caught by the
+        # re-derived band, not by any category list.
+        envelope = _verify_envelope(verdict="PASS", score=70)
+        with pytest.raises(ValueError, match="completion_binding"):
+            self._validate(json.dumps(envelope))
+
     def test_accepts_canonical_complete_no_changes_transaction(self):
         expected = _bound_verify_receipt(target_file_count=0)
         envelope = _no_changes_envelope(expected)
@@ -2744,7 +2797,7 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError, match="completion_binding"):
             self._validate(json.dumps(envelope))
 
-    def test_accepts_pass_with_selected_advisory_warn_evidence(self):
+    def test_accepts_pass_with_advisory_warn_evidence(self):
         finding = {"severity": "WARN", "category": "n1", "file": "model.py", "line": 1}
         envelope = _verify_envelope(violations=[finding])
         envelope["summary"]["checks_run"].append("n1")
@@ -2758,12 +2811,19 @@ class TestVerifyReceiptV3Protocol:
         ],
         ids=["info", "non-advisory-warn"],
     )
-    def test_rejects_pass_with_noncanonical_nonfailing_evidence(self, finding):
+    def test_accepts_pass_with_nonfailing_evidence_of_any_severity_or_category(self, finding):
+        # This assertion used to be its own inverse: both of these were
+        # rejected, on the theory that a PASS may only carry WARN findings from
+        # seven named categories. Re-derived against the producer rather than
+        # assumed -- roam computes its verdict as `score >= 80` and nothing
+        # else, INFO findings are documented to carry a zero score penalty, and
+        # which categories are advisory is declared per category in the
+        # envelope. So neither shape is a contradiction, and rejecting them
+        # refused ordinary output at exit 2 as a malformed receipt.
         envelope = _verify_envelope(violations=[finding])
         if finding["category"] == "n1":
             envelope["summary"]["checks_run"].append("n1")
-        with pytest.raises(ValueError):
-            self._validate(json.dumps(envelope))
+        assert self._validate(json.dumps(envelope)) == envelope
 
     def test_rejects_finding_from_a_check_not_claimed_as_run(self):
         finding = {"severity": "WARN", "category": "n1", "file": "model.py", "line": 1}
