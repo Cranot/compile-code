@@ -3214,6 +3214,26 @@ def _narrowed_scope_suffix(excluded: Sequence[str]) -> str:
     return f"; scope narrowed: {len(excluded)} untracked path(s) under {names} excluded"
 
 
+def _suppressed_findings_suffix(summary: Mapping[str, object]) -> str:
+    """Render roam's own suppression count as a clause the VERDICT line carries.
+
+    Same reasoning as ``_narrowed_scope_suffix`` and the same position, for the
+    same reason: the verdict publishes an issue count that a repo-local
+    ``.roam-suppressions.yml`` already subtracted from, and roam recomputes the
+    SCORE over the reduced set, so a suppression can lift a run across its own
+    threshold. A PASS over a reduced finding set has to say so in the same
+    sentence as the PASS, or the reader takes the PASS and never reaches the
+    disclosure.
+
+    Nothing producer-supplied is echoed: only the integer, already validated as
+    a plain non-negative count, and a filename this build spells itself.
+    """
+    count = summary.get("suppressed")
+    if type(count) is not int or count <= 0:
+        return ""
+    return f"; {count} finding{'s' if count != 1 else ''} suppressed by .roam-suppressions.yml"
+
+
 def _narrowed_scope_notice(excluded: Sequence[str]) -> str:
     """Name what discovery dropped on the paths that never reach a verdict line."""
     names = ", ".join(_narrowed_scope_directories(excluded)) or "tool-state directories"
@@ -3762,6 +3782,22 @@ def _validate_verify_protocol(
         or summary.get("truncated") is True
     ):
         raise ValueError("summary_binding")
+    # `suppressed` is how many findings a checked-in `.roam-suppressions.yml`
+    # removed BEFORE roam recomputed the score, and it is accepted rather than
+    # refused on purpose: unlike every other filter roam applies, this one has
+    # no request-side correlate -- it arrives on a DEFAULT `compile verify` with
+    # no flag at all, so refusing it would take every repo that uses roam
+    # suppressions dark. What it must not do is arrive unread; it is rendered
+    # into the verdict line below, and a field this build now claims to
+    # understand has to actually be understood. Measured against roam 14.0.0
+    # through a pass-through shim: the real producer writes `sum(1 for ...)`
+    # and omits the key entirely at zero, so a plain non-negative int refuses
+    # nothing honest.
+    if "suppressed" in summary:
+        try:
+            _plain_int(summary["suppressed"])
+        except ValueError:
+            raise ValueError("summary_filter_shape") from None
     incomplete_reasons = summary.get("incomplete_reasons")
     # Carry WHICH check roam said was incomplete into every refusal below, not
     # just the last one. Roam sets `verification_complete: false` and
@@ -3967,6 +4003,11 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> 
     rather than above it: the denominator that line publishes is the scope roam
     was actually given, and a PASS over a reduced scope must say so in the same
     sentence as the PASS.
+
+    The same rule binds roam's OWN filters, and it was written here without
+    being applied to them: ``summary.suppressed`` is a numerator reduction of
+    exactly the same kind, arriving with no flag at all whenever the repo has a
+    ``.roam-suppressions.yml``, and it rode through unrendered.
     """
     summary = envelope["summary"]
     issue_count = summary["violation_count"]
@@ -3977,6 +4018,7 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = ()) -> 
         f"{issue_count} issue{'s' if issue_count != 1 else ''} in "
         f"{targets_checked} changed file{'s' if targets_checked != 1 else ''}"
         f"{_narrowed_scope_suffix(excluded)}"
+        f"{_suppressed_findings_suffix(summary)}"
     ]
     catalogue_note = _leak_catalogue_note(envelope)
     if catalogue_note:

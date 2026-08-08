@@ -2834,6 +2834,55 @@ class TestVerifyReceiptV3Protocol:
         assert "scope narrowed" not in mod._render_verify_envelope(_verify_envelope())
         assert "scope narrowed" not in mod._render_verify_envelope(_verify_envelope(), excluded=[])
 
+    def test_a_pass_over_a_suppressed_finding_set_says_so_on_the_verdict_line(self):
+        # Measured against roam 14.0.0 through a pass-through shim: a repo whose
+        # only change is adding `.roam-suppressions.yml` moves the SAME code
+        # from "PASS (score 98/100) -- 1 issue" to "PASS (score 100/100) -- 0
+        # issues" on a DEFAULT `compile verify` with no flag, because roam
+        # recomputes the score over the reduced set. With --threshold 95 the
+        # same file goes rc=5 FAIL -> rc=0 PASS. The disclosure rides the
+        # verdict line for the same reason the narrowing clause does: the count
+        # that line publishes is post-filter.
+        envelope = _verify_envelope()
+        envelope["summary"]["suppressed"] = 1
+
+        verdict_line = mod._render_verify_envelope(envelope).splitlines()[0]
+
+        assert verdict_line.startswith("VERDICT: PASS")
+        assert "1 finding suppressed by .roam-suppressions.yml" in verdict_line
+
+    def test_the_suppression_clause_is_absent_when_nothing_was_suppressed(self):
+        # Roam omits the key entirely at zero; a clause on every run would train
+        # readers to skip it.
+        assert "suppressed" not in mod._render_verify_envelope(_verify_envelope())
+        envelope = _verify_envelope()
+        envelope["summary"]["suppressed"] = 0
+        assert "suppressed" not in mod._render_verify_envelope(envelope)
+
+    def test_the_suppression_clause_pluralises_on_the_real_count(self):
+        envelope = _verify_envelope()
+        envelope["summary"]["suppressed"] = 5
+        assert "5 findings suppressed by .roam-suppressions.yml" in mod._render_verify_envelope(envelope)
+
+    @pytest.mark.parametrize("value", ["many", {"count": 3}, [1, 2], True, -4, 1.0])
+    def test_a_suppression_count_that_is_not_a_plain_count_is_refused(self, value):
+        # Accepting a field means accepting its shape. This one is rendered into
+        # the verdict line, and the real producer writes `sum(1 for ...)`, so
+        # every shape below is a producer this build cannot read rather than a
+        # roam release it would take dark.
+        envelope = _verify_envelope()
+        envelope["summary"]["suppressed"] = value
+        with pytest.raises(ValueError, match="summary_filter_shape"):
+            self._validate(json.dumps(envelope))
+
+    def test_a_plain_suppression_count_is_never_refused(self):
+        # The measured honest battery: default, --diff-only, --new-only and
+        # --threshold runs against roam 14.0.0 all emit a plain int here.
+        for count in (0, 1, 5, 4096):
+            envelope = _verify_envelope()
+            envelope["summary"]["suppressed"] = count
+            assert self._validate(json.dumps(envelope)) == envelope
+
     def test_the_narrowing_clause_names_only_fixed_directory_names(self):
         # Discovered paths are filesystem-supplied text; only names drawn from
         # NON_SOURCE_SCOPE_DIRECTORIES may reach a verdict block.
