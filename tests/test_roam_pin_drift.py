@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -122,8 +124,8 @@ class TestNotice:
         assert "STALE PIN" in out
         assert "roam-code 15 is published" in out
         assert "<16" in out
-        for site in ("pyproject.toml", "scripts/release_artifacts.py", "scripts/check.py"):
-            assert site in out
+        for site in mod.PIN_SITES:
+            assert site in out, f"the printed action does not name {site}"
         # It must not read as an outage: nothing refuses at runtime on a
         # product major any more, and saying otherwise would send a reader
         # looking for a break that does not exist.
@@ -139,3 +141,58 @@ class TestNotice:
         out = capsys.readouterr().out
         assert "UNDETERMINED" in out
         assert "PASS" not in out
+
+
+class TestTheNamedActionIsComplete:
+    """The remedy must name every file, derived from the tree, not from memory.
+
+    This notice shipped naming three sites while the ceiling literal lived in
+    seven. Detection was correct and the instruction was not, which is the
+    quieter half of the same defect: the maintainer follows the list, raises
+    three, and the four unnamed ones fail later somewhere else. Enumerating the
+    real set here means adding an eighth site cannot leave the printed action
+    behind -- it fails HERE, at the list, naming the file it is missing.
+    """
+
+    @staticmethod
+    def _tracked_text_files() -> list[str]:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        return [line for line in out.splitlines() if line.strip()]
+
+    def _sites_carrying_the_ceiling(self) -> set[str]:
+        ceiling = mod.declared_ceiling((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        # The three written forms of the interval, all anchored to the pin so an
+        # unrelated "<15" elsewhere in the tree is not mistaken for this number.
+        pattern = re.compile(
+            rf"roam-code[^\n]*<{ceiling}\b" rf"|<{ceiling}\s*,\s*>=" rf"|>=\s*[\d.]+\s*,\s*<{ceiling}\b"
+        )
+        found = set()
+        for rel in self._tracked_text_files():
+            try:
+                text = (ROOT / rel).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue  # binary or unreadable: cannot carry the literal as text
+            if pattern.search(text):
+                found.add(rel.replace("\\", "/"))
+        return found
+
+    def test_every_file_carrying_the_ceiling_is_named_in_the_printed_action(self):
+        carried = self._sites_carrying_the_ceiling()
+        assert carried, "found no file carrying the pin interval — the search itself is broken"
+        unnamed = sorted(carried - set(mod.PIN_SITES) - set(mod.HISTORICAL_SITES))
+        assert not unnamed, (
+            "these files carry the roam-code ceiling but the stale-pin notice does not name them, "
+            f"so a maintainer following its instructions would leave them behind: {unnamed}"
+        )
+
+    def test_every_named_site_exists(self):
+        # The opposite rot: a site is renamed or deleted and the notice keeps
+        # sending the reader to a path that is not there.
+        missing = sorted(site for site in mod.PIN_SITES if not (ROOT / site).exists())
+        assert not missing, f"the notice names sites that do not exist: {missing}"

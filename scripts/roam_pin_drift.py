@@ -39,11 +39,31 @@ TIMEOUT_SECONDS = 30
 
 # Every site that has to move together when the pin is raised. Named in the
 # failure text so the action is a list of files, not a search.
+#
+# This list shipped naming three of seven. A watcher whose whole purpose is to
+# name the action instead sent the maintainer to four files it did not mention
+# -- the incompleteness was in the remedy, not the detection, which is the
+# harder kind to notice because the gate still goes red at the right moment.
+# `tests/test_roam_pin_drift.py` now DERIVES the true set from the tree and
+# fails if this tuple is missing one, so the instruction cannot silently rot
+# again as sites are added.
 PIN_SITES = (
     "pyproject.toml",
     "scripts/release_artifacts.py",
     "scripts/check.py",
+    "README.md",
+    "tests/test_cli.py",
+    "tests/test_release.py",
+    "tests/test_roam_pin_drift.py",
 )
+
+# Files that carry the interval as a RECORD of what it was, not as a value that
+# has to move. A changelog entry describing "<15" is true about the release it
+# documents and stays true forever; listing it above would instruct a maintainer
+# to edit history. Carrying the literal and needing to be raised are different
+# properties, so the completeness check knows about both rather than treating
+# every occurrence as an obligation.
+HISTORICAL_SITES = ("CHANGELOG.md",)
 
 _RELEASE_RE = re.compile(r"\A(\d+)\.(\d+)\.(\d+)\Z")
 

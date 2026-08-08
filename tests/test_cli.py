@@ -1269,6 +1269,22 @@ class TestFailurePaths:
     def test_broken_toolchain_is_a_verdict_not_a_traceback(self, runner, monkeypatch, argv):
         # On PATH but unlaunchable (broken shim, wrong arch, permissions):
         # the docstring contract says exit 2 "toolchain missing/broken".
+        #
+        # The premise is "on PATH but unlaunchable", so it has to be stated at
+        # BOTH seams. `init` is gated and reaches the verdict through
+        # `_inspect_roam`; `run`/`stats` are not, and reach it by launching.
+        # Stubbing only `_roam` left the gated verb reading the developer's own
+        # PATH, which is why this passed on a machine with roam installed and
+        # failed everywhere else.
+        monkeypatch.setattr(
+            mod,
+            "_inspect_roam",
+            lambda timeout=10: _roam_info(
+                executable_version=None,
+                state="unlaunchable",
+                detail="[Error 13] Access is denied",
+            ),
+        )
         monkeypatch.setattr(mod, "_roam", self._raise_broken)
         res = runner.invoke(mod.cli, argv)
         assert res.exit_code == 2
@@ -2129,6 +2145,14 @@ class TestVerifyFailureFormatting:
 
 
 class TestBaselineVerb:
+    @pytest.fixture(autouse=True)
+    def _supported_roam(self, monkeypatch):
+        # `baseline` is an assurance verb, so it refuses before delegating when
+        # PATH roam is unusable. These cases are about baseline's own behaviour,
+        # so the toolchain is stated as healthy rather than inherited from
+        # whatever happens to be installed on the machine running the suite.
+        monkeypatch.setattr(mod, "_inspect_roam", lambda timeout=10: _roam_info())
+
     def test_baseline_refuses_dirty_tree(self, runner, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(mod, "_git_status_porcelain", lambda timeout=10: (0, " M src/cli.py\n"))
