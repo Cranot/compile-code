@@ -157,9 +157,33 @@ def git_candidate_files(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InventoryError(f"could not establish Git candidate inventory: {exc}") from exc
+    complaint = proc.stderr.decode("utf-8", "replace").strip()[-1_000:]
     if proc.returncode != 0:
-        detail = proc.stderr.decode("utf-8", "replace").strip()[-1_000:]
-        raise InventoryError(f"git ls-files failed ({proc.returncode}): {detail}")
+        raise InventoryError(f"git ls-files failed ({proc.returncode}): {complaint}")
+    # ``--others`` walks the worktree.  Meeting a directory it cannot open,
+    # git prints a warning, omits that entire subtree, and STILL EXITS 0 --
+    # so a pruned inventory is byte-indistinguishable from a complete one
+    # everywhere except on this stream.  Measured on git 2.43.0 with an
+    # unreadable directory holding an untracked credential: rc 0, the file
+    # absent from stdout, `warning: could not open directory` the only trace.
+    #
+    # This is the "partially enumerated" half of the rule in the module
+    # docstring, and it was the only half nothing enforced on the git path --
+    # the four checks below all catch a mangled RESULT, and a pruned subtree
+    # produces a perfectly well-formed one.  ``filesystem_files`` has always
+    # refused on OSError; this brings the git path to the same standard.
+    #
+    # Any stderr counts, deliberately: for a command whose successful output
+    # IS the file list, git having something to say is itself the anomaly.
+    # Matching the warning text would bind the gate to git's English locale
+    # and fail open under LANG -- an unreadable message must not become an
+    # unread directory.
+    if complaint:
+        raise InventoryError(
+            "git ls-files could not fully enumerate the worktree, so this "
+            "inventory is a lower bound and no scan over it can establish "
+            f"a clean result: {complaint}"
+        )
     if len(proc.stdout) > MAX_GIT_INVENTORY_BYTES:
         raise InventoryError(f"Git candidate inventory exceeds {MAX_GIT_INVENTORY_BYTES} bytes")
     if proc.stdout and not proc.stdout.endswith(b"\0"):
