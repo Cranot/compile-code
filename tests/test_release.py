@@ -3247,3 +3247,101 @@ def test_release_yml_combined_install_resolves_against_pypi():
         check=False,
     )
     assert completed.returncode == 0, (completed.stdout + completed.stderr)[-4000:]
+
+
+def _fake_release_clock(monkeypatch) -> dict[str, float]:
+    """Drive github_release_state's deadline from a clock the test advances."""
+    clock = {"now": 0.0}
+    monkeypatch.setattr(release.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(release.time, "sleep", lambda seconds: clock.update(now=clock["now"] + seconds))
+    return clock
+
+
+def test_github_release_state_polls_a_draft_that_is_not_visible_yet(tmp_path: Path, monkeypatch):
+    """A freshly created draft that has not landed in the listing must be waited for, not read once.
+
+    roam-code's sibling pipeline fails exactly here. Its publish.yml runs
+    `gh release create --draft` and then `fetch_release_state` one line later,
+    in the same shell step. GitHub's /releases/tags/{tag} does not resolve
+    drafts, so that falls through to the listing; when the just-created draft
+    is not in the listing yet, the zero-draft branch is a bare `0) ;;` no-op
+    that leaves the 404 body in place, and the next unguarded `jq -e` fails
+    under `bash -e` -- exit 1 with no ::error:: annotation. Measured
+    consequence there: the release job can never succeed on a first tag push,
+    only on a retry that inherits the draft attempt one stranded.
+
+    compile-code cannot fail that way by construction -- it stages the draft
+    in github_release_stage and re-reads it from github_release_draft_verify,
+    a separate job, through `github-release-state --require-draft-exact
+    --wait-seconds 120`. But construction is an argument, not a measurement:
+    every existing test drives `_remote_github_release_state`, the single-shot
+    inner call, so the retry wrapper that carries the whole difference had
+    never been executed. This executes it.
+    """
+    clock = _fake_release_clock(monkeypatch)
+    attempts: list[str] = []
+    outcomes: list[str | release.ReleaseError] = [
+        release.ReleaseError("GitHub release is missing"),
+        release.ReleaseError("GitHub release is missing"),
+        "draft_exact",
+    ]
+
+    def resolve(_bundle: Path, *, expected_source, required_state, details=None):
+        attempts.append(required_state)
+        outcome = outcomes[len(attempts) - 1]
+        if isinstance(outcome, release.ReleaseError):
+            raise outcome
+        if details is not None:
+            details["release_id"] = 42
+        return outcome
+
+    monkeypatch.setattr(release, "_remote_github_release_state", resolve)
+
+    details: dict[str, int | str] = {}
+    state = release.github_release_state(
+        tmp_path,
+        expected_source=_source(),
+        require_exact=False,
+        require_draft_exact=True,
+        wait_seconds=120,
+        details=details,
+    )
+
+    assert state == "draft_exact", "a draft that appeared on the second poll must still be found"
+    assert attempts == ["draft", "draft", "draft"], f"the state read was not retried: {attempts}"
+    assert clock["now"] > 0, "the poll did not back off between reads"
+    assert clock["now"] <= 120, "the poll must stay inside the declared wait budget"
+    assert details["release_id"] == 42, "details from the successful read must reach the caller"
+
+
+def test_github_release_state_names_the_draft_it_never_saw_instead_of_failing_bare(tmp_path: Path, monkeypatch):
+    """Exhausting the wait budget must raise a named error, not exit silently.
+
+    The second half of the roam-code shape is how it ends: a bare `jq -e`
+    returning false under `bash -e`, so the job exits 1 with no annotation and
+    the log points at nothing. The equivalent path here has to say which state
+    it wanted and which it kept getting, and it has to have actually retried
+    before giving up -- a single read that fails once is the defect, however
+    good its error message is.
+    """
+    clock = _fake_release_clock(monkeypatch)
+    attempts: list[str] = []
+
+    def never_appears(_bundle: Path, *, expected_source, required_state, details=None):
+        attempts.append(required_state)
+        raise release.ReleaseError("GitHub release is missing")
+
+    monkeypatch.setattr(release, "_remote_github_release_state", never_appears)
+
+    with pytest.raises(release.ReleaseError, match="did not become a byte-exact draft"):
+        release.github_release_state(
+            tmp_path,
+            expected_source=_source(),
+            require_exact=False,
+            require_draft_exact=True,
+            wait_seconds=120,
+            details={},
+        )
+
+    assert len(attempts) > 1, f"the wrapper gave up after a single read, which is the roam-code defect: {attempts}"
+    assert clock["now"] >= 120, "the wrapper stopped short of the wait budget it advertises"
