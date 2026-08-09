@@ -3890,6 +3890,21 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             problems.append("release build must validate source before dependency audit and tool installation")
         if build_job.count("python scripts/release_artifacts.py source") != 1:
             problems.append("release build must run exactly one early source guard")
+        # check.py runs the full suite, and five of those tests need the
+        # product graph: four import `roam`, one reads installed compile-code
+        # dist metadata. PYTHONPATH=src provides neither, and no lock graph
+        # carries a roam row, so a build job that reaches check.py without an
+        # editable product install fails on ModuleNotFoundError -- naming the
+        # product's dependency for what is really a missing install step.
+        # Deleting the install, or letting it drift after the gate it feeds,
+        # both reproduce that; the ordering is the invariant, not the wording.
+        product_install = build_job.find("--only-binary=:all: -e .")
+        repository_gate = build_job.find("python scripts/check.py")
+        if repository_gate >= 0 and not (tool_install < product_install < repository_gate):
+            problems.append(
+                "release build must install the product dependency graph after the hash-locked tooling "
+                "install and before scripts/check.py"
+            )
     if release.find("python scripts/release_artifacts.py audit-locks") > release.find("python -m pip install"):
         problems.append("release.yml must audit locked graphs before installing release tooling")
     secret_names = set(re.findall(r"secrets\.([A-Z0-9_]+)", release))

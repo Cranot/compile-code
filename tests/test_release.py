@@ -2233,6 +2233,78 @@ def test_publish_owner_gate_is_asserted_on_the_publish_job_not_the_whole_file(tm
     assert any("binding drift" in f for f in findings), f"pypi environment moved but not caught: {findings}"
 
 
+_PRODUCT_INSTALL_STEP = "      - name: Resolve and install the product dependency graph\n"
+_RELEASE_GATE_STEP = "      - name: Run source, workflow, privacy, dependency, and release gates\n"
+_PRODUCT_INSTALL_COMMAND = "python -m pip install --no-compile --no-build-isolation --only-binary=:all: -e ."
+
+
+def _product_install_command(workflow: str) -> str:
+    """Return the one-line pip invocation of the product-install step."""
+    match = re.search(
+        r"(?ms)^      - name: Resolve and install the product dependency graph\n.*?run: >-\n(.*?)(?=\n\n|\Z)",
+        workflow,
+    )
+    assert match is not None, "the product dependency graph install step is missing"
+    return " ".join(match.group(1).split())
+
+
+def _drop_product_install(workflow: str) -> str:
+    return workflow[: workflow.index(_PRODUCT_INSTALL_STEP)] + workflow[workflow.index(_RELEASE_GATE_STEP) :]
+
+
+def _move_product_install_after_the_gate(workflow: str) -> str:
+    start = workflow.index(_PRODUCT_INSTALL_STEP)
+    middle = workflow.index(_RELEASE_GATE_STEP)
+    end = workflow.index("\n      - name:", middle) + 1
+    return workflow[:start] + workflow[middle:end] + workflow[start:middle] + workflow[end:]
+
+
+def test_release_build_must_install_the_product_before_running_the_repository_gate(tmp_path: Path):
+    """A gate that cannot import the product is a broken workflow, not a broken commit.
+
+    The build job installed three hash-locked graphs and then ran check.py
+    with PYTHONPATH=src. `src` supplies the compile_code module but no dist
+    metadata, and no lock graph carries a roam row, so the full suite failed
+    5 tests -- four `ModuleNotFoundError: No module named 'roam'` and one
+    version-drift assertion against '0.0.0+unknown'. On the first real tag
+    push that stops the release at step 7 of 11 with an error that names the
+    product's own dependency, which reads like a bad commit.
+
+    ci.yml has never shown this because it installs the product first, which
+    is exactly why the release job needs the same step in the same place: the
+    gate is only meaningful if it re-measures the environment CI measured.
+    Both the deletion and the reordering are checked, because a step that
+    drifts to after the gate it feeds fails identically and silently.
+    """
+    assert release.audit_repository(ROOT) == [], "the checked-in workflow must itself be clean"
+
+    dropped = _repo_with_release_workflow(tmp_path / "a", _drop_product_install)
+    findings = release.audit_repository(dropped)
+    assert any("product dependency graph" in f for f in findings), f"product install deleted but not caught: {findings}"
+
+    reordered = _repo_with_release_workflow(tmp_path / "b", _move_product_install_after_the_gate)
+    findings = release.audit_repository(reordered)
+    assert any("product dependency graph" in f for f in findings), (
+        f"product install moved after the gate but not caught: {findings}"
+    )
+
+
+def test_release_and_ci_resolve_the_product_graph_identically():
+    """The release re-run of check.py must measure the environment CI measured.
+
+    require_green_ci proves CI was green for this commit; the build job's own
+    check.py run is only a faithful second arm if the interpreter it runs in
+    was assembled the same way. Divergent flags here -- a pinned graph on one
+    side, a resolved one on the other -- would let the release gate pass or
+    fail over a dependency set CI never saw.
+    """
+    workflows = ROOT / ".github" / "workflows"
+    release_command = _product_install_command((workflows / "release.yml").read_text(encoding="utf-8"))
+    ci_command = _product_install_command((workflows / "ci.yml").read_text(encoding="utf-8"))
+    assert release_command == _PRODUCT_INSTALL_COMMAND
+    assert ci_command == _PRODUCT_INSTALL_COMMAND
+
+
 def test_unrankable_remote_version_refuses_instead_of_being_ignored(tmp_path: Path):
     """A registry version we cannot rank must STOP the release, not be skipped.
 
@@ -3110,8 +3182,18 @@ def _release_yml_combined_install_command() -> list[str]:
     steps = [
         step for step in jobs["build"]["steps"] if isinstance(step.get("run"), str) and "-m pip install" in step["run"]
     ]
-    assert len(steps) == 1, "release.yml's build job must contain exactly one pip install step"
-    command = steps[0]["run"].split()
+    locked = [step for step in steps if "--require-hashes" in step["run"]]
+    resolved = [step for step in steps if "--require-hashes" not in step["run"]]
+    assert len(locked) == 1, "release.yml's build job must contain exactly one hash-locked pip install step"
+    # The build job also resolves the product graph, because the repository
+    # gate it runs imports roam and reads compile-code dist metadata. That one
+    # unpinned install is deliberate and is asserted on its own; any OTHER
+    # unpinned install would be a resolution nobody chose, so the count is
+    # pinned here rather than left to the eye.
+    assert len(resolved) == 1 and "-e ." in resolved[0]["run"], (
+        f"the build job's only unpinned install must be the product graph the gate needs: {resolved}"
+    )
+    command = locked[0]["run"].split()
     assert command[:3] == ["python", "-m", "pip"], command[:3]
     return command
 

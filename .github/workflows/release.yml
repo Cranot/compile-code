@@ -57,6 +57,35 @@ jobs:
           -r release/tooling-requirements.lock -r release/smoke-requirements.lock
           -r release/attestation-requirements.lock
 
+      # check.py runs the full pytest suite, and five of those tests exercise
+      # the product itself: four import `roam` (the toolchain this compiler
+      # resolves against) and one asserts that installed compile-code dist
+      # metadata equals pyproject's declared version. PYTHONPATH=src supplies
+      # the compile_code module but no dist metadata and no roam at all, and
+      # no lock graph carries a roam row, so without this step the gate fails
+      # with ModuleNotFoundError on the product's own dependency — a broken
+      # workflow that reads exactly like a broken commit.
+      #
+      # This is the one resolved install in an otherwise hash-locked job, and
+      # it is deliberate rather than an oversight. ci.yml resolves the same
+      # graph with the same flags, so the gate re-run here measures the
+      # environment CI measured; pinning it to a fourth lock would make the
+      # two arms disagree about what was tested. Measured on the exact build
+      # environment (3.12.13 + the three locks above): the install is purely
+      # additive — roam-code, networkx, tree-sitter, tree-sitter-language-pack
+      # and the editable compile-code, with no version of any hash-locked
+      # package changed. Artifact bytes are unaffected either way, because
+      # build_release() builds from `git archive` under PIP_NO_INDEX with the
+      # pinned setuptools, never from this interpreter's source tree.
+      - name: Resolve and install the product dependency graph
+        env:
+          PIP_CONFIG_FILE: /dev/null
+          PIP_DISABLE_PIP_VERSION_CHECK: "1"
+          PIP_NO_INPUT: "1"
+        run: >-
+          python -m pip install --no-compile --no-build-isolation
+          --only-binary=:all: -e .
+
       - name: Run source, workflow, privacy, dependency, and release gates
         env:
           PYTHONPATH: src
