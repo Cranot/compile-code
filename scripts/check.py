@@ -205,6 +205,35 @@ def _test_dependency_failures() -> list[str]:
     return failures
 
 
+def _hook_wiring_failure() -> str | None:
+    """Report a clone whose git hooks are not wired to this repository's gate.
+
+    The pre-push gate only protects a clone where ``core.hooksPath`` points at
+    ``.githooks``; a fresh clone starts unwired and pushes with no local gate
+    at all. CI is exempt: it runs this same pipeline directly on a fresh clone,
+    so hook wiring there is neither needed nor expected.
+    """
+    if os.environ.get("CI") == "true":
+        return None
+    remedy = "run `git config core.hooksPath .githooks` so the pre-push gate protects this clone"
+    try:
+        probe = subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"git hook wiring could not be measured ({exc}); {remedy} (CI job: check)"
+    configured = probe.stdout.strip()
+    if probe.returncode != 0 or not configured:
+        return f"git hooks are not wired (core.hooksPath is unset); {remedy} (CI job: check)"
+    if configured != ".githooks":
+        return f"git hooks point at {configured!r}, not .githooks; {remedy} (CI job: check)"
+    return None
+
+
 def _environment_precondition_failures(*, network_probe: Callable[[], str | None] | None = None) -> list[str]:
     """Check the environment needed before running the complete repository gate.
 
@@ -231,6 +260,10 @@ def _environment_precondition_failures(*, network_probe: Callable[[], str | None
     git = shutil.which("git")
     if not git:
         failures.append("git executable is required by repository inventory and state gates (CI job: check)")
+    else:
+        hook_failure = _hook_wiring_failure()
+        if hook_failure:
+            failures.append(hook_failure)
 
     encoding = locale.getpreferredencoding(False).replace("-", "").upper()
     if encoding != "UTF8":

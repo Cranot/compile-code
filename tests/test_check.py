@@ -171,6 +171,55 @@ def test_environment_preconditions_name_unwritable_temp(monkeypatch):
     assert any("writable temporary directory" in failure for failure in failures)
 
 
+def test_hook_wiring_exempts_ci(monkeypatch):
+    monkeypatch.setenv("CI", "true")
+    assert check._hook_wiring_failure() is None
+
+
+def test_hook_wiring_names_unwired_clone(monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+
+    def unset(cmd, **kwargs):
+        assert cmd[:3] == ["git", "config", "--get"]
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(check.subprocess, "run", unset)
+    failure = check._hook_wiring_failure()
+    assert failure is not None
+    assert "core.hooksPath is unset" in failure
+    assert "git config core.hooksPath .githooks" in failure
+
+
+def test_hook_wiring_names_foreign_hooks_path(monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+
+    def foreign(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=".husky\n", stderr="")
+
+    monkeypatch.setattr(check.subprocess, "run", foreign)
+    failure = check._hook_wiring_failure()
+    assert failure is not None
+    assert ".husky" in failure
+
+
+def test_hook_wiring_accepts_wired_clone(monkeypatch):
+    monkeypatch.delenv("CI", raising=False)
+
+    def wired(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=".githooks\n", stderr="")
+
+    monkeypatch.setattr(check.subprocess, "run", wired)
+    assert check._hook_wiring_failure() is None
+
+
+def test_environment_preconditions_name_unwired_hooks(monkeypatch):
+    monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setattr(check, "_quality_tool_failures", lambda: [])
+    monkeypatch.setattr(check, "_hook_wiring_failure", lambda: "git hooks are not wired (core.hooksPath is unset)")
+    failures = check._environment_precondition_failures(network_probe=lambda: None)
+    assert any("git hooks are not wired" in failure for failure in failures)
+
+
 def test_environment_preconditions_name_missing_git(monkeypatch):
     monkeypatch.setattr(check.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(check.shutil, "which", lambda name: None if name == "git" else "/bin/tool")
