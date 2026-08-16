@@ -40,7 +40,7 @@ Pre-resolves the mechanical work — who calls this, what changed recently, what
 
 ## Install and use in 60 seconds
 
-Release `0.2.1` is deliberately dependency-gated, and that gate is now open:
+Release `0.2.2` is deliberately dependency-gated, and that gate is now open:
 `roam-code 13.10.0` is available on PyPI, so the tested `>=13.10.0,<15`
 packaging interval resolves. The installer fails instead of silently
 substituting an older kernel. That upper bound is a resolver preference — the
@@ -48,7 +48,7 @@ newest kernel major a receipt-v3 transaction has been run against — not a
 runtime refusal: the CLI enforces the floor and lets the envelope-schema major
 decide compatibility.
 
-compile-code itself is not on PyPI yet and `v0.2.1` is not tagged yet, so
+compile-code itself is not on PyPI yet and `v0.2.2` is not tagged yet, so
 install the unpinned `main` today:
 
 ```bash
@@ -61,13 +61,13 @@ Once the release ships, the pinned forms below resolve. Until then they fail
 by design rather than installing something untested:
 
 ```bash
-python -m pip install "compile-code==0.2.1"                    # owner-gated PyPI release
-python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.1"
+python -m pip install "compile-code==0.2.2"                    # owner-gated PyPI release
+python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.2"
 ```
 
 Every path resolves the `compile` CLI and its roam-code engine together. The
 packaging interval makes the command auditable and keeps an untested future
-major out of what the immutable 0.2.1 release *resolves* by default. It is not
+major out of what the immutable 0.2.2 release *resolves* by default. It is not
 a runtime refusal: a newer kernel already on your PATH is verified against the
 envelope contract rather than rejected on its version number.
 
@@ -205,7 +205,7 @@ Replayed against **723 real prompts** captured from live agent sessions
 
 ### The numbers move with the kernel
 
-compile-code 0.2.1 requires `roam-code >= 13.10.0` and picks up compatible
+compile-code 0.2.2 requires `roam-code >= 13.10.0` and picks up compatible
 kernel releases — so the published losses above are not static marketing:
 each one was attacked in a kernel release and re-measured. The trivial-prompt cell
 (+80% cost on v13.4) is a tie on v13.6; the generation cell (+17%) flipped
@@ -457,7 +457,7 @@ custom deployment policies only (`protected_branches=false` and
 `custom_branch_policies=true`) and contains exactly policy ID `55007746`, name
 pattern `v*`, type `tag`. This is deliberately an owner-approved gate rather
 than a two-person review gate; the workflow separately requires both the tag
-actor and rerun actor to be `Cranot` and hard-binds this release to `v0.2.1`.
+actor and rerun actor to be `Cranot` and hard-binds this release to `v0.2.2`.
 Administrator bypass is currently enabled; it is not pinned by the contract,
 so disabling bypass later is accepted as monotonic hardening.
 Store `RELEASE_GUARD_READ_TOKEN` as an environment secret there, with no

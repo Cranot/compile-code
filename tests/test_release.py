@@ -30,7 +30,7 @@ from scripts import release_artifacts as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 EPOCH = 1_700_000_000
 SOURCE_SHA = "1" * 40
 TAG_OBJECT_SHA = "a" * 40
@@ -236,7 +236,7 @@ def _fulcio_extension(oid: str, value: str) -> x509.UnrecognizedExtension:
     return x509.UnrecognizedExtension(x509.ObjectIdentifier(oid), der_encode(UTF8String(value)))
 
 
-def _sigstore_test_certificate(*, repository: str, workflow: str, ref: str = "refs/tags/v0.2.1") -> bytes:
+def _sigstore_test_certificate(*, repository: str, workflow: str, ref: str = "refs/tags/v0.2.2") -> bytes:
     """A self-signed certificate carrying the same Fulcio OIDC claim extensions a real
     GitHub Actions Trusted Publisher certificate would carry (issuer, source repository
     URI, source repository ref, and build config URI -- OIDs 1.3.6.1.4.1.57264.1.{8,12,14,18}
@@ -523,6 +523,26 @@ def _remote_github(
     return documents, remote_payloads
 
 
+DRAFT_DOWNLOAD_SEGMENT = "untagged-13b676099a4179724e88"
+
+
+def _as_untagged_draft(payloads: dict[str, bytes], *documents: dict) -> None:
+    """Flip a published fixture into GitHub's real draft shape.
+
+    Draft assets carry untagged-<hex> download URLs until publication
+    (measured on run 31933000118); a tag-based URL on a draft is the wrong
+    assumption these fixtures used to encode.
+    """
+    for document in documents:
+        document.update(draft=True, immutable=False, published_at=None)
+        for asset in document["assets"]:
+            old = asset["browser_download_url"]
+            new = f"{release.REPOSITORY_URL}/releases/download/{DRAFT_DOWNLOAD_SEGMENT}/{asset['name']}"
+            asset["browser_download_url"] = new
+            if old in payloads:
+                payloads[new] = payloads[old]
+
+
 def _github_reader(documents: dict[str, object]):
     def read(path: str, allow_not_found: bool) -> object | None:
         if path in documents:
@@ -645,7 +665,7 @@ def test_complete_release_build_is_byte_reproducible_and_both_bundles_verify(
 def test_closed_bundle_verifies_and_binds_wheel_sdist_sbom_and_dist(tmp_path: Path):
     bundle, dist = _bundle(tmp_path)
     manifest = release.verify_bundle(bundle, dist=dist, expected_source=_source())
-    assert manifest["tag"] == "v0.2.1"
+    assert manifest["tag"] == "v0.2.2"
     assert {record["role"] for record in manifest["files"]} == {"wheel", "sdist", "sbom"}
     assert all(set(record["hashes"]) == {"sha256", "sha512"} for record in manifest["files"])
     assert all(set(record["sri"]) == {"sha256", "sha512"} for record in manifest["files"])
@@ -674,7 +694,7 @@ def test_manifest_path_traversal_and_duplicate_keys_fail_closed(tmp_path: Path):
 
     bundle, _ = _bundle(tmp_path / "duplicate")
     original = (bundle / release.MANIFEST_NAME).read_text(encoding="utf-8")
-    duplicate = original.replace('"files":', '"version":"0.2.1","files":', 1)
+    duplicate = original.replace('"files":', '"version":"0.2.2","files":', 1)
     (bundle / release.MANIFEST_NAME).write_text(duplicate, encoding="utf-8")
     with pytest.raises(release.ReleaseError, match="duplicate JSON key"):
         release.verify_bundle(bundle)
@@ -783,8 +803,8 @@ def test_hash_mismatch_and_source_bound_artifact_substitution_fail_closed(tmp_pa
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda doc: doc.update(tag="v0.2.2"), "tag must be exactly"),
-        (lambda doc: doc.update(version="0.2.2"), "tag must be exactly"),
+        (lambda doc: doc.update(tag="v0.2.3"), "tag must be exactly"),
+        (lambda doc: doc.update(version="0.2.3"), "tag must be exactly"),
         (lambda doc: doc["source"].update(sha="f" * 40), "source binding mismatch"),
         (lambda doc: doc["source"].update(tag_object_sha=doc["source"]["sha"]), "must differ"),
         (lambda doc: doc["evidence"].update(build_attestation="unsigned"), "evidence policy mismatch"),
@@ -834,7 +854,7 @@ def test_lifecycle_scripts_and_dynamic_metadata_fail_closed(tmp_path: Path):
     pyproject = (
         (ROOT / "pyproject.toml")
         .read_text(encoding="utf-8")
-        .replace('version = "0.2.1"', 'version = "0.2.1"\ndynamic = ["description"]')
+        .replace('version = "0.2.2"', 'version = "0.2.2"\ndynamic = ["description"]')
     )
     with pytest.raises(release.ReleaseError, match="dynamic metadata"):
         release._read_pyproject_bytes(pyproject.encode())
@@ -1299,9 +1319,9 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         assert "IMMUTABLE_RELEASES_TOKEN" not in privileged
         assert "name: release-guard" not in privileged
         assert privileged.count("contents: write") == 1
-        assert "github.ref == 'refs/tags/v0.2.1'" in privileged
+        assert "github.ref == 'refs/tags/v0.2.2'" in privileged
         assert "needs.github_release_preflight.outputs.source_sha == github.sha" in privileged
-        assert "needs.github_release_preflight.outputs.tag == 'v0.2.1'" in privileged
+        assert "needs.github_release_preflight.outputs.tag == 'v0.2.2'" in privileged
         assert "fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag'" in privileged
         assert (
             "fromJSON(steps.remote_tag_ref.outputs.data).object.sha == "
@@ -1318,7 +1338,7 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         "needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id"
         in github_stage
     )
-    assert "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1" in github_stage
+    assert "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.2" in github_stage
     assert "route: PATCH " not in github_stage
     assert 'draft: "true"' in github_stage
     assert 'allowUpdates: "false"' in github_stage
@@ -1328,9 +1348,9 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
     assert 'removeArtifacts: "false"' in github_stage
     assert 'replacesArtifacts: "false"' in github_stage
     assert 'skipIfReleaseExists: "true"' in github_stage
-    assert github_stage.count("compile_code-0.2.1-py3-none-any.whl") == 1
-    assert github_stage.count("compile_code-0.2.1.tar.gz") == 1
-    assert github_stage.count("compile_code-0.2.1.cdx.json") == 1
+    assert github_stage.count("compile_code-0.2.2-py3-none-any.whl") == 1
+    assert github_stage.count("compile_code-0.2.2.tar.gz") == 1
+    assert github_stage.count("compile_code-0.2.2.cdx.json") == 1
     assert github_stage.count("release-manifest.json") == 2  # body + exact file input
     assert github_publish.count("octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae") == 8
     assert github_publish.count("route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}") == 4
@@ -1348,8 +1368,8 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         ) in github_publish
     assert "fromJSON(steps.remote_draft.outputs.data).assets[3] != null" in github_publish
     assert "fromJSON(steps.remote_draft.outputs.data).assets[4] == null" in github_publish
-    assert "tag_name: v0.2.1" in github_publish
-    assert "name: compile-code v0.2.1" in github_publish
+    assert "tag_name: v0.2.2" in github_publish
+    assert "name: compile-code v0.2.2" in github_publish
     assert "prerelease: false" in github_publish
     assert jobs["github_release_stage"]["needs"] == ["build", "prepublish", "github_release_preflight"]
     assert jobs["github_release_draft_verify"]["needs"] == [
@@ -1432,8 +1452,8 @@ def test_release_workflow_audit_rejects_tag_guard_mutation_and_binding_loss(tmp_
 
     workflow.write_text(
         original.replace(
-            "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1",
-            "route: PATCH /repos/Cranot/compile-code/git/ref/tags/v0.2.1",
+            "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.2",
+            "route: PATCH /repos/Cranot/compile-code/git/ref/tags/v0.2.2",
             1,
         ),
         encoding="utf-8",
@@ -2327,7 +2347,7 @@ def test_unrankable_remote_version_refuses_instead_of_being_ignored(tmp_path: Pa
     The monotonicity guard filtered the comparison set with
     `if VERSION_RE.fullmatch(version)`, so any remote version that was not
     strict X.Y.Z was dropped before the max() — a published 1.0.0rc1 or
-    1.0.0.post1 simply was not considered, and publishing 0.2.1 sailed through.
+    1.0.0.post1 simply was not considered, and publishing 0.2.2 sailed through.
     The guard reported success while guarding nothing, which is worse than
     having no guard, because it gets quoted as assurance.
 
@@ -2407,7 +2427,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
     extra_project["releases"][VERSION].append(
         {
             "digests": {"sha256": "0" * 64},
-            "filename": "compile_code-0.2.1.zip",
+            "filename": "compile_code-0.2.2.zip",
             "packagetype": "sdist",
             "size": 1,
             "url": "https://files.pythonhosted.org/packages/test/extra",
@@ -2688,8 +2708,7 @@ def test_github_release_state_is_missing_draft_or_exact_and_verifies_required_at
     manifest = _manifest(bundle)
     release_path = f"/repos/{release.REPOSITORY}/releases/tags/{manifest['tag']}"
     inventory_path = f"/repos/{release.REPOSITORY}/releases?per_page=100&page=1"
-    for document in (documents[release_path], documents[inventory_path][0]):
-        document.update(draft=True, immutable=False, published_at=None)
+    _as_untagged_draft(payloads, documents[release_path], documents[inventory_path][0])
     calls.clear()
     assert (
         release._remote_github_release_state(
@@ -2728,8 +2747,7 @@ def test_github_release_draft_is_byte_verified_before_publication(tmp_path: Path
     manifest = _manifest(bundle)
     release_path = f"/repos/{release.REPOSITORY}/releases/tags/{manifest['tag']}"
     inventory_path = f"/repos/{release.REPOSITORY}/releases?per_page=100&page=1"
-    for document in (documents[release_path], documents[inventory_path][0]):
-        document.update(draft=True, immutable=False, published_at=None)
+    _as_untagged_draft(payloads, documents[release_path], documents[inventory_path][0])
     calls: list[str] = []
     details: dict[str, int | str] = {}
     assert (
@@ -2764,8 +2782,7 @@ def test_github_draft_outputs_carry_each_exact_asset_id_digest_and_size(tmp_path
     manifest = _manifest(bundle)
     release_path = f"/repos/{release.REPOSITORY}/releases/tags/{manifest['tag']}"
     inventory_path = f"/repos/{release.REPOSITORY}/releases?per_page=100&page=1"
-    for document in (documents[release_path], documents[inventory_path][0]):
-        document.update(draft=True, immutable=False, published_at=None)
+    _as_untagged_draft(payloads, documents[release_path], documents[inventory_path][0])
     details: dict[str, int | str] = {}
     assert (
         release._remote_github_release_state(
@@ -2801,6 +2818,56 @@ def test_github_draft_outputs_carry_each_exact_asset_id_digest_and_size(tmp_path
     }
 
 
+def test_github_draft_with_tag_based_asset_urls_fails_closed(tmp_path: Path):
+    """Regression pin for run 31933000118's inverse: a draft claiming the
+    published tag-based download URL is refused, because GitHub never serves
+    that shape for drafts — it was the assumption that made tests green while
+    the first live draft-verify failed."""
+    bundle, _ = _bundle(tmp_path)
+    documents, payloads = _remote_github(bundle)
+    manifest = _manifest(bundle)
+    release_path = f"/repos/{release.REPOSITORY}/releases/tags/{manifest['tag']}"
+    inventory_path = f"/repos/{release.REPOSITORY}/releases?per_page=100&page=1"
+    for document in (documents[release_path], documents[inventory_path][0]):
+        document.update(draft=True, immutable=False, published_at=None)
+    with pytest.raises(release.ReleaseError, match="draft release asset URL mismatch"):
+        release._remote_github_release_state(
+            bundle,
+            expected_source=_source(),
+            required_state="draft",
+            fetch_json=_github_reader(documents),
+            fetch_bytes=lambda url: payloads[url],
+            verify_build_attestations=lambda _bundle, _manifest: None,
+            verify_release_attestation=lambda _bundle, _manifest: None,
+            environ=_github_environment(),
+        )
+
+
+def test_github_draft_assets_spanning_two_download_segments_fail_closed(tmp_path: Path):
+    bundle, _ = _bundle(tmp_path)
+    documents, payloads = _remote_github(bundle)
+    manifest = _manifest(bundle)
+    release_path = f"/repos/{release.REPOSITORY}/releases/tags/{manifest['tag']}"
+    inventory_path = f"/repos/{release.REPOSITORY}/releases?per_page=100&page=1"
+    _as_untagged_draft(payloads, documents[release_path], documents[inventory_path][0])
+    for document in (documents[release_path], documents[inventory_path][0]):
+        stray = document["assets"][-1]
+        stray_url = f"{release.REPOSITORY_URL}/releases/download/untagged-{'e' * 20}/{stray['name']}"
+        payloads[stray_url] = payloads[stray["browser_download_url"]]
+        stray["browser_download_url"] = stray_url
+    with pytest.raises(release.ReleaseError, match="span multiple download segments"):
+        release._remote_github_release_state(
+            bundle,
+            expected_source=_source(),
+            required_state="draft",
+            fetch_json=_github_reader(documents),
+            fetch_bytes=lambda url: payloads[url],
+            verify_build_attestations=lambda _bundle, _manifest: None,
+            verify_release_attestation=lambda _bundle, _manifest: None,
+            environ=_github_environment(),
+        )
+
+
 def test_github_release_hidden_exact_draft_recovers_but_mismatch_and_duplicate_fail_closed(tmp_path: Path):
     bundle, _ = _bundle(tmp_path)
     manifest = _manifest(bundle)
@@ -2810,7 +2877,7 @@ def test_github_release_hidden_exact_draft_recovers_but_mismatch_and_duplicate_f
     documents, payloads = _remote_github(bundle)
     draft = copy.deepcopy(documents[release_path])
     assert isinstance(draft, dict)
-    draft.update(draft=True, immutable=False, published_at=None)
+    _as_untagged_draft(payloads, draft)
     del documents[release_path]
     documents[inventory_path] = [draft]
     assert (
@@ -2901,7 +2968,7 @@ def test_github_release_hidden_exact_draft_recovers_but_mismatch_and_duplicate_f
         (
             lambda docs, manifest: docs[
                 f"/repos/{release.REPOSITORY}/environments/{release.RELEASE_GUARD_ENVIRONMENT}/deployment-branch-policies"
-            ]["branch_policies"][0].update(name="v0.2.1"),
+            ]["branch_policies"][0].update(name="v0.2.2"),
             "tag pattern mismatch",
         ),
         (
@@ -3074,14 +3141,14 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     identity = ["-c", "user.name=Release Test", "-c", "user.email=release@example.invalid"]
     subprocess.run(["git", *identity, "commit", "-qm", "release source"], cwd=repository, check=True)
-    subprocess.run(["git", *identity, "tag", "-am", "v0.2.1", "v0.2.1"], cwd=repository, check=True)
+    subprocess.run(["git", *identity, "tag", "-am", "v0.2.2", "v0.2.2"], cwd=repository, check=True)
     sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
     ).stdout.strip()
     env = {
         "GITHUB_ACTOR": "Cranot",
         "GITHUB_EVENT_NAME": "push",
-        "GITHUB_REF": "refs/tags/v0.2.1",
+        "GITHUB_REF": "refs/tags/v0.2.2",
         "GITHUB_REPOSITORY": "Cranot/compile-code",
         "GITHUB_REPOSITORY_OWNER": "Cranot",
         "GITHUB_SHA": sha,
@@ -3089,9 +3156,9 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     }
     context = release.source_context_from_github(repository, env)
     assert context["sha"] == sha
-    assert context["tag"] == "v0.2.1"
+    assert context["tag"] == "v0.2.2"
     tag_object_sha = subprocess.run(
-        ["git", "rev-parse", "refs/tags/v0.2.1^{tag}"],
+        ["git", "rev-parse", "refs/tags/v0.2.2^{tag}"],
         cwd=repository,
         check=True,
         capture_output=True,
@@ -3100,7 +3167,7 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     assert context["tag_object_sha"] == tag_object_sha
     assert context["tag_object_sha"] != context["sha"]
 
-    injected = dict(env, GITHUB_REF="refs/tags/v0.2.1;echo injected")
+    injected = dict(env, GITHUB_REF="refs/tags/v0.2.2;echo injected")
     with pytest.raises(release.ReleaseError, match="event ref must be"):
         release.source_context_from_github(repository, injected)
 
@@ -3117,8 +3184,8 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     with pytest.raises(release.ReleaseError, match="checkout must be clean"):
         release.source_context_from_github(repository, env, allow_untracked=True)
 
-    subprocess.run(["git", "tag", "-d", "v0.2.1"], cwd=repository, check=True, capture_output=True)
-    subprocess.run(["git", "tag", "v0.2.1"], cwd=repository, check=True)
+    subprocess.run(["git", "tag", "-d", "v0.2.2"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "v0.2.2"], cwd=repository, check=True)
     with pytest.raises(release.ReleaseError, match="annotated tag object"):
         release.source_context_from_github(repository, env, allow_untracked=True)
 

@@ -3393,6 +3393,7 @@ def _remote_github_release_state(
     asset_ids: set[int] = set()
     roles_by_filename = {record["filename"]: record["role"] for record in manifest["files"]}
     roles_by_filename[MANIFEST_NAME] = "manifest"
+    draft_download_segment: str | None = None
     for asset in assets:
         filename = _safe_bundle_filename(asset["name"])
         payload = payloads[filename]
@@ -3413,9 +3414,28 @@ def _remote_github_release_state(
             asset.get("digest") == asset_digest,
             f"GitHub release asset digest mismatch: {filename}",
         )
-        expected_url = f"{REPOSITORY_URL}/releases/download/{manifest['tag']}/{filename}"
         url = asset.get("browser_download_url")
-        _require(url == expected_url, f"GitHub release asset URL mismatch: {filename}")
+        if draft_state is True:
+            # GitHub serves DRAFT assets under an untagged-<hex> download
+            # segment until publication; the tag-based URL only exists after
+            # the draft is published (measured on run 31933000118, whose
+            # staged v0.2.1 draft carried untagged-13b676099a4179724e88).
+            draft_url_match = re.fullmatch(
+                re.escape(f"{REPOSITORY_URL}/releases/download/") + r"(untagged-[0-9a-f]+)/" + re.escape(filename),
+                url if isinstance(url, str) else "",
+            )
+            _require(draft_url_match is not None, f"GitHub draft release asset URL mismatch: {filename}")
+            assert draft_url_match is not None
+            segment = draft_url_match.group(1)
+            if draft_download_segment is None:
+                draft_download_segment = segment
+            _require(
+                segment == draft_download_segment,
+                f"GitHub draft release assets span multiple download segments: {filename}",
+            )
+        else:
+            expected_url = f"{REPOSITORY_URL}/releases/download/{manifest['tag']}/{filename}"
+            _require(url == expected_url, f"GitHub release asset URL mismatch: {filename}")
         api_url = asset.get("url")
         expected_api_url = f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{asset_id}"
         _require(api_url == expected_api_url, f"GitHub release asset API URL mismatch: {filename}")
@@ -3997,11 +4017,11 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             "github.triggering_actor == 'Cranot'",
             "environment:\n      name: pypi",
             "permissions:\n      id-token: write",
-            "github.ref == 'refs/tags/v0.2.1'",
+            "github.ref == 'refs/tags/v0.2.2'",
             "needs.require_green_ci.result == 'success'",
             "needs.prepublish.outputs.publish_required == 'true'",
             "needs.github_release_preflight.outputs.source_sha == github.sha",
-            "needs.github_release_preflight.outputs.tag == 'v0.2.1'",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.2'",
             "needs.github_release_preflight.outputs.release_state == 'exact'",
             "needs.github_release_draft_verify.outputs.state == 'draft_exact'",
             "needs.github_release_draft_verify.result == 'success'",
@@ -4033,9 +4053,9 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         if job.count("route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}") != 1:
             problems.append(f"{job_name} must URL-bind the annotated tag SHA as an API parameter")
         for binding in (
-            "github.ref == 'refs/tags/v0.2.1'",
+            "github.ref == 'refs/tags/v0.2.2'",
             "needs.github_release_preflight.outputs.source_sha == github.sha",
-            "needs.github_release_preflight.outputs.tag == 'v0.2.1'",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.2'",
             "fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag'",
             "fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha",
             "fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit'",
@@ -4079,8 +4099,8 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             "fromJSON(steps.remote_draft.outputs.data).assets[3] != null",
             "fromJSON(steps.remote_draft.outputs.data).assets[4] == null",
             "needs.postpublish.result == 'success'",
-            "tag_name: v0.2.1",
-            "name: compile-code v0.2.1",
+            "tag_name: v0.2.2",
+            "name: compile-code v0.2.2",
             "prerelease: false",
         ):
             if binding not in github_publish:
@@ -4097,9 +4117,9 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         if re.search(r"(?m)^\s+route:\s+(?:POST|PATCH|PUT|DELETE)\b", github_stage):
             problems.append("draft staging tag guard may perform only GET requests outside the pinned staging action")
         expected_assets = (
-            "compile_code-0.2.1-py3-none-any.whl",
-            "compile_code-0.2.1.tar.gz",
-            "compile_code-0.2.1.cdx.json",
+            "compile_code-0.2.2-py3-none-any.whl",
+            "compile_code-0.2.2.tar.gz",
+            "compile_code-0.2.2.cdx.json",
         )
         for asset in expected_assets:
             if github_stage.count(asset) != 1:
