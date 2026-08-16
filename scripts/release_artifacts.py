@@ -3997,11 +3997,11 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             "github.triggering_actor == 'Cranot'",
             "environment:\n      name: pypi",
             "permissions:\n      id-token: write",
-            "github.ref == 'refs/tags/v0.2.0'",
+            "github.ref == 'refs/tags/v0.2.1'",
             "needs.require_green_ci.result == 'success'",
             "needs.prepublish.outputs.publish_required == 'true'",
             "needs.github_release_preflight.outputs.source_sha == github.sha",
-            "needs.github_release_preflight.outputs.tag == 'v0.2.0'",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.1'",
             "needs.github_release_preflight.outputs.release_state == 'exact'",
             "needs.github_release_draft_verify.outputs.state == 'draft_exact'",
             "needs.github_release_draft_verify.result == 'success'",
@@ -4033,9 +4033,9 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         if job.count("route: GET /repos/{owner}/{repo}/git/tags/{tag_sha}") != 1:
             problems.append(f"{job_name} must URL-bind the annotated tag SHA as an API parameter")
         for binding in (
-            "github.ref == 'refs/tags/v0.2.0'",
+            "github.ref == 'refs/tags/v0.2.1'",
             "needs.github_release_preflight.outputs.source_sha == github.sha",
-            "needs.github_release_preflight.outputs.tag == 'v0.2.0'",
+            "needs.github_release_preflight.outputs.tag == 'v0.2.1'",
             "fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag'",
             "fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha",
             "fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit'",
@@ -4079,8 +4079,8 @@ def audit_repository(root: Path = ROOT) -> list[str]:
             "fromJSON(steps.remote_draft.outputs.data).assets[3] != null",
             "fromJSON(steps.remote_draft.outputs.data).assets[4] == null",
             "needs.postpublish.result == 'success'",
-            "tag_name: v0.2.0",
-            "name: compile-code v0.2.0",
+            "tag_name: v0.2.1",
+            "name: compile-code v0.2.1",
             "prerelease: false",
         ):
             if binding not in github_publish:
@@ -4097,9 +4097,9 @@ def audit_repository(root: Path = ROOT) -> list[str]:
         if re.search(r"(?m)^\s+route:\s+(?:POST|PATCH|PUT|DELETE)\b", github_stage):
             problems.append("draft staging tag guard may perform only GET requests outside the pinned staging action")
         expected_assets = (
-            "compile_code-0.2.0-py3-none-any.whl",
-            "compile_code-0.2.0.tar.gz",
-            "compile_code-0.2.0.cdx.json",
+            "compile_code-0.2.1-py3-none-any.whl",
+            "compile_code-0.2.1.tar.gz",
+            "compile_code-0.2.1.cdx.json",
         )
         for asset in expected_assets:
             if github_stage.count(asset) != 1:

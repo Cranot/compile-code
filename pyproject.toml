@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compile-code"
-version = "0.2.0"
+version = "0.2.1"
 description = "A compiler for AI coding tasks: pre-resolves repo facts before the agent's first token to reduce tool calls and token use."
 readme = "README.md"
 requires-python = ">=3.10"

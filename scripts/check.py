@@ -1222,9 +1222,9 @@ def readme_sanity() -> bool:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     normalized_text = re.sub(r"\s+", " ", text)
     problems = []
-    if 'python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.0"' not in text:
+    if 'python -m pip install "compile-code @ git+https://github.com/Cranot/compile-code.git@v0.2.1"' not in text:
         problems.append("install command missing")
-    if 'python -m pip install "compile-code==0.2.0"' not in text:
+    if 'python -m pip install "compile-code==0.2.1"' not in text:
         problems.append("future owner-gated PyPI install command missing")
     if "`roam-code 13.10.0` is available on PyPI" not in text:
         problems.append("dependency publication gate missing")
@@ -1460,6 +1460,9 @@ def release_sanity() -> bool:
     release_dates = re.findall(r"(?m)^## 0\.2\.0 - (\d{4}-\d{2}-\d{2})$", changelog)
     if release_dates != ["2026-07-23"]:
         problems.append(f"CHANGELOG.md: expected one 0.2.0 release heading dated 2026-07-23, got {release_dates}")
+    patch_dates = re.findall(r"(?m)^## 0\.2\.1 - (\d{4}-\d{2}-\d{2})$", changelog)
+    if patch_dates != ["2026-08-16"]:
+        problems.append(f"CHANGELOG.md: expected one 0.2.1 release heading dated 2026-08-16, got {patch_dates}")
     print(f"[check] release sanity: {'PASS' if not problems else 'FAIL'}")
     for problem in problems:
         print("  -", problem)

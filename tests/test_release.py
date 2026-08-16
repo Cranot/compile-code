@@ -30,7 +30,7 @@ from scripts import release_artifacts as release
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 EPOCH = 1_700_000_000
 SOURCE_SHA = "1" * 40
 TAG_OBJECT_SHA = "a" * 40
@@ -236,7 +236,7 @@ def _fulcio_extension(oid: str, value: str) -> x509.UnrecognizedExtension:
     return x509.UnrecognizedExtension(x509.ObjectIdentifier(oid), der_encode(UTF8String(value)))
 
 
-def _sigstore_test_certificate(*, repository: str, workflow: str, ref: str = "refs/tags/v0.2.0") -> bytes:
+def _sigstore_test_certificate(*, repository: str, workflow: str, ref: str = "refs/tags/v0.2.1") -> bytes:
     """A self-signed certificate carrying the same Fulcio OIDC claim extensions a real
     GitHub Actions Trusted Publisher certificate would carry (issuer, source repository
     URI, source repository ref, and build config URI -- OIDs 1.3.6.1.4.1.57264.1.{8,12,14,18}
@@ -645,7 +645,7 @@ def test_complete_release_build_is_byte_reproducible_and_both_bundles_verify(
 def test_closed_bundle_verifies_and_binds_wheel_sdist_sbom_and_dist(tmp_path: Path):
     bundle, dist = _bundle(tmp_path)
     manifest = release.verify_bundle(bundle, dist=dist, expected_source=_source())
-    assert manifest["tag"] == "v0.2.0"
+    assert manifest["tag"] == "v0.2.1"
     assert {record["role"] for record in manifest["files"]} == {"wheel", "sdist", "sbom"}
     assert all(set(record["hashes"]) == {"sha256", "sha512"} for record in manifest["files"])
     assert all(set(record["sri"]) == {"sha256", "sha512"} for record in manifest["files"])
@@ -674,7 +674,7 @@ def test_manifest_path_traversal_and_duplicate_keys_fail_closed(tmp_path: Path):
 
     bundle, _ = _bundle(tmp_path / "duplicate")
     original = (bundle / release.MANIFEST_NAME).read_text(encoding="utf-8")
-    duplicate = original.replace('"files":', '"version":"0.2.0","files":', 1)
+    duplicate = original.replace('"files":', '"version":"0.2.1","files":', 1)
     (bundle / release.MANIFEST_NAME).write_text(duplicate, encoding="utf-8")
     with pytest.raises(release.ReleaseError, match="duplicate JSON key"):
         release.verify_bundle(bundle)
@@ -783,8 +783,8 @@ def test_hash_mismatch_and_source_bound_artifact_substitution_fail_closed(tmp_pa
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda doc: doc.update(tag="v0.2.1"), "tag must be exactly"),
-        (lambda doc: doc.update(version="0.2.1"), "tag must be exactly"),
+        (lambda doc: doc.update(tag="v0.2.2"), "tag must be exactly"),
+        (lambda doc: doc.update(version="0.2.2"), "tag must be exactly"),
         (lambda doc: doc["source"].update(sha="f" * 40), "source binding mismatch"),
         (lambda doc: doc["source"].update(tag_object_sha=doc["source"]["sha"]), "must differ"),
         (lambda doc: doc["evidence"].update(build_attestation="unsigned"), "evidence policy mismatch"),
@@ -834,7 +834,7 @@ def test_lifecycle_scripts_and_dynamic_metadata_fail_closed(tmp_path: Path):
     pyproject = (
         (ROOT / "pyproject.toml")
         .read_text(encoding="utf-8")
-        .replace('version = "0.2.0"', 'version = "0.2.0"\ndynamic = ["description"]')
+        .replace('version = "0.2.1"', 'version = "0.2.1"\ndynamic = ["description"]')
     )
     with pytest.raises(release.ReleaseError, match="dynamic metadata"):
         release._read_pyproject_bytes(pyproject.encode())
@@ -1299,9 +1299,9 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         assert "IMMUTABLE_RELEASES_TOKEN" not in privileged
         assert "name: release-guard" not in privileged
         assert privileged.count("contents: write") == 1
-        assert "github.ref == 'refs/tags/v0.2.0'" in privileged
+        assert "github.ref == 'refs/tags/v0.2.1'" in privileged
         assert "needs.github_release_preflight.outputs.source_sha == github.sha" in privileged
-        assert "needs.github_release_preflight.outputs.tag == 'v0.2.0'" in privileged
+        assert "needs.github_release_preflight.outputs.tag == 'v0.2.1'" in privileged
         assert "fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag'" in privileged
         assert (
             "fromJSON(steps.remote_tag_ref.outputs.data).object.sha == "
@@ -1318,7 +1318,7 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         "needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id"
         in github_stage
     )
-    assert "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0" in github_stage
+    assert "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1" in github_stage
     assert "route: PATCH " not in github_stage
     assert 'draft: "true"' in github_stage
     assert 'allowUpdates: "false"' in github_stage
@@ -1328,9 +1328,9 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
     assert 'removeArtifacts: "false"' in github_stage
     assert 'replacesArtifacts: "false"' in github_stage
     assert 'skipIfReleaseExists: "true"' in github_stage
-    assert github_stage.count("compile_code-0.2.0-py3-none-any.whl") == 1
-    assert github_stage.count("compile_code-0.2.0.tar.gz") == 1
-    assert github_stage.count("compile_code-0.2.0.cdx.json") == 1
+    assert github_stage.count("compile_code-0.2.1-py3-none-any.whl") == 1
+    assert github_stage.count("compile_code-0.2.1.tar.gz") == 1
+    assert github_stage.count("compile_code-0.2.1.cdx.json") == 1
     assert github_stage.count("release-manifest.json") == 2  # body + exact file input
     assert github_publish.count("octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae") == 8
     assert github_publish.count("route: GET /repos/{owner}/{repo}/releases/assets/{asset_id}") == 4
@@ -1348,8 +1348,8 @@ def test_release_workflow_is_inputless_least_privilege_owner_gated_and_publisher
         ) in github_publish
     assert "fromJSON(steps.remote_draft.outputs.data).assets[3] != null" in github_publish
     assert "fromJSON(steps.remote_draft.outputs.data).assets[4] == null" in github_publish
-    assert "tag_name: v0.2.0" in github_publish
-    assert "name: compile-code v0.2.0" in github_publish
+    assert "tag_name: v0.2.1" in github_publish
+    assert "name: compile-code v0.2.1" in github_publish
     assert "prerelease: false" in github_publish
     assert jobs["github_release_stage"]["needs"] == ["build", "prepublish", "github_release_preflight"]
     assert jobs["github_release_draft_verify"]["needs"] == [
@@ -1432,8 +1432,8 @@ def test_release_workflow_audit_rejects_tag_guard_mutation_and_binding_loss(tmp_
 
     workflow.write_text(
         original.replace(
-            "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0",
-            "route: PATCH /repos/Cranot/compile-code/git/ref/tags/v0.2.0",
+            "route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1",
+            "route: PATCH /repos/Cranot/compile-code/git/ref/tags/v0.2.1",
             1,
         ),
         encoding="utf-8",
@@ -2327,7 +2327,7 @@ def test_unrankable_remote_version_refuses_instead_of_being_ignored(tmp_path: Pa
     The monotonicity guard filtered the comparison set with
     `if VERSION_RE.fullmatch(version)`, so any remote version that was not
     strict X.Y.Z was dropped before the max() — a published 1.0.0rc1 or
-    1.0.0.post1 simply was not considered, and publishing 0.2.0 sailed through.
+    1.0.0.post1 simply was not considered, and publishing 0.2.1 sailed through.
     The guard reported success while guarding nothing, which is worse than
     having no guard, because it gets quoted as assurance.
 
@@ -2407,7 +2407,7 @@ def test_pypi_state_is_missing_or_exact_and_never_blindly_skips(tmp_path: Path):
     extra_project["releases"][VERSION].append(
         {
             "digests": {"sha256": "0" * 64},
-            "filename": "compile_code-0.2.0.zip",
+            "filename": "compile_code-0.2.1.zip",
             "packagetype": "sdist",
             "size": 1,
             "url": "https://files.pythonhosted.org/packages/test/extra",
@@ -2901,7 +2901,7 @@ def test_github_release_hidden_exact_draft_recovers_but_mismatch_and_duplicate_f
         (
             lambda docs, manifest: docs[
                 f"/repos/{release.REPOSITORY}/environments/{release.RELEASE_GUARD_ENVIRONMENT}/deployment-branch-policies"
-            ]["branch_policies"][0].update(name="v0.2.0"),
+            ]["branch_policies"][0].update(name="v0.2.1"),
             "tag pattern mismatch",
         ),
         (
@@ -3074,14 +3074,14 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     identity = ["-c", "user.name=Release Test", "-c", "user.email=release@example.invalid"]
     subprocess.run(["git", *identity, "commit", "-qm", "release source"], cwd=repository, check=True)
-    subprocess.run(["git", *identity, "tag", "-am", "v0.2.0", "v0.2.0"], cwd=repository, check=True)
+    subprocess.run(["git", *identity, "tag", "-am", "v0.2.1", "v0.2.1"], cwd=repository, check=True)
     sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=repository, check=True, capture_output=True, text=True
     ).stdout.strip()
     env = {
         "GITHUB_ACTOR": "Cranot",
         "GITHUB_EVENT_NAME": "push",
-        "GITHUB_REF": "refs/tags/v0.2.0",
+        "GITHUB_REF": "refs/tags/v0.2.1",
         "GITHUB_REPOSITORY": "Cranot/compile-code",
         "GITHUB_REPOSITORY_OWNER": "Cranot",
         "GITHUB_SHA": sha,
@@ -3089,9 +3089,9 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     }
     context = release.source_context_from_github(repository, env)
     assert context["sha"] == sha
-    assert context["tag"] == "v0.2.0"
+    assert context["tag"] == "v0.2.1"
     tag_object_sha = subprocess.run(
-        ["git", "rev-parse", "refs/tags/v0.2.0^{tag}"],
+        ["git", "rev-parse", "refs/tags/v0.2.1^{tag}"],
         cwd=repository,
         check=True,
         capture_output=True,
@@ -3100,7 +3100,7 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     assert context["tag_object_sha"] == tag_object_sha
     assert context["tag_object_sha"] != context["sha"]
 
-    injected = dict(env, GITHUB_REF="refs/tags/v0.2.0;echo injected")
+    injected = dict(env, GITHUB_REF="refs/tags/v0.2.1;echo injected")
     with pytest.raises(release.ReleaseError, match="event ref must be"):
         release.source_context_from_github(repository, injected)
 
@@ -3117,8 +3117,8 @@ def test_source_context_binds_annotated_tag_event_sha_and_clean_head(tmp_path: P
     with pytest.raises(release.ReleaseError, match="checkout must be clean"):
         release.source_context_from_github(repository, env, allow_untracked=True)
 
-    subprocess.run(["git", "tag", "-d", "v0.2.0"], cwd=repository, check=True, capture_output=True)
-    subprocess.run(["git", "tag", "v0.2.0"], cwd=repository, check=True)
+    subprocess.run(["git", "tag", "-d", "v0.2.1"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "tag", "v0.2.1"], cwd=repository, check=True)
     with pytest.raises(release.ReleaseError, match="annotated tag object"):
         release.source_context_from_github(repository, env, allow_untracked=True)
 

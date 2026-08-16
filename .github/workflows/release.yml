@@ -286,10 +286,10 @@ jobs:
       needs.prepublish.result == 'success' &&
       needs.github_release_preflight.result == 'success' &&
       github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
-      github.triggering_actor == 'Cranot' && github.ref == 'refs/tags/v0.2.0' &&
+      github.triggering_actor == 'Cranot' && github.ref == 'refs/tags/v0.2.1' &&
       needs.prepublish.outputs.publish_required == 'true' &&
       needs.github_release_preflight.outputs.source_sha == github.sha &&
-      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.1' &&
       (
         (
           needs.github_release_preflight.outputs.release_state == 'exact' &&
@@ -473,9 +473,9 @@ jobs:
       github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
       github.triggering_actor == 'Cranot' &&
       needs.github_release_preflight.outputs.release_required == 'true' &&
-      github.ref == 'refs/tags/v0.2.0' &&
+      github.ref == 'refs/tags/v0.2.1' &&
       needs.github_release_preflight.outputs.source_sha == github.sha &&
-      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.1' &&
       needs.github_release_preflight.outputs.bundle_artifact_id == needs.build.outputs.bundle_artifact_id &&
       needs.github_release_preflight.outputs.bundle_artifact_digest == needs.build.outputs.bundle_artifact_digest
     runs-on: ubuntu-24.04
@@ -494,7 +494,7 @@ jobs:
         id: remote_tag_ref
         uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
         with:
-          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0
+          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1
           headers: |
             x-github-api-version: "2026-03-10"
         env:
@@ -516,30 +516,30 @@ jobs:
       - name: Create one draft and attach only the closed asset set # zizmor: ignore[superfluous-actions] A shell step would violate this privileged job's no-run boundary.
         if: >-
           steps.remote_tag_ref.outputs.status == '200' &&
-          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.0' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.1' &&
           fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag' &&
           fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha &&
           steps.remote_tag_object.outputs.status == '200' &&
           fromJSON(steps.remote_tag_object.outputs.data).sha == needs.github_release_preflight.outputs.tag_object_sha &&
-          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.0' &&
+          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.1' &&
           fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit' &&
           fromJSON(steps.remote_tag_object.outputs.data).object.sha == github.sha
         uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           token: ${{ github.token }}
-          tag: v0.2.0
+          tag: v0.2.1
           commit: ${{ github.sha }}
-          name: compile-code v0.2.0
+          name: compile-code v0.2.1
           body: >-
-            compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by
+            compile-code 0.2.1 release artifacts. The closed asset set is byte-bound by
             release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.
           allowUpdates: "false"
           artifactContentType: application/octet-stream
           artifactErrorsFailBuild: "true"
           artifacts: >-
-            release-bundle/compile_code-0.2.0-py3-none-any.whl,
-            release-bundle/compile_code-0.2.0.tar.gz,
-            release-bundle/compile_code-0.2.0.cdx.json,
+            release-bundle/compile_code-0.2.1-py3-none-any.whl,
+            release-bundle/compile_code-0.2.1.tar.gz,
+            release-bundle/compile_code-0.2.1.cdx.json,
             release-bundle/release-manifest.json
           draft: "true"
           immutableCreate: "false"
@@ -643,9 +643,9 @@ jobs:
       needs.postpublish.result == 'success' &&
       github.repository == 'Cranot/compile-code' && github.actor == 'Cranot' &&
       github.triggering_actor == 'Cranot' &&
-      github.ref == 'refs/tags/v0.2.0' &&
+      github.ref == 'refs/tags/v0.2.1' &&
       needs.github_release_preflight.outputs.source_sha == github.sha &&
-      needs.github_release_preflight.outputs.tag == 'v0.2.0' &&
+      needs.github_release_preflight.outputs.tag == 'v0.2.1' &&
       needs.github_release_draft_verify.outputs.state == 'draft_exact' &&
       needs.github_release_draft_verify.outputs.publish_required == 'true'
     runs-on: ubuntu-24.04
@@ -657,7 +657,7 @@ jobs:
         id: remote_tag_ref
         uses: octokit/request-action@b91aabaa861c777dcdb14e2387e30eddf04619ae # v3.0.0
         with:
-          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.0
+          route: GET /repos/Cranot/compile-code/git/ref/tags/v0.2.1
           headers: |
             x-github-api-version: "2026-03-10"
         env:
@@ -744,31 +744,31 @@ jobs:
       - name: Publish only the final exact draft and asset IDs
         if: >-
           steps.remote_tag_ref.outputs.status == '200' &&
-          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.0' &&
+          fromJSON(steps.remote_tag_ref.outputs.data).ref == 'refs/tags/v0.2.1' &&
           fromJSON(steps.remote_tag_ref.outputs.data).object.type == 'tag' &&
           fromJSON(steps.remote_tag_ref.outputs.data).object.sha == needs.github_release_preflight.outputs.tag_object_sha &&
           steps.remote_tag_object.outputs.status == '200' &&
           fromJSON(steps.remote_tag_object.outputs.data).sha == needs.github_release_preflight.outputs.tag_object_sha &&
-          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.0' &&
+          fromJSON(steps.remote_tag_object.outputs.data).tag == 'v0.2.1' &&
           fromJSON(steps.remote_tag_object.outputs.data).object.type == 'commit' &&
           fromJSON(steps.remote_tag_object.outputs.data).object.sha == github.sha &&
           steps.remote_wheel.outputs.status == '200' &&
           fromJSON(steps.remote_wheel.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id) &&
-          fromJSON(steps.remote_wheel.outputs.data).name == 'compile_code-0.2.0-py3-none-any.whl' &&
+          fromJSON(steps.remote_wheel.outputs.data).name == 'compile_code-0.2.1-py3-none-any.whl' &&
           fromJSON(steps.remote_wheel.outputs.data).state == 'uploaded' &&
           fromJSON(steps.remote_wheel.outputs.data).content_type == 'application/octet-stream' &&
           fromJSON(steps.remote_wheel.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_size) &&
           fromJSON(steps.remote_wheel.outputs.data).digest == needs.github_release_draft_verify.outputs.wheel_asset_digest &&
           steps.remote_sdist.outputs.status == '200' &&
           fromJSON(steps.remote_sdist.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_id) &&
-          fromJSON(steps.remote_sdist.outputs.data).name == 'compile_code-0.2.0.tar.gz' &&
+          fromJSON(steps.remote_sdist.outputs.data).name == 'compile_code-0.2.1.tar.gz' &&
           fromJSON(steps.remote_sdist.outputs.data).state == 'uploaded' &&
           fromJSON(steps.remote_sdist.outputs.data).content_type == 'application/octet-stream' &&
           fromJSON(steps.remote_sdist.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.sdist_asset_size) &&
           fromJSON(steps.remote_sdist.outputs.data).digest == needs.github_release_draft_verify.outputs.sdist_asset_digest &&
           steps.remote_sbom.outputs.status == '200' &&
           fromJSON(steps.remote_sbom.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_id) &&
-          fromJSON(steps.remote_sbom.outputs.data).name == 'compile_code-0.2.0.cdx.json' &&
+          fromJSON(steps.remote_sbom.outputs.data).name == 'compile_code-0.2.1.cdx.json' &&
           fromJSON(steps.remote_sbom.outputs.data).state == 'uploaded' &&
           fromJSON(steps.remote_sbom.outputs.data).content_type == 'application/octet-stream' &&
           fromJSON(steps.remote_sbom.outputs.data).size == fromJSON(needs.github_release_draft_verify.outputs.sbom_asset_size) &&
@@ -782,13 +782,13 @@ jobs:
           fromJSON(steps.remote_manifest.outputs.data).digest == needs.github_release_draft_verify.outputs.manifest_asset_digest &&
           steps.remote_draft.outputs.status == '200' &&
           fromJSON(steps.remote_draft.outputs.data).id == fromJSON(needs.github_release_draft_verify.outputs.release_id) &&
-          fromJSON(steps.remote_draft.outputs.data).tag_name == 'v0.2.0' &&
+          fromJSON(steps.remote_draft.outputs.data).tag_name == 'v0.2.1' &&
           fromJSON(steps.remote_draft.outputs.data).draft == true &&
           fromJSON(steps.remote_draft.outputs.data).prerelease == false &&
           fromJSON(steps.remote_draft.outputs.data).immutable == false &&
           fromJSON(steps.remote_draft.outputs.data).published_at == null &&
-          fromJSON(steps.remote_draft.outputs.data).name == 'compile-code v0.2.0' &&
-          fromJSON(steps.remote_draft.outputs.data).body == 'compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.' &&
+          fromJSON(steps.remote_draft.outputs.data).name == 'compile-code v0.2.1' &&
+          fromJSON(steps.remote_draft.outputs.data).body == 'compile-code 0.2.1 release artifacts. The closed asset set is byte-bound by release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.' &&
           fromJSON(steps.remote_draft.outputs.data).assets[3] != null &&
           fromJSON(steps.remote_draft.outputs.data).assets[4] == null &&
           contains(fromJSON(steps.remote_draft.outputs.data).assets.*.id, fromJSON(needs.github_release_draft_verify.outputs.wheel_asset_id)) &&
@@ -801,10 +801,10 @@ jobs:
           owner: Cranot
           repo: compile-code
           release_id: ${{ fromJSON(needs.github_release_draft_verify.outputs.release_id) }}
-          tag_name: v0.2.0
-          name: compile-code v0.2.0
+          tag_name: v0.2.1
+          name: compile-code v0.2.1
           body: >-
-            compile-code 0.2.0 release artifacts. The closed asset set is byte-bound by
+            compile-code 0.2.1 release artifacts. The closed asset set is byte-bound by
             release-manifest.json and requires GitHub build-provenance plus immutable-release attestations.
           draft: false
           prerelease: false
