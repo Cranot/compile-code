@@ -1724,14 +1724,23 @@ def test_github_cli_install_is_exclusive_and_revalidates_hash_and_version(monkey
     )
     assert executable == tmp_path / release.GITHUB_CLI_INSTALL_DIRECTORY / "gh"
     assert executable.read_bytes() == binary
+    state_directory = tmp_path / f"{release.GITHUB_CLI_INSTALL_DIRECTORY}-state"
     assert invocations == [
         (
             [str(executable), "--version"],
             release.ROOT,
-            {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "NO_COLOR": "1"},
+            {
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "NO_COLOR": "1",
+                "HOME": str(state_directory),
+                "XDG_STATE_HOME": str(state_directory),
+            },
             30,
         )
     ]
+    assert state_directory.is_dir()
+    assert release.ROOT.resolve() not in state_directory.resolve().parents
 
     with pytest.raises(release.ReleaseError, match="already exists"):
         release.install_github_cli(
@@ -1769,9 +1778,13 @@ def test_each_github_attestation_command_revalidates_the_controlled_cli(monkeypa
     commands: list[list[str]] = []
     environments: list[dict[str, str]] = []
 
+    install_directory = tmp_path / release.GITHUB_CLI_INSTALL_DIRECTORY
+    install_directory.mkdir()
+    controlled_executable = install_directory / "gh"
+
     def controlled_cli():
         validations.append("validated")
-        return "/runner/_temp/compile-code-gh-2.96.0/gh"
+        return str(controlled_executable)
 
     def run(argv, **kwargs):
         commands.append(argv)
@@ -1786,15 +1799,15 @@ def test_each_github_attestation_command_revalidates_the_controlled_cli(monkeypa
 
     assert len(commands) == 9
     assert len(validations) == len(commands)
-    assert all(command[0] == "/runner/_temp/compile-code-gh-2.96.0/gh" for command in commands)
+    assert all(command[0] == str(controlled_executable) for command in commands)
     assert sum(command[1:3] == ["attestation", "verify"] for command in commands) == 4
     assert sum(command[1:3] == ["release", "verify-asset"] for command in commands) == 4
     assert sum(command[1:3] == ["release", "verify"] for command in commands) == 1
-    expected_config_directory = str(Path("/runner/_temp/compile-code-gh-2.96.0/gh").parent)
+    state_directory = tmp_path / f"{release.GITHUB_CLI_INSTALL_DIRECTORY}-state"
     assert all(
         environment
         == {
-            "GH_CONFIG_DIR": expected_config_directory,
+            "GH_CONFIG_DIR": str(install_directory),
             "GH_HOST": "github.com",
             "GH_NO_UPDATE_NOTIFIER": "1",
             "GH_PROMPT_DISABLED": "1",
@@ -1802,9 +1815,12 @@ def test_each_github_attestation_command_revalidates_the_controlled_cli(monkeypa
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
             "NO_COLOR": "1",
+            "HOME": str(state_directory),
+            "XDG_STATE_HOME": str(state_directory),
         }
         for environment in environments
     )
+    assert release.ROOT.resolve() not in state_directory.resolve().parents
 
 
 def test_release_apis_use_only_the_owner_scoped_read_token(tmp_path: Path, monkeypatch):

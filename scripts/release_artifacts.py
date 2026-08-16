@@ -925,6 +925,7 @@ def _validate_github_cli_executable(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "NO_COLOR": "1",
+        **_github_cli_state_environment(executable),
     }
     output = run_command([str(executable), "--version"], cwd=ROOT, env=version_environment, timeout=30)
     _require(isinstance(output, str), "GitHub CLI version output is not text")
@@ -945,6 +946,31 @@ def _validate_github_cli_executable(
 def _require_github_cli_platform() -> None:
     _require(sys.platform == "linux", "the pinned GitHub CLI archive requires Linux")
     _require(platform.machine().lower() in {"amd64", "x86_64"}, "the pinned GitHub CLI archive requires amd64")
+
+
+def _github_cli_state_environment(executable: Path) -> dict[str, str]:
+    """Pin a writable gh state home beside the install directory, outside the workspace.
+
+    gh 2.96.0 writes .local/state/gh/device-id on every invocation; with no HOME in
+    its environment it resolves that path relative to the working directory, which
+    dirtied the release checkout and tripped the clean-checkout gate.
+    """
+    state_directory = executable.parent.parent / f"{executable.parent.name}-state"
+    try:
+        os.mkdir(state_directory, 0o700)
+    except FileExistsError:
+        pass
+    validated = _validated_real_directory(state_directory, label="GitHub CLI state directory")
+    if os.name == "posix":
+        state = os.lstat(validated)
+        _require(state.st_uid == os.geteuid(), "GitHub CLI state directory owner mismatch")
+        _require(state.st_mode & 0o022 == 0, "GitHub CLI state directory is group/world writable")
+    root = ROOT.resolve()
+    _require(
+        validated != root and root not in validated.parents,
+        "GitHub CLI state directory must be outside the source workspace",
+    )
+    return {"HOME": str(validated), "XDG_STATE_HOME": str(validated)}
 
 
 def install_github_cli(
@@ -1007,6 +1033,7 @@ def _run_github_cli(arguments: list[str], *, timeout: int = 120) -> str:
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "NO_COLOR": "1",
+        **_github_cli_state_environment(Path(executable)),
     }
     result = _run([executable, *arguments], cwd=ROOT, env=environment, timeout=timeout)
     _require(isinstance(result, str), "GitHub CLI command output is not text")
@@ -1056,9 +1083,10 @@ def source_context_from_github(
     head = _git(root, "rev-parse", "HEAD")
     _require(event_commit == source_sha == head, "event SHA, annotated tag target, and checked-out HEAD must match")
     untracked_mode = "no" if allow_untracked else "all"
+    status_output = _git(root, "status", "--porcelain=v1", f"--untracked-files={untracked_mode}")
     _require(
-        _git(root, "status", "--porcelain=v1", f"--untracked-files={untracked_mode}") == "",
-        "release checkout must be clean",
+        status_output == "",
+        f"release checkout must be clean; unexpected paths:\n{status_output[:2000]}",
     )
 
     epoch_text = _git(root, "show", "-s", "--format=%ct", source_sha)
