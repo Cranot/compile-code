@@ -1103,7 +1103,7 @@ def source_context_from_github(
 
 
 def _assert_release_tools() -> None:
-    expected = {"build": "1.5.0", "pip": "26.1.2", "setuptools": "83.0.0", "wheel": "0.47.0"}
+    expected = {"build": "1.5.0", "pip": "26.2.1", "setuptools": "83.0.0", "wheel": "0.47.0"}
     for distribution, version in expected.items():
         try:
             actual = importlib_metadata.version(distribution)
@@ -3771,7 +3771,7 @@ def _run_install_smoke(artifact: Path, version: str, mode: str, temp_root: Path)
         backend_assertion = (
             "import importlib.metadata as m; "
             "assert {n: m.version(n) for n in ('packaging', 'pip', 'setuptools', 'wheel')} == "
-            "{'packaging': '26.2', 'pip': '26.1.2', 'setuptools': '83.0.0', 'wheel': '0.47.0'}"
+            "{'packaging': '26.2', 'pip': '26.2.1', 'setuptools': '83.0.0', 'wheel': '0.47.0'}"
         )
         _run([str(python), "-I", "-c", backend_assertion], cwd=temp_root, env=environment, timeout=60)
         if mode == "package-only":

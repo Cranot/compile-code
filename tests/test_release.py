@@ -2064,7 +2064,7 @@ def test_locked_graph_audit_reports_vulnerabilities_with_graph_provenance():
 
     with pytest.raises(
         release.ReleaseError,
-        match=r"pip==26\.1\.2:GHSA-aaaa-bbbb-cccc.*(?:build|tooling)-requirements\.lock",
+        match=r"pip==26\.2\.1:GHSA-aaaa-bbbb-cccc.*(?:build|tooling)-requirements\.lock",
     ):
         release.audit_locked_requirements(ROOT, fetch_json=vulnerable)
 

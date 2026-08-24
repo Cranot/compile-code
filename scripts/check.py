@@ -1366,7 +1366,7 @@ def release_sanity() -> bool:
     tooling_lock = (ROOT / "release" / "tooling-requirements.lock").read_text(encoding="utf-8")
     for exact_tool in (
         "build==1.5.0",
-        "pip==26.1.2",
+        "pip==26.2.1",
         "pytest==9.1.1",
         "pyyaml==6.0.3",
         "ruff==0.15.22",

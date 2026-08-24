@@ -4,7 +4,7 @@
 # with another release lock resolves to one agreed version.
 build==1.5.0
 packaging==26.2
-pip==26.1.2
+pip==26.2.1
 pyasn1==0.6.4
 # tests/test_release.py drives the REAL pypi_attestations verification path
 # (see the sigstore entry below for the paired rationale). The version is owned

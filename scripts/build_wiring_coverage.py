@@ -170,7 +170,14 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("closure", _c(False, "", "Excluded from the edit denominator: transitive closure (graph navigation).")),
     ("clusters", _c(False, "", "Excluded from the edit denominator: graph clustering (reporting).")),
     ("codeowners", _c(False, "", "Excluded from the edit denominator: ownership coverage.")),
-    ("collapse", _c(True, "F21", "Detects benign-default collapse: error paths returning the same value as legitimate emptiness.")),
+    (
+        "collapse",
+        _c(
+            True,
+            "F21",
+            "Detects benign-default collapse: error paths returning the same value as legitimate emptiness.",
+        ),
+    ),
     ("commands", _c(False, "", "Excluded from the edit denominator: list repo runnable commands (meta).")),
     ("compare", _c(False, "", "Excluded from the edit denominator: cross-index structural diff (reporting).")),
     ("compatibility", _c(True, "F2", "Checks version and consumer compatibility across a change.")),
