@@ -63,16 +63,19 @@ def test_render_starts_with_generated_by_header() -> None:
     assert "`known`" in rendered
 
 
-def test_verify_derives_product_rule_registration_and_trigger_description() -> None:
+def test_verify_derives_product_check_registration_and_trigger_descriptions() -> None:
     inventory = coverage.roam_command_inventory()
 
-    assert coverage._product_verify_commands(inventory) == frozenset({"rules"})
+    assert coverage._product_verify_commands(inventory) == frozenset({"py-types", "rules"})
 
     import compile_code.cli as cli
 
     descriptions = dict(cli._VERIFY_AUTO_CHECK_REGISTRY)
     assert "Any edit" in descriptions["rules"]
     assert "not_applicable" in descriptions["rules"]
-    assert cli._auto_select_product_verify_checks(["README.md"]) == ("rules",)
-    assert cli._auto_select_product_verify_checks(["tests/test_service.py"]) == ("rules",)
+    assert "Python edits" in descriptions["py-types"]
+    assert "pre-edit type surface" in descriptions["py-types"]
+    assert "absolute legacy debt never gates" in descriptions["py-types"]
+    assert cli._auto_select_product_verify_checks(["README.md"]) == ("rules", "py-types")
+    assert cli._auto_select_product_verify_checks(["tests/test_service.py"]) == ("rules", "py-types")
     assert cli._auto_select_product_verify_checks([]) == ()

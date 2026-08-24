@@ -18,6 +18,7 @@ Hardening contract: every toolchain failure surfaces as a one-line
 
 from __future__ import annotations
 
+import ast
 import errno
 import hashlib
 import json
@@ -2545,6 +2546,7 @@ _VERIFY_CAUSE_LABELS = {
     "COMMAND EXAMPLES": "broken command example",
     "SECRETS": "exposed secret",
     "RULES": "governance rule violation",
+    "PY TYPES": "type-annotation regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2643,6 +2645,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "Any edit triggers a bounded .roam/rules YAML declaration probe; declared rules run, while an absent "
         "or empty declaration set reports not_applicable.",
     ),
+    (
+        "py-types",
+        "Python edits run a bounded annotation-health probe and compare edited public symbols with their Git "
+        "pre-edit type surface; non-Python edits report not_applicable and absolute legacy debt never gates.",
+    ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
     {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
@@ -2652,6 +2659,16 @@ _VERIFY_RULE_GATING_SEVERITIES = frozenset({"error"})
 MAX_VERIFY_RULE_DECLARATION_ENTRIES = 4096
 MAX_VERIFY_RULE_FINDINGS = 10
 MAX_VERIFY_RULE_TEXT_CHARS = 1024
+MAX_VERIFY_TYPE_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_VERIFY_TYPE_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_TYPE_DETAIL_FILES = 25
+MAX_VERIFY_TYPE_ENVELOPE_FINDINGS = MAX_VERIFY_TYPE_DETAIL_FILES * 5
+MAX_VERIFY_TYPE_FINDINGS = 10
+MAX_VERIFY_TYPE_TEXT_CHARS = 1024
+_VERIFY_TYPE_EMPTY_STATES = frozenset({"no_python_files", "no_public_python_functions"})
+_VERIFY_TYPE_ISSUE = re.compile(r"^(?:no-return|uses-Any|legacy-typing|[1-9]\d*-untyped)$")
+_VERIFY_TYPE_TOTAL_DEFINITION = "public Python functions/methods; test files excluded unless --include-tests is set"
+_VERIFY_TYPE_COVERAGE_DEFINITION = "(total_public - max(no_return_annotation, untyped_params)) * 100 // total_public"
 _VERIFY_CATEGORY_NAMES = _VERIFY_CHECK_NAMES | {"verification"}
 # There is deliberately no hand-copied "categories allowed to WARN on a PASS"
 # set here. Roam declares advisory-ness per category in the envelope it sends,
@@ -3934,6 +3951,543 @@ def _verify_rules_unavailable_verdict(reason: object) -> str:
     )
 
 
+def _verify_type_annotation(node: ast.expr | None) -> dict[str, object] | None:
+    if node is None:
+        return None
+    try:
+        display = ast.unparse(node)
+    except (RecursionError, ValueError) as exc:
+        raise ValueError("type_annotation_unreadable") from exc
+    if not display or len(display) > MAX_VERIFY_TYPE_TEXT_CHARS or any(ord(char) < 32 for char in display):
+        raise ValueError("type_annotation_unreadable")
+
+    def union_members(candidate: ast.expr) -> list[str]:
+        if isinstance(candidate, ast.BinOp) and isinstance(candidate.op, ast.BitOr):
+            return [*union_members(candidate.left), *union_members(candidate.right)]
+        return [ast.dump(candidate, annotate_fields=True, include_attributes=False)]
+
+    names = [candidate for candidate in ast.walk(node) if isinstance(candidate, (ast.Name, ast.Attribute))]
+    is_any = any(
+        (isinstance(candidate, ast.Name) and candidate.id == "Any")
+        or (isinstance(candidate, ast.Attribute) and candidate.attr == "Any")
+        for candidate in names
+    )
+    is_object = isinstance(node, ast.Name) and node.id == "object"
+    return {
+        "display": display,
+        "canonical": ast.dump(node, annotate_fields=True, include_attributes=False),
+        "union_members": tuple(union_members(node)),
+        "is_any": is_any,
+        "is_object": is_object,
+    }
+
+
+def _python_annotation_surface(raw: str) -> dict[str, dict[str, object]]:
+    """Return the public callable type surface in one bounded Python source."""
+    try:
+        tree = ast.parse(raw)
+    except (MemoryError, RecursionError, SyntaxError, ValueError) as exc:
+        raise ValueError("type_source_unparseable") from exc
+    surface: dict[str, dict[str, object]] = {}
+    scope: list[str] = []
+
+    class SurfaceVisitor(ast.NodeVisitor):
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            qualified_name = ".".join([*scope, node.name])
+            if not node.name.startswith("_"):
+                positional = [*node.args.posonlyargs, *node.args.args]
+                keyword_only = list(node.args.kwonlyargs)
+                arguments: list[ast.arg] = [*positional, *keyword_only]
+                if node.args.vararg is not None:
+                    arguments.append(node.args.vararg)
+                if node.args.kwarg is not None:
+                    arguments.append(node.args.kwarg)
+                parameters = tuple(
+                    {
+                        "name": argument.arg,
+                        "annotation": _verify_type_annotation(argument.annotation),
+                    }
+                    for argument in arguments
+                    if argument.arg not in {"self", "cls"}
+                )
+                surface[qualified_name] = {
+                    "line": node.lineno,
+                    "parameters": parameters,
+                    "return": _verify_type_annotation(node.returns),
+                }
+            scope.append(node.name)
+            self.generic_visit(node)
+            scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_function(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_function(node)
+
+    SurfaceVisitor().visit(tree)
+    return surface
+
+
+def _verify_type_git_capture(root: Path, argv: list[str], *, stdout_limit: int) -> subprocess.CompletedProcess:
+    git_path, _reason = _resolve_trusted_executable("git", reject_workspace=True)
+    if not git_path:
+        raise ValueError("type_git_unavailable")
+    try:
+        return _run_bounded_capture(
+            [git_path, "-c", "core.fsmonitor=false", *argv],
+            cwd=str(root),
+            timeout=10,
+            stdout_limit=stdout_limit,
+            stderr_limit=MAX_VERIFY_STDERR_BYTES,
+            env=_trusted_tool_env(git=True),
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("type_git_unavailable") from exc
+
+
+def _verify_type_baseline_paths(root: Path, targets: Sequence[str]) -> dict[str, str | None]:
+    """Map current Python paths to their pre-edit names, including detected renames."""
+    inside = _verify_type_git_capture(root, ["rev-parse", "--is-inside-work-tree"], stdout_limit=32)
+    if inside.returncode != 0 or (inside.stdout or b"").strip() != b"true":
+        raise ValueError("type_git_unavailable")
+    head = _verify_type_git_capture(root, ["cat-file", "-e", "HEAD^{commit}"], stdout_limit=1)
+    if head.returncode != 0:
+        return {path: None for path in targets}
+    diff = _verify_type_git_capture(
+        root,
+        ["diff", "--name-status", "-z", "--find-renames", "HEAD", "--", *targets],
+        stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+    )
+    raw = diff.stdout or b""
+    if diff.returncode != 0 or len(raw) > MAX_VERIFY_GIT_STATUS_BYTES or (raw and not raw.endswith(b"\0")):
+        raise ValueError("type_git_diff_unavailable")
+    try:
+        records = raw.split(b"\0")
+        baseline: dict[str, str | None] = {path: path for path in targets}
+        index = 0
+        while index < len(records):
+            status_raw = records[index]
+            index += 1
+            if not status_raw:
+                continue
+            status = status_raw.decode("ascii")
+            if re.fullmatch(r"(?:[AMDUT]|R\d{1,3}|C\d{1,3})", status) is None or index >= len(records):
+                raise ValueError("type_git_diff_malformed")
+            first_path = _decode_verify_status_path(records[index])
+            index += 1
+            if status.startswith(("R", "C")):
+                if index >= len(records):
+                    raise ValueError("type_git_diff_malformed")
+                current_path = _decode_verify_status_path(records[index])
+                index += 1
+                if current_path in baseline:
+                    baseline[current_path] = first_path
+            elif status == "A" and first_path in baseline:
+                baseline[first_path] = None
+        return baseline
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("type_git_diff_malformed") from exc
+
+
+def _verify_type_head_source(root: Path, baseline_path: str | None) -> str:
+    if baseline_path is None:
+        return ""
+    blob = _verify_type_git_capture(
+        root,
+        ["cat-file", "blob", f"HEAD:{baseline_path}"],
+        stdout_limit=MAX_VERIFY_TYPE_SOURCE_BYTES,
+    )
+    raw = blob.stdout or b""
+    if blob.returncode != 0 or len(raw) > MAX_VERIFY_TYPE_SOURCE_BYTES:
+        tree = _verify_type_git_capture(
+            root,
+            ["ls-tree", "-z", "HEAD", "--", baseline_path],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        if tree.returncode == 0 and not (tree.stdout or b""):
+            return ""
+        raise ValueError("type_baseline_unavailable")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("type_baseline_non_utf8") from exc
+
+
+def _verify_type_annotation_regressed(
+    previous: Mapping[str, object], current: Mapping[str, object]
+) -> tuple[bool, str]:
+    previous_display = str(previous["display"])
+    current_display = str(current["display"])
+    if current.get("is_any") is True and previous.get("is_any") is not True:
+        return True, f"widened from {previous_display} to {current_display}"
+    if current.get("is_object") is True and previous.get("is_object") is not True:
+        return True, f"widened from {previous_display} to object"
+    previous_members = set(previous.get("union_members", ()))
+    current_members = set(current.get("union_members", ()))
+    if previous_members and previous_members < current_members:
+        return True, f"widened from {previous_display} to {current_display}"
+    return False, ""
+
+
+def _verify_type_annotation_delta(root: Path, targets: Sequence[str]) -> dict[str, object]:
+    """Compare edited Python callables with their Git ``HEAD`` type surface."""
+    python_targets = tuple(path for path in targets if Path(path).suffix.lower() == ".py")
+    if not python_targets:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed Python files",
+            "regression_count": 0,
+            "findings": (),
+        }
+    baseline_paths = _verify_type_baseline_paths(root, python_targets)
+    findings: list[dict[str, object]] = []
+    regression_count = 0
+    required_no_return: set[tuple[str, str]] = set()
+    required_untyped: set[tuple[str, str]] = set()
+    required_any: set[tuple[str, str]] = set()
+    total_source_bytes = 0
+    current_public_count = 0
+    current_python_file_count = 0
+
+    def add_finding(
+        *,
+        path: str,
+        line: int,
+        symbol: str,
+        annotation: str,
+        change: str,
+        support: str | None,
+    ) -> None:
+        nonlocal regression_count
+        regression_count += 1
+        key = (path, symbol)
+        if support == "no_return":
+            required_no_return.add(key)
+        elif support == "untyped":
+            required_untyped.add(key)
+        elif support == "any":
+            required_any.add(key)
+        if len(findings) < MAX_VERIFY_TYPE_FINDINGS:
+            findings.append(
+                {
+                    "file": path,
+                    "line": line,
+                    "symbol": symbol,
+                    "annotation": annotation,
+                    "change": change,
+                }
+            )
+
+    for path in python_targets:
+        candidate = root / Path(path)
+        try:
+            current_exists = candidate.exists()
+            current_raw = (
+                ""
+                if not current_exists
+                else _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_TYPE_SOURCE_BYTES)
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("type_current_source_unavailable") from exc
+        current_python_file_count += int(current_exists)
+        baseline_raw = _verify_type_head_source(root, baseline_paths[path])
+        total_source_bytes += len(current_raw.encode("utf-8")) + len(baseline_raw.encode("utf-8"))
+        if total_source_bytes > MAX_VERIFY_TYPE_TOTAL_SOURCE_BYTES:
+            raise ValueError("type_source_scope_too_large")
+        previous_surface = _python_annotation_surface(baseline_raw)
+        current_surface = _python_annotation_surface(current_raw)
+        current_public_count += len(current_surface)
+        for symbol, current_symbol in current_surface.items():
+            previous_symbol = previous_surface.get(symbol)
+            line = _plain_int(current_symbol.get("line"), minimum=1)
+            current_parameters = current_symbol.get("parameters")
+            if not isinstance(current_parameters, tuple):
+                raise ValueError("type_surface_invalid")
+            if previous_symbol is None:
+                for parameter in current_parameters:
+                    if isinstance(parameter, Mapping) and parameter.get("annotation") is None:
+                        name = str(parameter.get("name"))
+                        add_finding(
+                            path=path,
+                            line=line,
+                            symbol=symbol,
+                            annotation=f"{name} annotation",
+                            change="missing on new public symbol",
+                            support="untyped",
+                        )
+                if current_symbol.get("return") is None:
+                    add_finding(
+                        path=path,
+                        line=line,
+                        symbol=symbol,
+                        annotation="return annotation",
+                        change="missing on new public symbol",
+                        support="no_return",
+                    )
+                continue
+
+            previous_parameters = previous_symbol.get("parameters")
+            if not isinstance(previous_parameters, tuple):
+                raise ValueError("type_surface_invalid")
+            previous_by_name = {
+                str(parameter["name"]): parameter.get("annotation")
+                for parameter in previous_parameters
+                if isinstance(parameter, Mapping) and isinstance(parameter.get("name"), str)
+            }
+            for parameter_index, parameter in enumerate(current_parameters):
+                if not isinstance(parameter, Mapping) or not isinstance(parameter.get("name"), str):
+                    raise ValueError("type_surface_invalid")
+                name = str(parameter["name"])
+                current_annotation = parameter.get("annotation")
+                has_previous_parameter = name in previous_by_name
+                previous_annotation = previous_by_name.get(name)
+                if not has_previous_parameter and parameter_index < len(previous_parameters):
+                    previous_parameter = previous_parameters[parameter_index]
+                    if isinstance(previous_parameter, Mapping):
+                        has_previous_parameter = True
+                        previous_annotation = previous_parameter.get("annotation")
+                if isinstance(previous_annotation, Mapping) and current_annotation is None:
+                    add_finding(
+                        path=path,
+                        line=line,
+                        symbol=symbol,
+                        annotation=f"{name} annotation",
+                        change=f"removed (was {previous_annotation['display']})",
+                        support="untyped",
+                    )
+                elif isinstance(previous_annotation, Mapping) and isinstance(current_annotation, Mapping):
+                    regressed, change = _verify_type_annotation_regressed(previous_annotation, current_annotation)
+                    if regressed:
+                        add_finding(
+                            path=path,
+                            line=line,
+                            symbol=symbol,
+                            annotation=f"{name} annotation",
+                            change=change,
+                            support="any" if current_annotation.get("is_any") is True else None,
+                        )
+                elif not has_previous_parameter and current_annotation is None:
+                    add_finding(
+                        path=path,
+                        line=line,
+                        symbol=symbol,
+                        annotation=f"{name} annotation",
+                        change="missing on new parameter",
+                        support="untyped",
+                    )
+                elif (
+                    not has_previous_parameter
+                    and isinstance(current_annotation, Mapping)
+                    and current_annotation.get("is_any") is True
+                ):
+                    add_finding(
+                        path=path,
+                        line=line,
+                        symbol=symbol,
+                        annotation=f"{name} annotation",
+                        change="new parameter uses Any",
+                        support="any",
+                    )
+            previous_return = previous_symbol.get("return")
+            current_return = current_symbol.get("return")
+            if isinstance(previous_return, Mapping) and current_return is None:
+                add_finding(
+                    path=path,
+                    line=line,
+                    symbol=symbol,
+                    annotation="return annotation",
+                    change=f"removed (was {previous_return['display']})",
+                    support="no_return",
+                )
+            elif isinstance(previous_return, Mapping) and isinstance(current_return, Mapping):
+                regressed, change = _verify_type_annotation_regressed(previous_return, current_return)
+                if regressed:
+                    add_finding(
+                        path=path,
+                        line=line,
+                        symbol=symbol,
+                        annotation="return annotation",
+                        change=change,
+                        support="any" if current_return.get("is_any") is True else None,
+                    )
+    return {
+        "state": "failed" if regression_count else "complete",
+        "python_target_count": len(python_targets),
+        "current_python_file_count": current_python_file_count,
+        "current_public_count": current_public_count,
+        "regression_count": regression_count,
+        "findings": tuple(findings),
+        "required_no_return": len(required_no_return),
+        "required_untyped": len(required_untyped),
+        "required_any": len(required_any),
+    }
+
+
+def _validate_verify_py_types_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+    delta: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the bounded absolute ``py-types`` result and bind it to the edit delta."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("py_types_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "py-types"
+        or envelope.get("version") != expected_roam_version
+        or returncode != 0
+    ):
+        raise ValueError("py_types_envelope")
+    summary = envelope.get("summary")
+    by_file = envelope.get("by_file")
+    raw_findings = envelope.get("findings")
+    if not isinstance(summary, dict) or not isinstance(by_file, list) or not isinstance(raw_findings, list):
+        raise ValueError("py_types_shape")
+    if len(by_file) > MAX_VERIFY_TYPE_DETAIL_FILES or len(raw_findings) > MAX_VERIFY_TYPE_ENVELOPE_FINDINGS:
+        raise ValueError("py_types_result_bound")
+    total = _plain_int(summary.get("total_public"))
+    no_return = _plain_int(summary.get("no_return_annotation"), maximum=total)
+    untyped = _plain_int(summary.get("untyped_params"), maximum=total)
+    uses_any = _plain_int(summary.get("uses_any"), maximum=total)
+    old_typing = _plain_int(summary.get("old_typing"), maximum=total)
+    coverage = _plain_int(summary.get("coverage_pct"), maximum=100)
+    _bounded_verify_rule_text(summary.get("verdict"), reason="py_types_verdict")
+    if (
+        summary.get("partial_success") is not False
+        or summary.get("total_public_definition") != _VERIFY_TYPE_TOTAL_DEFINITION
+        or summary.get("coverage_pct_definition") != _VERIFY_TYPE_COVERAGE_DEFINITION
+    ):
+        raise ValueError("py_types_incomplete")
+    if total:
+        if coverage != ((total - max(no_return, untyped)) * 100) // total:
+            raise ValueError("py_types_counts")
+    else:
+        state = summary.get("state")
+        if state not in _VERIFY_TYPE_EMPTY_STATES or summary.get("coverage_pct_computable") is not False:
+            raise ValueError("py_types_empty_state")
+        python_files = _plain_int(summary.get("python_files"))
+        _plain_int(summary.get("indexed_files"))
+        if state == "no_python_files" and (
+            python_files != 0 or _plain_int(delta.get("current_python_file_count")) != 0
+        ):
+            raise ValueError("py_types_scope_contradiction")
+
+    for row in by_file:
+        if not isinstance(row, dict):
+            raise ValueError("py_types_file")
+        _verify_rule_site(expected_root, row.get("path"))
+        row_total = _plain_int(row.get("total"))
+        _plain_int(row.get("missing"), maximum=row_total)
+    for finding in raw_findings:
+        if not isinstance(finding, dict):
+            raise ValueError("py_types_finding")
+        _bounded_verify_rule_text(finding.get("name"), reason="py_types_finding_name")
+        _verify_rule_site(expected_root, finding.get("path"))
+        _plain_int(finding.get("line"), minimum=1)
+        issues = finding.get("issues")
+        if (
+            not isinstance(issues, list)
+            or not issues
+            or any(not isinstance(issue, str) or _VERIFY_TYPE_ISSUE.fullmatch(issue) is None for issue in issues)
+        ):
+            raise ValueError("py_types_finding_issues")
+    if total < _plain_int(delta.get("current_public_count")):
+        raise ValueError("py_types_scope_contradiction")
+    if (
+        no_return < _plain_int(delta.get("required_no_return"))
+        or untyped < _plain_int(delta.get("required_untyped"))
+        or uses_any < _plain_int(delta.get("required_any"))
+    ):
+        raise ValueError("py_types_delta_contradiction")
+    result = dict(delta)
+    result.update(
+        absolute_total_public=total,
+        absolute_coverage_pct=coverage if total else None,
+        absolute_no_return=no_return,
+        absolute_untyped=untyped,
+        absolute_uses_any=uses_any,
+        absolute_old_typing=old_typing,
+    )
+    return result
+
+
+def _run_verify_py_types_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Run py-types for Python edits, gating only regressions against Git ``HEAD``."""
+    try:
+        delta = _verify_type_annotation_delta(root, targets)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded edited-file type delta could not be derived from Git and Python source",
+        }, EXIT_TOOLCHAIN
+    if delta["state"] == "not_applicable":
+        return delta, 0
+    rc, output = _delegate_capturing(
+        "--json",
+        "py-types",
+        "--detail",
+        "--top",
+        str(MAX_VERIFY_TYPE_DETAIL_FILES),
+        "--include-tests",
+        executable=executable,
+        env=env,
+    )
+    if output is None:
+        return None, rc
+    try:
+        result = _validate_verify_py_types_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+            delta=delta,
+        )
+    except (UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "py-types did not return one complete structured result consistent with the edited files",
+        }, EXIT_TOOLCHAIN
+    if result.get("absolute_total_public") == 0 and result.get("current_public_count", 0) != 0:
+        return {
+            "state": "unavailable",
+            "reason": "py-types did not index the edited public Python symbols",
+        }, EXIT_TOOLCHAIN
+    return result, 0
+
+
+def _verify_py_types_unavailable_verdict(reason: object) -> str:
+    safe_reason = (
+        reason
+        if isinstance(reason, str)
+        and 0 < len(reason) <= MAX_VERIFY_TYPE_TEXT_CHARS
+        and all(ord(char) >= 32 for char in reason)
+        else "the type-annotation check could not establish a complete result"
+    )
+    return (
+        f"VERDICT: verify unavailable — py-types did not run completely: {safe_reason}. "
+        "A triggered type check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited "
+        "Python source, then rerun `compile verify --changed`."
+    )
+
+
 def _prepare_verify_request(
     files: tuple[str, ...],
 ) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
@@ -4631,7 +5185,7 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = (), dif
     return "\n".join(lines)
 
 
-def _render_verify_with_product_checks(
+def _render_verify_with_rules_check(
     envelope: dict,
     rules_result: Mapping[str, object] | None,
     *,
@@ -4701,6 +5255,80 @@ def _render_verify_with_product_checks(
     return "\n".join(lines)
 
 
+def _render_verify_with_product_checks(
+    envelope: dict,
+    rules_result: Mapping[str, object] | None,
+    py_types_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose core Verify with the validated product-owned check results."""
+    rendered = _render_verify_with_rules_check(
+        envelope,
+        rules_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
+    if py_types_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = py_types_result.get("state")
+    if state == "not_applicable":
+        lines.append("py-types [not_applicable]: no changed Python files")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("py_types_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "py-types" not in roster:
+                lines[index] = f"{line}, py-types"
+            break
+    else:
+        lines.insert(1, "checks: py-types")
+
+    total_public = _plain_int(py_types_result.get("absolute_total_public"))
+    coverage = py_types_result.get("absolute_coverage_pct")
+    if coverage is not None:
+        _plain_int(coverage, maximum=100)
+        absolute = f"absolute repository coverage observed at {coverage}% across {total_public} public callables"
+    else:
+        absolute = "absolute repository coverage not computable (no public callables)"
+    if state == "complete":
+        lines.append(f"py-types [complete]: edited-file annotation delta clean; {absolute}")
+        return "\n".join(lines)
+
+    regression_count = _plain_int(py_types_result.get("regression_count"), minimum=1)
+    summary = envelope["summary"]
+    targets_checked = summary.get("targets_checked", summary["files_checked"])
+    if lines[0].startswith("VERDICT: FAIL (governance rules)"):
+        lines[0] = "VERDICT: FAIL (governance rules + type-annotation regression) -- product-owned edit gates failed"
+    else:
+        lines[0] = (
+            f"VERDICT: FAIL (type-annotation regression) -- {regression_count} degraded annotation"
+            f"{'s' if regression_count != 1 else ''} in {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    findings = py_types_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("py_types_render_findings")
+    lines.extend(("", "PY TYPES (0/100):"))
+    for finding in findings[:MAX_VERIFY_TYPE_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("py_types_render_finding")
+        location = str(finding["file"])
+        if finding.get("line") is not None:
+            location += f":{finding['line']}"
+        lines.append(f"  FAIL: {location} -- {finding['symbol']}: {finding['annotation']} {finding['change']}")
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more type-annotation regressions omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]:
     files: list[str] = []
     findings = rules_result.get("findings")
@@ -4713,6 +5341,17 @@ def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]
             and isinstance(finding.get("file"), str)
             and finding["file"] not in files
         ):
+            files.append(finding["file"])
+    return files
+
+
+def _verify_py_types_failing_files(py_types_result: Mapping[str, object]) -> list[str]:
+    files: list[str] = []
+    findings = py_types_result.get("findings")
+    if not isinstance(findings, tuple):
+        return files
+    for finding in findings:
+        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
             files.append(finding["file"])
     return files
 
@@ -4970,11 +5609,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     changed set. Its delete-safety check derives its trigger from the same Git
     change: a deleted or renamed path, or a diff hunk removing an
     exported/public symbol, is checked for surviving references. The
-    product-owned rules adapter is also auto-selected for any edit: a bounded
-    declaration probe runs `.roam/rules` YAML rules when present and reports a
-    typed not_applicable state when none exist. If either triggered check lacks
-    the inputs needed for a complete result, VERIFY names the unavailable state
-    and refuses instead of publishing a false pass.
+    product-owned adapters are also auto-selected from that scope: a bounded
+    declaration probe runs `.roam/rules` YAML rules when present, and Python
+    edits run `py-types` with an edited-symbol delta against Git ``HEAD`` so
+    legacy absolute debt does not gate unrelated work. Inapplicable adapters
+    report typed not_applicable states. If any triggered check lacks the inputs
+    needed for a complete result, VERIFY names the unavailable state and
+    refuses instead of publishing a false pass.
     `--new-only` passes through to roam's accepted-debt baseline; `--diff-only`
     keeps the output scoped to changed lines. Only a complete, bound JSON
     receipt is rendered. A validated gate failure is followed by a block naming
@@ -5033,6 +5674,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             click.echo(_narrowed_scope_notice(excluded))
         raise SystemExit(rc)
     rules_result: dict[str, object] | None = None
+    py_types_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -5060,6 +5702,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "py-types" in selected_product_checks:
+            py_types_result, py_types_rc = _run_verify_py_types_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if py_types_result is None:
+                raise SystemExit(py_types_rc)
+            if py_types_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_py_types_unavailable_verdict(
+                        py_types_result.get("unavailable_reason", py_types_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -5081,6 +5740,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     rendered = _render_verify_with_product_checks(
         envelope,
         rules_result,
+        py_types_result,
         excluded=excluded,
         diff_only=diff_only,
     )
@@ -5090,11 +5750,16 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     # completed nonzero run gets the failure block — including roam's own
     # exit 2 ("bad arguments"), which only the sentinel can distinguish from
     # this CLI's EXIT_TOOLCHAIN (also 2).
-    final_rc = EXIT_VERIFY_GATE if rules_result is not None and rules_result.get("state") == "failed" else rc
+    product_failed = any(
+        result is not None and result.get("state") == "failed" for result in (rules_result, py_types_result)
+    )
+    final_rc = EXIT_VERIFY_GATE if product_failed else rc
     if final_rc != 0:
         failing = _failing_files(envelope)
         if rules_result is not None:
             failing.extend(path for path in _verify_rules_failing_files(rules_result) if path not in failing)
+        if py_types_result is not None:
+            failing.extend(path for path in _verify_py_types_failing_files(py_types_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(

@@ -221,6 +221,114 @@ def _rules_envelope(
     }
 
 
+def _py_types_envelope(
+    *,
+    total_public: int,
+    findings: list[dict[str, object]],
+    python_files: int = 1,
+    default_path: str = "service.py",
+) -> dict[str, object]:
+    """A measured roam 14.0.0 py-types envelope, with neutral fixture data."""
+    no_return = sum("no-return" in finding["issues"] for finding in findings)
+    untyped_params = sum(any(str(issue).endswith("-untyped") for issue in finding["issues"]) for finding in findings)
+    uses_any = sum("uses-Any" in finding["issues"] for finding in findings)
+    old_typing = sum("legacy-typing" in finding["issues"] for finding in findings)
+    coverage = ((total_public - max(no_return, untyped_params)) * 100 // total_public) if total_public else 0
+    summary: dict[str, object] = {
+        "verdict": f"fixture type coverage ({coverage}%)",
+        "total_public": total_public,
+        "total_public_definition": "public Python functions/methods; test files excluded unless --include-tests is set",
+        "no_return_annotation": no_return,
+        "untyped_params": untyped_params,
+        "uses_any": uses_any,
+        "old_typing": old_typing,
+        "coverage_pct": coverage,
+        "coverage_pct_definition": "(total_public - max(no_return_annotation, untyped_params)) * 100 // total_public",
+        "partial_success": False,
+    }
+    if total_public == 0:
+        summary.update(
+            state="no_public_python_functions" if python_files else "no_python_files",
+            coverage_pct_computable=False,
+            python_files=python_files,
+            indexed_files=python_files,
+        )
+    paths = sorted({str(finding["path"]) for finding in findings}) or ([default_path] if total_public else [])
+    missing_symbols = {
+        (str(finding["path"]), str(finding["name"]))
+        for finding in findings
+        if "no-return" in finding["issues"] or any(str(issue).endswith("-untyped") for issue in finding["issues"])
+    }
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "py-types",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": summary,
+        "by_file": [
+            {
+                "path": path,
+                "total": total_public if len(paths) == 1 else sum(finding["path"] == path for finding in findings),
+                "missing": sum(finding_path == path for finding_path, _symbol in missing_symbols),
+            }
+            for path in paths
+        ],
+        "findings": findings,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_type_delta(monkeypatch):
+    """Keep protocol-format fixtures focused when they have no Git evidence.
+
+    The real type delta still runs for Git-backed fixtures and for non-Python
+    scopes. Tests that deliberately exercise an unavailable or fabricated
+    delta replace this seam again in their own setup.
+    """
+    real_delta = mod._verify_type_annotation_delta
+
+    def fixture_delta(root, targets):
+        python_targets = tuple(path for path in targets if Path(path).suffix.lower() == ".py")
+        current_files_exist = all((root / Path(path)).is_file() for path in python_targets)
+        if python_targets and (not mod._git_marker_has_evidence(root) or not current_files_exist):
+            return {
+                "state": "complete",
+                "python_target_count": len(python_targets),
+                "current_python_file_count": sum((root / Path(path)).is_file() for path in python_targets),
+                "current_public_count": 0,
+                "regression_count": 0,
+                "findings": (),
+                "required_no_return": 0,
+                "required_untyped": 0,
+                "required_any": 0,
+            }
+        return real_delta(root, targets)
+
+    monkeypatch.setattr(mod, "_verify_type_annotation_delta", fixture_delta)
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_py_types_check(monkeypatch):
+    """Keep receipt-only fixtures independent of product-check delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_py_types_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_total_public": 0,
+                "absolute_coverage_pct": None,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
 def _no_changes_envelope(receipt: dict[str, object]) -> dict[str, object]:
     """The canonical 'nothing to verify' transaction roam emits for an empty scope."""
     envelope = _verify_envelope(receipt=receipt)
@@ -867,6 +975,10 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
 
     def _invoke(self, runner, monkeypatch, mutate=None):
         def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-types"]:
+                envelope = _py_types_envelope(total_public=0, findings=[])
+                envelope["version"] = self.FUTURE
+                return SimpleNamespace(returncode=0, stdout=json.dumps(envelope), stderr="")
             receipt = {
                 "schema": mod.VERIFY_RECEIPT_SCHEMA,
                 "request_nonce": env["ROAM_VERIFY_REQUEST_NONCE"],
@@ -1690,7 +1802,7 @@ class TestFailurePathsLaunch:
         assert res.exit_code == 0
 
 
-@pytest.mark.usefixtures("compatible_roam")
+@pytest.mark.usefixtures("compatible_roam", "neutralize_synthetic_verify_type_delta")
 class TestVerifyFailureFormatting:
     """`compile verify` must turn a roam verify failure into a block that names
     the failing command, the changed files, a likely cause, and one local rerun."""
@@ -1715,7 +1827,10 @@ class TestVerifyFailureFormatting:
 
         class _P:
             def __init__(self, args, stdout):
-                captured["args"] = list(args)
+                if list(args[:2]) == ["--json", "py-types"]:
+                    captured["product_args"] = list(args)
+                else:
+                    captured["args"] = list(args)
                 self.stdout = stdout
                 self.stderr = ""
 
@@ -1724,6 +1839,8 @@ class TestVerifyFailureFormatting:
         def fake(*args, timeout=600, executable="roam", env=None):
             captured["executable"] = executable
             captured["env"] = dict(env or {})
+            if list(args[:2]) == ["--json", "py-types"]:
+                return _P(args, json.dumps(_py_types_envelope(total_public=10_000, findings=[])))
             raw = output
             match = re.match(r"VERDICT:\s+(PASS|WARN|FAIL)\s+\(score\s+(\d+)/100\)", output)
             if match and output.count("VERDICT:") == 1:
@@ -1843,7 +1960,9 @@ class TestVerifyFailureFormatting:
         )
         assert "files   : (no changed files)" in block
 
-    def test_verify_failure_emits_block_and_exit_5(self, runner, monkeypatch, compatible_roam):
+    def test_verify_failure_emits_block_and_exit_5(
+        self, runner, monkeypatch, compatible_roam, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         monkeypatch.setattr(mod, "_changed_files", lambda: pytest.fail("parsed failures need no local discovery"))
@@ -1945,7 +2064,9 @@ class TestVerifyFailureFormatting:
         assert "cannot pass" in res.output
         assert remedy in res.output
 
-    def test_deleted_symbol_survivors_fail_and_name_each_referencing_site(self, runner, monkeypatch):
+    def test_deleted_symbol_survivors_fail_and_name_each_referencing_site(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         finding = {
             "severity": "FAIL",
             "category": "delete_check",
@@ -2023,6 +2144,20 @@ class TestVerifyFailureFormatting:
             lambda _files: (tmp_path, ["src/service.py"], receipt, env, []),
         )
         monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        monkeypatch.setattr(
+            mod,
+            "_run_verify_py_types_check",
+            lambda *_args, **_kwargs: (
+                {
+                    "state": "complete",
+                    "absolute_total_public": 1,
+                    "absolute_coverage_pct": 0,
+                    "regression_count": 0,
+                    "findings": (),
+                },
+                0,
+            ),
+        )
 
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         rule_output = json.dumps(
@@ -2092,6 +2227,20 @@ class TestVerifyFailureFormatting:
             lambda _files: (tmp_path, ["src/service.py"], receipt, env, []),
         )
         monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        monkeypatch.setattr(
+            mod,
+            "_run_verify_py_types_check",
+            lambda *_args, **_kwargs: (
+                {
+                    "state": "complete",
+                    "absolute_total_public": 1,
+                    "absolute_coverage_pct": 0,
+                    "regression_count": 0,
+                    "findings": (),
+                },
+                0,
+            ),
+        )
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         rule_output = json.dumps(
             _rules_envelope(
@@ -2184,6 +2333,309 @@ class TestVerifyFailureFormatting:
         assert result["state"] == "unavailable"
         assert result["unavailable_reason"] == "declared rule configuration was not completely evaluated"
 
+    def test_annotation_removal_fails_and_names_file_symbols_and_annotations(self, runner, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "from __future__ import annotations\n\n"
+            "def normalise(record_id: int, label: str) -> str:\n"
+            '    return f"{record_id}:{label}"\n\n'
+            "class Catalogue:\n"
+            "    def label(self, item_id: int) -> str:\n"
+            '        return f"item-{item_id}"\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "service.py"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "typed baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        source.write_text(
+            "from __future__ import annotations\n\n"
+            "def normalise(record_id, label):\n"
+            '    return f"{record_id}:{label}"\n\n'
+            "class Catalogue:\n"
+            "    def label(self, item_id):\n"
+            '        return f"item-{item_id}"\n',
+            encoding="utf-8",
+        )
+        digest = mod._verification_content_sha256(tmp_path, ["service.py"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["service.py"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        type_output = json.dumps(
+            _py_types_envelope(
+                total_public=2,
+                findings=[
+                    {
+                        "name": "normalise",
+                        "path": "service.py",
+                        "line": 3,
+                        "issues": ["no-return", "2-untyped"],
+                    },
+                    {
+                        "name": "Catalogue.label",
+                        "path": "service.py",
+                        "line": 7,
+                        "issues": ["no-return", "1-untyped"],
+                    },
+                ],
+            )
+        )
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-types"]:
+                return SimpleNamespace(returncode=0, stdout=type_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (type-annotation regression)")
+        assert "service.py" in result.output
+        assert "normalise" in result.output
+        assert "Catalogue.label" in result.output
+        assert "record_id annotation removed" in result.output
+        assert "return annotation removed" in result.output
+
+    @pytest.mark.parametrize(
+        ("baseline", "edited"),
+        [
+            (
+                "def normalise(record_id: int, label: str) -> str:\n    return f'{record_id}:{label}'\n",
+                "def normalise(record_id: int, label: str) -> str:\n    return f'record-{record_id}:{label}'\n",
+            ),
+            (
+                "def normalise(record_id, label):\n    return '{}:{}'.format(record_id, label)\n",
+                "def normalise(record_id, label):\n    return 'record-{}:{}'.format(record_id, label)\n",
+            ),
+        ],
+        ids=["well-typed-body-edit", "legacy-untyped-body-edit"],
+    )
+    def test_type_delta_conservation_ignores_unchanged_type_debt(self, baseline, edited, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(baseline, encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "service.py"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        source.write_text(edited, encoding="utf-8")
+
+        result = mod._verify_type_annotation_delta(tmp_path, ["service.py"])
+
+        assert result["state"] == "complete"
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_type_delta_names_any_and_union_widening(self, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text("def convert(value: int) -> int:\n    return value\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "service.py"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "typed baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        source.write_text("def convert(value: int | str) -> Any:\n    return value\n", encoding="utf-8")
+
+        result = mod._verify_type_annotation_delta(tmp_path, ["service.py"])
+
+        assert result["state"] == "failed"
+        assert result["regression_count"] == 2
+        assert {finding["annotation"] for finding in result["findings"]} == {
+            "value annotation",
+            "return annotation",
+        }
+        assert all("widened from" in finding["change"] for finding in result["findings"])
+
+    @pytest.mark.parametrize(
+        ("control", "findings", "expected_coverage"),
+        [
+            ("well-typed edit", [], "100%"),
+            (
+                "legacy-untyped edit",
+                [
+                    {
+                        "name": "normalise",
+                        "path": "service.py",
+                        "line": 1,
+                        "issues": ["no-return", "2-untyped"],
+                    }
+                ],
+                "0%",
+            ),
+        ],
+        ids=["well-typed", "legacy-untyped-noise-trap"],
+    )
+    def test_python_type_conservation_edits_pass_without_gating_absolute_debt(
+        self, control, findings, expected_coverage, runner, monkeypatch, tmp_path
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def normalise(record_id, label):\n    return f'{record_id}:{label}'\n", encoding="utf-8")
+        digest = mod._verification_content_sha256(tmp_path, ["service.py"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["service.py"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        monkeypatch.setattr(
+            mod,
+            "_verify_type_annotation_delta",
+            lambda _root, _targets: {
+                "state": "complete",
+                "python_target_count": 1,
+                "current_public_count": 1,
+                "regression_count": 0,
+                "findings": (),
+                "required_no_return": 0,
+                "required_untyped": 0,
+                "required_any": 0,
+            },
+        )
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        type_output = json.dumps(_py_types_envelope(total_public=1, findings=findings))
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-types"]:
+                return SimpleNamespace(returncode=0, stdout=type_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert control
+        assert result.exit_code == 0
+        assert result.output.startswith("VERDICT: PASS")
+        assert "py-types [complete]: edited-file annotation delta clean" in result.output
+        assert f"coverage observed at {expected_coverage}" in result.output
+
+    def test_non_python_edit_records_type_not_applicable_without_launching_evaluator(
+        self, runner, monkeypatch, tmp_path
+    ):
+        readme = tmp_path / "README.md"
+        readme.write_text("# Fixture\n", encoding="utf-8")
+        digest = mod._verification_content_sha256(tmp_path, ["README.md"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["README.md"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "README.md"])
+
+        assert result.exit_code == 0
+        assert "py-types [not_applicable]: no changed Python files" in result.output
+        assert "product_args" not in captured
+
+    def test_triggered_type_check_unavailability_is_typed_at_exit_2(self, runner, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text("def normalise(value: int) -> int:\n    return value\n", encoding="utf-8")
+        digest = mod._verification_content_sha256(tmp_path, ["service.py"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["service.py"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        monkeypatch.setattr(
+            mod,
+            "_verify_type_annotation_delta",
+            lambda _root, _targets: (_ for _ in ()).throw(ValueError("fixture delta unavailable")),
+        )
+        fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "py-types did not run completely" in result.output
+        assert "repair Git, the Roam index, or the edited Python source" in result.output
+        assert "product_args" not in captured
+
     @pytest.mark.parametrize("output", ["", "checks completed without a verdict\n"], ids=["empty", "malformed"])
     def test_zero_exit_requires_parseable_success_verdict(self, output, runner, monkeypatch):
         fake, _ = self._capture(output, 0)
@@ -2238,7 +2690,9 @@ class TestVerifyFailureFormatting:
         assert "kernel diagnostic from completed run" not in res.output
         assert res.output.count("VERDICT: verifier protocol failure") == 1
 
-    def test_verify_threshold_passes_through_and_shows_in_command(self, runner, monkeypatch):
+    def test_verify_threshold_passes_through_and_shows_in_command(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify", "--threshold", "90", "src/bad.py"])
@@ -2293,7 +2747,9 @@ class TestVerifyFailureFormatting:
         assert mixed.exit_code == 2
         assert "cannot be combined" in mixed.output
 
-    def test_failure_commands_quote_adversarial_paths_and_preserve_threshold(self, runner, monkeypatch):
+    def test_failure_commands_quote_adversarial_paths_and_preserve_threshold(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         malicious_path = "src/a.py; Write-Output AUDIT_CANARY"
         findings = [
             {
@@ -2352,7 +2808,9 @@ class TestVerifyFailureFormatting:
             assert "verify --threshold 90 --changed" in completed.stdout
             assert "AUDIT_CANARY" not in completed.stdout + completed.stderr
 
-    def test_verify_new_only_and_diff_only_pass_through(self, runner, monkeypatch):
+    def test_verify_new_only_and_diff_only_pass_through(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify", "--new-only", "--diff-only", "src/bad.py"])
@@ -2380,7 +2838,9 @@ class TestVerifyFailureFormatting:
         )
         assert captured["env"]["ROAM_VERIFY_SCOPE_COUNT"].isdigit()
 
-    def test_no_argument_failure_uses_bound_scope_for_human_context(self, runner, monkeypatch):
+    def test_no_argument_failure_uses_bound_scope_for_human_context(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify"])
@@ -2390,7 +2850,9 @@ class TestVerifyFailureFormatting:
         assert "files   : " in res.output
         assert "next    : compile verify --changed" in res.output
 
-    def test_failure_block_reports_parsed_failing_scope_not_all_targets(self, runner, monkeypatch):
+    def test_failure_block_reports_parsed_failing_scope_not_all_targets(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
 
@@ -2409,7 +2871,9 @@ class TestVerifyFailureFormatting:
         assert "files   : src/bad.py" in res.output
         assert "next    : compile verify --changed" in res.output
 
-    def test_oversized_advisory_does_not_change_delegation(self, runner, monkeypatch):
+    def test_oversized_advisory_does_not_change_delegation(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         files = [f"f{i}.py" for i in range(30)]
@@ -2453,7 +2917,9 @@ class TestVerifyFailureFormatting:
         assert "orchestration_contract" in res.output
         assert "summary.residual_wave_note" in res.output
 
-    def test_a_newer_producer_does_not_soften_a_real_gate_failure(self, runner, monkeypatch):
+    def test_a_newer_producer_does_not_soften_a_real_gate_failure(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+    ):
         self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
 
         res = runner.invoke(mod.cli, ["verify", "src/bad.py"])
@@ -2585,6 +3051,7 @@ class TestCommandInventory:
         assert res.output.strip() == _format_command_inventory(mod.cli.commands).strip()
 
 
+@pytest.mark.usefixtures("neutralize_synthetic_verify_py_types_check")
 class TestVerifyReceiptV3Protocol:
     def _validate(
         self,
