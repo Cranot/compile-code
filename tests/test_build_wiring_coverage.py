@@ -66,7 +66,7 @@ def test_render_starts_with_generated_by_header() -> None:
 def test_verify_derives_product_check_registration_and_trigger_descriptions() -> None:
     inventory = coverage.roam_command_inventory()
 
-    assert coverage._product_verify_commands(inventory) == frozenset({"py-types", "rules"})
+    assert coverage._product_verify_commands(inventory) == frozenset({"py-modern", "py-types", "rules"})
 
     import compile_code.cli as cli
 
@@ -76,6 +76,13 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "Python edits" in descriptions["py-types"]
     assert "pre-edit type surface" in descriptions["py-types"]
     assert "absolute legacy debt never gates" in descriptions["py-types"]
-    assert cli._auto_select_product_verify_checks(["README.md"]) == ("rules", "py-types")
-    assert cli._auto_select_product_verify_checks(["tests/test_service.py"]) == ("rules", "py-types")
+    assert "Python edits" in descriptions["py-modern"]
+    assert "Git pre-edit state" in descriptions["py-modern"]
+    assert "absolute legacy debt never gates" in descriptions["py-modern"]
+    assert cli._auto_select_product_verify_checks(["README.md"]) == ("rules", "py-types", "py-modern")
+    assert cli._auto_select_product_verify_checks(["tests/test_service.py"]) == (
+        "rules",
+        "py-types",
+        "py-modern",
+    )
     assert cli._auto_select_product_verify_checks([]) == ()

@@ -2547,6 +2547,7 @@ _VERIFY_CAUSE_LABELS = {
     "SECRETS": "exposed secret",
     "RULES": "governance rule violation",
     "PY TYPES": "type-annotation regression",
+    "PY MODERN": "Python modernization regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2650,6 +2651,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "Python edits run a bounded annotation-health probe and compare edited public symbols with their Git "
         "pre-edit type surface; non-Python edits report not_applicable and absolute legacy debt never gates.",
     ),
+    (
+        "py-modern",
+        "Python edits run a bounded modernization probe and compare outdated constructs in touched files with "
+        "their Git pre-edit state; non-Python edits report not_applicable and absolute legacy debt never gates.",
+    ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
     {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
@@ -2669,6 +2675,22 @@ _VERIFY_TYPE_EMPTY_STATES = frozenset({"no_python_files", "no_public_python_func
 _VERIFY_TYPE_ISSUE = re.compile(r"^(?:no-return|uses-Any|legacy-typing|[1-9]\d*-untyped)$")
 _VERIFY_TYPE_TOTAL_DEFINITION = "public Python functions/methods; test files excluded unless --include-tests is set"
 _VERIFY_TYPE_COVERAGE_DEFINITION = "(total_public - max(no_return_annotation, untyped_params)) * 100 // total_public"
+MAX_VERIFY_MODERN_DETAIL_FILES = 25
+MAX_VERIFY_MODERN_ENVELOPE_OCCURRENCES = MAX_VERIFY_MODERN_DETAIL_FILES * 5
+MAX_VERIFY_MODERN_FINDINGS = 10
+MAX_VERIFY_MODERN_TEXT_CHARS = 1024
+_VERIFY_MODERN_FEATURE_KEYS = (
+    "walrus",
+    "match_stmt",
+    "pep604",
+    "pep585",
+    "legacy_typing",
+    "pep695",
+    "fstring",
+    "dot_format",
+)
+_VERIFY_MODERN_LEGACY_TYPING = re.compile(r"\b(?:Optional|Dict|List|Set|Tuple|FrozenSet|Type)\[")
+_VERIFY_MODERN_DOT_FORMAT = re.compile(r"['\"]\s*\.format\s*\(")
 _VERIFY_CATEGORY_NAMES = _VERIFY_CHECK_NAMES | {"verification"}
 # There is deliberately no hand-copied "categories allowed to WARN on a PASS"
 # set here. Roam declares advisory-ness per category in the envelope it sends,
@@ -4119,6 +4141,33 @@ def _verify_type_head_source(root: Path, baseline_path: str | None) -> str:
         raise ValueError("type_baseline_non_utf8") from exc
 
 
+def _verify_edited_python_sources(root: Path, targets: Sequence[str]) -> tuple[tuple[str, bool, str, str], ...]:
+    """Return bounded current/HEAD source pairs for the edited Python files."""
+    python_targets = tuple(path for path in targets if Path(path).suffix.lower() == ".py")
+    if not python_targets:
+        return ()
+    baseline_paths = _verify_type_baseline_paths(root, python_targets)
+    sources: list[tuple[str, bool, str, str]] = []
+    total_source_bytes = 0
+    for path in python_targets:
+        candidate = root / Path(path)
+        try:
+            current_exists = candidate.exists()
+            current_raw = (
+                ""
+                if not current_exists
+                else _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_TYPE_SOURCE_BYTES)
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("type_current_source_unavailable") from exc
+        baseline_raw = _verify_type_head_source(root, baseline_paths[path])
+        total_source_bytes += len(current_raw.encode("utf-8")) + len(baseline_raw.encode("utf-8"))
+        if total_source_bytes > MAX_VERIFY_TYPE_TOTAL_SOURCE_BYTES:
+            raise ValueError("type_source_scope_too_large")
+        sources.append((path, current_exists, baseline_raw, current_raw))
+    return tuple(sources)
+
+
 def _verify_type_annotation_regressed(
     previous: Mapping[str, object], current: Mapping[str, object]
 ) -> tuple[bool, str]:
@@ -4137,21 +4186,19 @@ def _verify_type_annotation_regressed(
 
 def _verify_type_annotation_delta(root: Path, targets: Sequence[str]) -> dict[str, object]:
     """Compare edited Python callables with their Git ``HEAD`` type surface."""
-    python_targets = tuple(path for path in targets if Path(path).suffix.lower() == ".py")
-    if not python_targets:
+    python_sources = _verify_edited_python_sources(root, targets)
+    if not python_sources:
         return {
             "state": "not_applicable",
             "reason": "no changed Python files",
             "regression_count": 0,
             "findings": (),
         }
-    baseline_paths = _verify_type_baseline_paths(root, python_targets)
     findings: list[dict[str, object]] = []
     regression_count = 0
     required_no_return: set[tuple[str, str]] = set()
     required_untyped: set[tuple[str, str]] = set()
     required_any: set[tuple[str, str]] = set()
-    total_source_bytes = 0
     current_public_count = 0
     current_python_file_count = 0
 
@@ -4184,22 +4231,8 @@ def _verify_type_annotation_delta(root: Path, targets: Sequence[str]) -> dict[st
                 }
             )
 
-    for path in python_targets:
-        candidate = root / Path(path)
-        try:
-            current_exists = candidate.exists()
-            current_raw = (
-                ""
-                if not current_exists
-                else _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_TYPE_SOURCE_BYTES)
-            )
-        except (OSError, ValueError) as exc:
-            raise ValueError("type_current_source_unavailable") from exc
+    for path, current_exists, baseline_raw, current_raw in python_sources:
         current_python_file_count += int(current_exists)
-        baseline_raw = _verify_type_head_source(root, baseline_paths[path])
-        total_source_bytes += len(current_raw.encode("utf-8")) + len(baseline_raw.encode("utf-8"))
-        if total_source_bytes > MAX_VERIFY_TYPE_TOTAL_SOURCE_BYTES:
-            raise ValueError("type_source_scope_too_large")
         previous_surface = _python_annotation_surface(baseline_raw)
         current_surface = _python_annotation_surface(current_raw)
         current_public_count += len(current_surface)
@@ -4318,7 +4351,7 @@ def _verify_type_annotation_delta(root: Path, targets: Sequence[str]) -> dict[st
                     )
     return {
         "state": "failed" if regression_count else "complete",
-        "python_target_count": len(python_targets),
+        "python_target_count": len(python_sources),
         "current_python_file_count": current_python_file_count,
         "current_public_count": current_public_count,
         "regression_count": regression_count,
@@ -4485,6 +4518,278 @@ def _verify_py_types_unavailable_verdict(reason: object) -> str:
         f"VERDICT: verify unavailable — py-types did not run completely: {safe_reason}. "
         "A triggered type check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited "
         "Python source, then rerun `compile verify --changed`."
+    )
+
+
+def _verify_modern_occurrences(path: str, raw: str) -> tuple[dict[str, object], ...]:
+    occurrences: list[dict[str, object]] = []
+    for kind, pattern in (
+        ("legacy-typing", _VERIFY_MODERN_LEGACY_TYPING),
+        ("dot-format", _VERIFY_MODERN_DOT_FORMAT),
+    ):
+        occurrences.extend(
+            {
+                "file": path,
+                "line": raw.count("\n", 0, match.start()) + 1,
+                "kind": kind,
+                "match": match.group(0).strip(),
+            }
+            for match in pattern.finditer(raw)
+        )
+    return tuple(occurrences)
+
+
+def _verify_python_modernization_delta(root: Path, targets: Sequence[str]) -> dict[str, object]:
+    """Compare outdated constructs in edited Python files with Git ``HEAD``."""
+    python_sources = _verify_edited_python_sources(root, targets)
+    if not python_sources:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed Python files",
+            "regression_count": 0,
+            "findings": (),
+        }
+
+    regression_count = 0
+    findings: list[dict[str, object]] = []
+    current_by_file: dict[str, dict[str, int]] = {}
+    current_python_file_count = 0
+    for path, current_exists, baseline_raw, current_raw in python_sources:
+        current_python_file_count += int(current_exists)
+        baseline_counts = Counter(
+            (str(occurrence["kind"]), str(occurrence["match"]))
+            for occurrence in _verify_modern_occurrences(path, baseline_raw)
+        )
+        current_occurrences = _verify_modern_occurrences(path, current_raw)
+        current_counts = Counter(str(occurrence["kind"]) for occurrence in current_occurrences)
+        current_by_file[path] = {
+            "legacy_typing": current_counts["legacy-typing"],
+            "dot_format": current_counts["dot-format"],
+        }
+        for occurrence in current_occurrences:
+            key = (str(occurrence["kind"]), str(occurrence["match"]))
+            if baseline_counts[key]:
+                baseline_counts[key] -= 1
+                continue
+            regression_count += 1
+            if len(findings) < MAX_VERIFY_MODERN_FINDINGS:
+                findings.append(occurrence)
+
+    return {
+        "state": "failed" if regression_count else "complete",
+        "python_target_count": len(python_sources),
+        "current_python_file_count": current_python_file_count,
+        "current_legacy_typing": sum(counts["legacy_typing"] for counts in current_by_file.values()),
+        "current_dot_format": sum(counts["dot_format"] for counts in current_by_file.values()),
+        "current_by_file": current_by_file,
+        "regression_count": regression_count,
+        "findings": tuple(findings),
+    }
+
+
+def _validate_verify_py_modern_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+    delta: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the bounded absolute ``py-modern`` result and bind it to the edit delta."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("py_modern_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "py-modern"
+        or envelope.get("version") != expected_roam_version
+        or returncode != 0
+    ):
+        raise ValueError("py_modern_envelope")
+    summary = envelope.get("summary")
+    by_file = envelope.get("by_file")
+    raw_occurrences = envelope.get("legacy_occurrences")
+    if not isinstance(summary, dict) or not isinstance(by_file, list) or not isinstance(raw_occurrences, list):
+        raise ValueError("py_modern_shape")
+    if len(by_file) > MAX_VERIFY_MODERN_DETAIL_FILES or len(raw_occurrences) > MAX_VERIFY_MODERN_ENVELOPE_OCCURRENCES:
+        raise ValueError("py_modern_result_bound")
+    if summary.get("partial_success") is not False:
+        raise ValueError("py_modern_incomplete")
+
+    totals = {key: _plain_int(summary.get(key)) for key in _VERIFY_MODERN_FEATURE_KEYS}
+    files_scanned = _plain_int(summary.get("files_scanned"))
+    type_ratio = _plain_int(summary.get("type_modernisation_pct"), maximum=100)
+    format_ratio = _plain_int(summary.get("fstring_pct"), maximum=100)
+    type_total = totals["pep604"] + totals["pep585"] + totals["legacy_typing"]
+    format_total = totals["fstring"] + totals["dot_format"]
+    expected_type_ratio = (totals["pep604"] + totals["pep585"]) * 100 // type_total if type_total else 0
+    expected_format_ratio = totals["fstring"] * 100 // format_total if format_total else 0
+    if type_ratio != expected_type_ratio or format_ratio != expected_format_ratio:
+        raise ValueError("py_modern_counts")
+    if type_ratio >= 80 and format_ratio >= 80:
+        label = "modern Python"
+    elif type_ratio >= 50 and format_ratio >= 50:
+        label = "mixed Python"
+    else:
+        label = "legacy Python"
+    verdict = _bounded_verify_rule_text(summary.get("verdict"), reason="py_modern_verdict")
+    if verdict != f"{label} (type-modern {type_ratio}%, f-string {format_ratio}%)":
+        raise ValueError("py_modern_verdict")
+
+    row_totals = Counter({key: 0 for key in _VERIFY_MODERN_FEATURE_KEYS})
+    rows_by_path: dict[str, dict[str, int]] = {}
+    for row in by_file:
+        if not isinstance(row, dict):
+            raise ValueError("py_modern_file")
+        path = _verify_rule_site(expected_root, row.get("path"))
+        if path in rows_by_path:
+            raise ValueError("py_modern_file")
+        counts = {key: _plain_int(row.get(key)) for key in _VERIFY_MODERN_FEATURE_KEYS}
+        if not any(counts.values()):
+            raise ValueError("py_modern_file")
+        rows_by_path[path] = counts
+        row_totals.update(counts)
+    if files_scanned < len(by_file) or any(row_totals[key] > totals[key] for key in _VERIFY_MODERN_FEATURE_KEYS):
+        raise ValueError("py_modern_counts")
+
+    occurrence_counts: Counter[str] = Counter()
+    occurrence_sites: Counter[tuple[str, int, str, str]] = Counter()
+    for occurrence in raw_occurrences:
+        if not isinstance(occurrence, dict):
+            raise ValueError("py_modern_occurrence")
+        path = _verify_rule_site(expected_root, occurrence.get("path"))
+        line = _plain_int(occurrence.get("line"), minimum=1)
+        kind = occurrence.get("kind")
+        match = _bounded_verify_rule_text(occurrence.get("match"), reason="py_modern_occurrence_match")
+        if kind == "legacy-typing":
+            if _VERIFY_MODERN_LEGACY_TYPING.fullmatch(match) is None:
+                raise ValueError("py_modern_occurrence")
+        elif kind == "dot-format":
+            if _VERIFY_MODERN_DOT_FORMAT.fullmatch(match) is None:
+                raise ValueError("py_modern_occurrence")
+        else:
+            raise ValueError("py_modern_occurrence")
+        occurrence_counts[kind] += 1
+        occurrence_sites[(path, line, kind, match)] += 1
+    outdated_total = totals["legacy_typing"] + totals["dot_format"]
+    if len(raw_occurrences) != min(outdated_total, MAX_VERIFY_MODERN_ENVELOPE_OCCURRENCES):
+        raise ValueError("py_modern_occurrence_count")
+    if (
+        occurrence_counts["legacy-typing"] > totals["legacy_typing"]
+        or occurrence_counts["dot-format"] > totals["dot_format"]
+    ):
+        raise ValueError("py_modern_occurrence_count")
+
+    current_python_file_count = _plain_int(delta.get("current_python_file_count"))
+    current_legacy_typing = _plain_int(delta.get("current_legacy_typing"))
+    current_dot_format = _plain_int(delta.get("current_dot_format"))
+    if (
+        files_scanned < current_python_file_count
+        or totals["legacy_typing"] < current_legacy_typing
+        or totals["dot_format"] < current_dot_format
+    ):
+        raise ValueError("py_modern_delta_contradiction")
+    current_by_file = delta.get("current_by_file")
+    if not isinstance(current_by_file, Mapping):
+        raise ValueError("py_modern_delta_contradiction")
+    for path, raw_counts in current_by_file.items():
+        if not isinstance(path, str) or not isinstance(raw_counts, Mapping):
+            raise ValueError("py_modern_delta_contradiction")
+        expected_counts = {
+            "legacy_typing": _plain_int(raw_counts.get("legacy_typing")),
+            "dot_format": _plain_int(raw_counts.get("dot_format")),
+        }
+        row = rows_by_path.get(path)
+        if row is None:
+            if len(by_file) < MAX_VERIFY_MODERN_DETAIL_FILES and any(expected_counts.values()):
+                raise ValueError("py_modern_delta_contradiction")
+            continue
+        if any(row[key] < value for key, value in expected_counts.items()):
+            raise ValueError("py_modern_delta_contradiction")
+
+    if outdated_total <= MAX_VERIFY_MODERN_ENVELOPE_OCCURRENCES:
+        for finding in delta.get("findings", ()):
+            if not isinstance(finding, Mapping):
+                raise ValueError("py_modern_delta_contradiction")
+            site = (
+                str(finding.get("file")),
+                _plain_int(finding.get("line"), minimum=1),
+                str(finding.get("kind")),
+                str(finding.get("match")),
+            )
+            if not occurrence_sites[site]:
+                raise ValueError("py_modern_delta_contradiction")
+            occurrence_sites[site] -= 1
+
+    result = dict(delta)
+    result.update(
+        absolute_files_scanned=files_scanned,
+        absolute_type_modernisation_pct=type_ratio,
+        absolute_fstring_pct=format_ratio,
+        absolute_legacy_typing=totals["legacy_typing"],
+        absolute_dot_format=totals["dot_format"],
+    )
+    return result
+
+
+def _run_verify_py_modern_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Run py-modern for Python edits, gating only regressions against Git ``HEAD``."""
+    try:
+        delta = _verify_python_modernization_delta(root, targets)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded edited-file modernization delta could not be derived from Git and Python source",
+        }, EXIT_TOOLCHAIN
+    if delta["state"] == "not_applicable":
+        return delta, 0
+    rc, output = _delegate_capturing(
+        "--json",
+        "py-modern",
+        "--detail",
+        "--top",
+        str(MAX_VERIFY_MODERN_DETAIL_FILES),
+        executable=executable,
+        env=env,
+    )
+    if output is None:
+        return None, rc
+    try:
+        result = _validate_verify_py_modern_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+            delta=delta,
+        )
+    except (UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "py-modern did not return one complete structured result consistent with the edited files",
+        }, EXIT_TOOLCHAIN
+    return result, 0
+
+
+def _verify_py_modern_unavailable_verdict(reason: object) -> str:
+    safe_reason = (
+        reason
+        if isinstance(reason, str)
+        and 0 < len(reason) <= MAX_VERIFY_MODERN_TEXT_CHARS
+        and all(ord(char) >= 32 for char in reason)
+        else "the Python modernization check could not establish a complete result"
+    )
+    return (
+        f"VERDICT: verify unavailable — py-modern did not run completely: {safe_reason}. "
+        "A triggered modernization check that did not run cannot pass. Fix: repair Git, the Roam index, or the "
+        "edited Python source, then rerun `compile verify --changed`."
     )
 
 
@@ -5259,6 +5564,7 @@ def _render_verify_with_product_checks(
     envelope: dict,
     rules_result: Mapping[str, object] | None,
     py_types_result: Mapping[str, object] | None,
+    py_modern_result: Mapping[str, object] | None,
     *,
     excluded: Sequence[str] = (),
     diff_only: bool = False,
@@ -5270,62 +5576,127 @@ def _render_verify_with_product_checks(
         excluded=excluded,
         diff_only=diff_only,
     )
-    if py_types_result is None:
-        return rendered
     lines = rendered.splitlines()
-    state = py_types_result.get("state")
-    if state == "not_applicable":
-        lines.append("py-types [not_applicable]: no changed Python files")
+    summary = envelope["summary"]
+    targets_checked = summary.get("targets_checked", summary["files_checked"])
+
+    if py_types_result is not None:
+        state = py_types_result.get("state")
+        if state == "not_applicable":
+            lines.append("py-types [not_applicable]: no changed Python files")
+        elif state in {"complete", "failed"}:
+            for index, line in enumerate(lines):
+                if line.startswith("checks:"):
+                    roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+                    if "py-types" not in roster:
+                        lines[index] = f"{line}, py-types"
+                    break
+            else:
+                lines.insert(1, "checks: py-types")
+
+            total_public = _plain_int(py_types_result.get("absolute_total_public"))
+            coverage = py_types_result.get("absolute_coverage_pct")
+            if coverage is not None:
+                _plain_int(coverage, maximum=100)
+                absolute = (
+                    f"absolute repository coverage observed at {coverage}% across {total_public} public callables"
+                )
+            else:
+                absolute = "absolute repository coverage not computable (no public callables)"
+            if state == "complete":
+                lines.append(f"py-types [complete]: edited-file annotation delta clean; {absolute}")
+            else:
+                regression_count = _plain_int(py_types_result.get("regression_count"), minimum=1)
+                if lines[0].startswith("VERDICT: FAIL (governance rules)"):
+                    lines[0] = (
+                        "VERDICT: FAIL (governance rules + type-annotation regression) -- "
+                        "product-owned edit gates failed"
+                    )
+                else:
+                    lines[0] = (
+                        f"VERDICT: FAIL (type-annotation regression) -- {regression_count} degraded annotation"
+                        f"{'s' if regression_count != 1 else ''} in {targets_checked} changed file"
+                        f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+                        f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+                    )
+                findings = py_types_result.get("findings")
+                if not isinstance(findings, tuple):
+                    raise ValueError("py_types_render_findings")
+                lines.extend(("", "PY TYPES (0/100):"))
+                for finding in findings[:MAX_VERIFY_TYPE_FINDINGS]:
+                    if not isinstance(finding, Mapping):
+                        raise ValueError("py_types_render_finding")
+                    location = str(finding["file"])
+                    if finding.get("line") is not None:
+                        location += f":{finding['line']}"
+                    lines.append(
+                        f"  FAIL: {location} -- {finding['symbol']}: {finding['annotation']} {finding['change']}"
+                    )
+                omitted = regression_count - len(findings)
+                if omitted > 0:
+                    lines.append(f"  (+{omitted} more type-annotation regressions omitted by output bound)")
+        else:
+            raise ValueError("py_types_render_state")
+
+    if py_modern_result is None:
         return "\n".join(lines)
-    if state not in {"complete", "failed"}:
-        raise ValueError("py_types_render_state")
+    modern_state = py_modern_result.get("state")
+    if modern_state == "not_applicable":
+        lines.append("py-modern [not_applicable]: no changed Python files")
+        return "\n".join(lines)
+    if modern_state not in {"complete", "failed"}:
+        raise ValueError("py_modern_render_state")
 
     for index, line in enumerate(lines):
         if line.startswith("checks:"):
             roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
-            if "py-types" not in roster:
-                lines[index] = f"{line}, py-types"
+            if "py-modern" not in roster:
+                lines[index] = f"{line}, py-modern"
             break
     else:
-        lines.insert(1, "checks: py-types")
-
-    total_public = _plain_int(py_types_result.get("absolute_total_public"))
-    coverage = py_types_result.get("absolute_coverage_pct")
-    if coverage is not None:
-        _plain_int(coverage, maximum=100)
-        absolute = f"absolute repository coverage observed at {coverage}% across {total_public} public callables"
-    else:
-        absolute = "absolute repository coverage not computable (no public callables)"
-    if state == "complete":
-        lines.append(f"py-types [complete]: edited-file annotation delta clean; {absolute}")
+        lines.insert(1, "checks: py-modern")
+    type_ratio = _plain_int(py_modern_result.get("absolute_type_modernisation_pct"), maximum=100)
+    format_ratio = _plain_int(py_modern_result.get("absolute_fstring_pct"), maximum=100)
+    absolute_legacy = _plain_int(py_modern_result.get("absolute_legacy_typing"))
+    absolute_dot_format = _plain_int(py_modern_result.get("absolute_dot_format"))
+    absolute = (
+        f"absolute repository adoption observed at type-modern {type_ratio}%, f-string {format_ratio}% "
+        f"({absolute_legacy} legacy-typing, {absolute_dot_format} dot-format)"
+    )
+    if modern_state == "complete":
+        lines.append(f"py-modern [complete]: edited-file outdated-construct delta clean; {absolute}")
         return "\n".join(lines)
 
-    regression_count = _plain_int(py_types_result.get("regression_count"), minimum=1)
-    summary = envelope["summary"]
-    targets_checked = summary.get("targets_checked", summary["files_checked"])
-    if lines[0].startswith("VERDICT: FAIL (governance rules)"):
-        lines[0] = "VERDICT: FAIL (governance rules + type-annotation regression) -- product-owned edit gates failed"
+    modern_regression_count = _plain_int(py_modern_result.get("regression_count"), minimum=1)
+    failed_labels: list[str] = []
+    if rules_result is not None and rules_result.get("state") == "failed":
+        failed_labels.append("governance rules")
+    if py_types_result is not None and py_types_result.get("state") == "failed":
+        failed_labels.append("type-annotation regression")
+    failed_labels.append("Python modernization regression")
+    if len(failed_labels) > 1:
+        lines[0] = f"VERDICT: FAIL ({' + '.join(failed_labels)}) -- product-owned edit gates failed"
     else:
         lines[0] = (
-            f"VERDICT: FAIL (type-annotation regression) -- {regression_count} degraded annotation"
-            f"{'s' if regression_count != 1 else ''} in {targets_checked} changed file"
+            f"VERDICT: FAIL (Python modernization regression) -- {modern_regression_count} outdated construct"
+            f"{'s' if modern_regression_count != 1 else ''} introduced in {targets_checked} changed file"
             f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
             f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
         )
-    findings = py_types_result.get("findings")
-    if not isinstance(findings, tuple):
-        raise ValueError("py_types_render_findings")
-    lines.extend(("", "PY TYPES (0/100):"))
-    for finding in findings[:MAX_VERIFY_TYPE_FINDINGS]:
+    modern_findings = py_modern_result.get("findings")
+    if not isinstance(modern_findings, tuple):
+        raise ValueError("py_modern_render_findings")
+    lines.extend(("", "PY MODERN (0/100):"))
+    for finding in modern_findings[:MAX_VERIFY_MODERN_FINDINGS]:
         if not isinstance(finding, Mapping):
-            raise ValueError("py_types_render_finding")
+            raise ValueError("py_modern_render_finding")
         location = str(finding["file"])
         if finding.get("line") is not None:
             location += f":{finding['line']}"
-        lines.append(f"  FAIL: {location} -- {finding['symbol']}: {finding['annotation']} {finding['change']}")
-    omitted = regression_count - len(findings)
+        lines.append(f"  FAIL: {location} -- {finding['kind']} introduced: {finding['match']}")
+    omitted = modern_regression_count - len(modern_findings)
     if omitted > 0:
-        lines.append(f"  (+{omitted} more type-annotation regressions omitted by output bound)")
+        lines.append(f"  (+{omitted} more modernization regressions omitted by output bound)")
     return "\n".join(lines)
 
 
@@ -5348,6 +5719,17 @@ def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]
 def _verify_py_types_failing_files(py_types_result: Mapping[str, object]) -> list[str]:
     files: list[str] = []
     findings = py_types_result.get("findings")
+    if not isinstance(findings, tuple):
+        return files
+    for finding in findings:
+        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
+            files.append(finding["file"])
+    return files
+
+
+def _verify_py_modern_failing_files(py_modern_result: Mapping[str, object]) -> list[str]:
+    files: list[str] = []
+    findings = py_modern_result.get("findings")
     if not isinstance(findings, tuple):
         return files
     for finding in findings:
@@ -5611,11 +5993,11 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     exported/public symbol, is checked for surviving references. The
     product-owned adapters are also auto-selected from that scope: a bounded
     declaration probe runs `.roam/rules` YAML rules when present, and Python
-    edits run `py-types` with an edited-symbol delta against Git ``HEAD`` so
-    legacy absolute debt does not gate unrelated work. Inapplicable adapters
-    report typed not_applicable states. If any triggered check lacks the inputs
-    needed for a complete result, VERIFY names the unavailable state and
-    refuses instead of publishing a false pass.
+    edits run `py-types` and `py-modern` with edited-file deltas against Git
+    ``HEAD`` so legacy absolute debt does not gate unrelated work. Inapplicable
+    adapters report typed not_applicable states. If any triggered check lacks
+    the inputs needed for a complete result, VERIFY names the unavailable state
+    and refuses instead of publishing a false pass.
     `--new-only` passes through to roam's accepted-debt baseline; `--diff-only`
     keeps the output scoped to changed lines. Only a complete, bound JSON
     receipt is rendered. A validated gate failure is followed by a block naming
@@ -5675,6 +6057,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         raise SystemExit(rc)
     rules_result: dict[str, object] | None = None
     py_types_result: dict[str, object] | None = None
+    py_modern_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -5719,6 +6102,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "py-modern" in selected_product_checks:
+            py_modern_result, py_modern_rc = _run_verify_py_modern_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if py_modern_result is None:
+                raise SystemExit(py_modern_rc)
+            if py_modern_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_py_modern_unavailable_verdict(
+                        py_modern_result.get("unavailable_reason", py_modern_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -5741,6 +6141,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         envelope,
         rules_result,
         py_types_result,
+        py_modern_result,
         excluded=excluded,
         diff_only=diff_only,
     )
@@ -5751,7 +6152,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     # exit 2 ("bad arguments"), which only the sentinel can distinguish from
     # this CLI's EXIT_TOOLCHAIN (also 2).
     product_failed = any(
-        result is not None and result.get("state") == "failed" for result in (rules_result, py_types_result)
+        result is not None and result.get("state") == "failed"
+        for result in (rules_result, py_types_result, py_modern_result)
     )
     final_rc = EXIT_VERIFY_GATE if product_failed else rc
     if final_rc != 0:
@@ -5760,6 +6162,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_rules_failing_files(rules_result) if path not in failing)
         if py_types_result is not None:
             failing.extend(path for path in _verify_py_types_failing_files(py_types_result) if path not in failing)
+        if py_modern_result is not None:
+            failing.extend(path for path in _verify_py_modern_failing_files(py_modern_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(

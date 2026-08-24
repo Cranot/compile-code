@@ -5,17 +5,17 @@ Source: resolved Roam 14.0.0. The 286-command inventory and channel sets are rea
 
 ## Summary
 
-**46 of 99 edit-relevant commands are wired** (49 distinct commands across all channels; 286 commands total).
+**47 of 99 edit-relevant commands are wired** (50 distinct commands across all channels; 286 commands total).
 
-Failure classes: 8 fully covered, 19 partial, and 0 fully uncovered.
+Failure classes: 9 fully covered, 18 partial, and 0 fully uncovered.
 
 | Channel | Wired commands | Edit-relevant wired | Inventory share |
 |---|---:|---:|---:|
 | CONTEXT | 22 | 19 | 7.7% |
-| VERIFY | 21 | 21 | 7.3% |
+| VERIFY | 22 | 22 | 7.7% |
 | HOOK | 6 | 6 | 2.1% |
 | MCP | 8 | 8 | 2.8% |
-| **Union** | **49** | **46** | **17.1%** |
+| **Union** | **50** | **47** | **17.5%** |
 
 ## Derived channel sets
 
@@ -25,7 +25,7 @@ Failure classes: 8 fully covered, 19 partial, and 0 fully uncovered.
 
 ### VERIFY
 
-`affected-tests`, `breaking`, `clones`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `over-fetch`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `verify-imports`
+`affected-tests`, `breaking`, `clones`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `verify-imports`
 
 ### HOOK
 
@@ -67,7 +67,7 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | F24 | Governance or custom-rule violation | 5 | 0 | 1 | 0 | 0 | 1 / 4 | partial |
 | F25 | Test hermeticity | 4 | 0 | 1 | 0 | 0 | 1 / 1 | covered |
 | F26 | Broken invariant | 5 | 1 | 0 | 0 | 0 | 1 / 6 | partial |
-| F27 | Type-annotation regression | 4 | 0 | 1 | 0 | 0 | 1 / 2 | partial |
+| F27 | Type-annotation regression | 4 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
 
 ## Ranked gap list
 
@@ -111,23 +111,22 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | 34 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
 | 35 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
 | 36 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
-| 37 | `py-modern` | 4 | F27 | Finds unsafe or outdated Python constructs during modernization. |
-| 38 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
-| 39 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
-| 40 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
-| 41 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
-| 42 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
-| 43 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
-| 44 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
-| 45 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
-| 46 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
-| 47 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
-| 48 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
-| 49 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
-| 50 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
-| 51 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
-| 52 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
-| 53 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
+| 37 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
+| 38 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
+| 39 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
+| 40 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
+| 41 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
+| 42 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
+| 43 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
+| 44 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
+| 45 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
+| 46 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
+| 47 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
+| 48 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
+| 49 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
+| 50 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
+| 51 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
+| 52 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
 
 ## Full command classification
 
@@ -332,7 +331,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `preflight` | no | — | Excluded from the edit denominator: pre-change checklist aggregate; subsumed by risk_context+edit_blast. | — |
 | `profile-import` | no | — | Imports runtime profiles; profile consumers provide the edit checks. | — |
 | `proof-bundle` | no | — | Excluded from the edit denominator: compliance. | — |
-| `py-modern` | yes | F27 | Finds unsafe or outdated Python constructs during modernization. | — |
+| `py-modern` | yes | F27 | Finds unsafe or outdated Python constructs during modernization. | VERIFY |
 | `py-types` | yes | F27 | Checks Python type surface and contract consistency. | VERIFY |
 | `pytest-fixtures` | yes | F9 | Maps test fixtures that an edit may need to preserve or update. | — |
 | `reachability-triage` | yes | F6, F19 | Triages whether vulnerable or sensitive code is actually reachable. | — |

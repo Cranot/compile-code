@@ -280,6 +280,56 @@ def _py_types_envelope(
     }
 
 
+def _py_modern_envelope(
+    *,
+    by_file: list[dict[str, object]],
+    legacy_occurrences: list[dict[str, object]],
+    files_scanned: int = 1,
+    partial_success: bool = False,
+) -> dict[str, object]:
+    """A measured roam 14.0.0 py-modern envelope, with neutral fixture data."""
+    feature_keys = (
+        "walrus",
+        "match_stmt",
+        "pep604",
+        "pep585",
+        "legacy_typing",
+        "pep695",
+        "fstring",
+        "dot_format",
+    )
+    totals = {key: sum(int(row[key]) for row in by_file) for key in feature_keys}
+    type_total = totals["pep604"] + totals["pep585"] + totals["legacy_typing"]
+    format_total = totals["fstring"] + totals["dot_format"]
+    type_ratio = (totals["pep604"] + totals["pep585"]) * 100 // type_total if type_total else 0
+    format_ratio = totals["fstring"] * 100 // format_total if format_total else 0
+    if type_ratio >= 80 and format_ratio >= 80:
+        label = "modern Python"
+    elif type_ratio >= 50 and format_ratio >= 50:
+        label = "mixed Python"
+    else:
+        label = "legacy Python"
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "py-modern",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": f"{label} (type-modern {type_ratio}%, f-string {format_ratio}%)",
+            "type_modernisation_pct": type_ratio,
+            "fstring_pct": format_ratio,
+            **totals,
+            "files_scanned": files_scanned,
+            "partial_success": partial_success,
+        },
+        "by_file": by_file,
+        "legacy_occurrences": legacy_occurrences,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -321,6 +371,28 @@ def neutralize_synthetic_verify_py_types_check(monkeypatch):
                 "state": "complete",
                 "absolute_total_public": 0,
                 "absolute_coverage_pct": None,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_py_modern_check(monkeypatch):
+    """Keep legacy receipt/format fixtures independent of modernization delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_py_modern_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_files_scanned": 0,
+                "absolute_type_modernisation_pct": 0,
+                "absolute_fstring_pct": 0,
+                "absolute_legacy_typing": 0,
+                "absolute_dot_format": 0,
                 "regression_count": 0,
                 "findings": (),
             },
@@ -1005,7 +1077,9 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         monkeypatch.setattr(mod, "_roam_capture", fake)
         return runner.invoke(mod.cli, ["verify"])
 
-    def test_a_readable_envelope_from_a_future_major_is_verified(self, runner, monkeypatch):
+    def test_a_readable_envelope_from_a_future_major_is_verified(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         result = self._invoke(runner, monkeypatch)
 
         assert result.exit_code == 0
@@ -1025,7 +1099,9 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         assert "unknown_incompleteness_signal" in result.output
         assert "warnings" in result.output
 
-    def test_a_neutral_additive_field_passes_and_is_disclosed_as_unread(self, runner, monkeypatch):
+    def test_a_neutral_additive_field_passes_and_is_disclosed_as_unread(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         result = self._invoke(
             runner,
             monkeypatch,
@@ -1902,6 +1978,66 @@ class TestVerifyFailureFormatting:
 
         return fake, captured
 
+    @staticmethod
+    def _commit_fixture_baseline(root: Path, path: str) -> None:
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "add", path], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+            cwd=root,
+            check=True,
+        )
+
+    @staticmethod
+    def _bind_product_verify_scope(monkeypatch, root: Path, targets: list[str]) -> None:
+        digest = mod._verification_content_sha256(root, targets)
+        receipt = _bound_verify_receipt(target_file_count=len(targets))
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": str(len(targets)),
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (root, targets, receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+
+    @staticmethod
+    def _modern_row(
+        *,
+        legacy_typing: int,
+        dot_format: int,
+        pep585: int = 0,
+        pep604: int = 0,
+        fstring: int = 0,
+    ) -> dict[str, object]:
+        return {
+            "path": "service.py",
+            "walrus": 0,
+            "match_stmt": 0,
+            "pep604": pep604,
+            "pep585": pep585,
+            "legacy_typing": legacy_typing,
+            "pep695": 0,
+            "fstring": fstring,
+            "dot_format": dot_format,
+        }
+
     def test_failing_files_dedupes_in_order(self):
         envelope = {
             "violations": [
@@ -1961,7 +2097,12 @@ class TestVerifyFailureFormatting:
         assert "files   : (no changed files)" in block
 
     def test_verify_failure_emits_block_and_exit_5(
-        self, runner, monkeypatch, compatible_roam, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        compatible_roam,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -1979,7 +2120,9 @@ class TestVerifyFailureFormatting:
         assert captured["args"][:4] == ["--json", "verify", "--auto", "--"]
         assert captured["executable"] == compatible_roam["path"]
 
-    def test_verify_pass_streams_roam_output_without_block(self, runner, monkeypatch):
+    def test_verify_pass_streams_roam_output_without_block(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
@@ -1987,7 +2130,9 @@ class TestVerifyFailureFormatting:
         assert "VERDICT: PASS" in res.output
         assert "verify failed" not in res.output
 
-    def test_verify_auto_selects_post_edit_checks_from_the_changed_scope(self, runner, monkeypatch):
+    def test_verify_auto_selects_post_edit_checks_from_the_changed_scope(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
             "VERDICT: PASS (score 100/100) -- no issues\n",
@@ -2065,7 +2210,11 @@ class TestVerifyFailureFormatting:
         assert remedy in res.output
 
     def test_deleted_symbol_survivors_fail_and_name_each_referencing_site(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         finding = {
             "severity": "FAIL",
@@ -2102,7 +2251,9 @@ class TestVerifyFailureFormatting:
             ("complete rename", ["library.py", "caller_one.py", "caller_two.py"]),
         ],
     )
-    def test_clean_symbol_removal_controls_pass(self, control, targets, runner, monkeypatch):
+    def test_clean_symbol_removal_controls_pass(
+        self, control, targets, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
             "VERDICT: PASS (score 100/100) -- no issues\n",
@@ -2118,7 +2269,9 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(targets)]
         assert "VERDICT: PASS" in res.output
 
-    def test_declared_governance_rule_violation_fails_and_names_rule_and_site(self, runner, monkeypatch, tmp_path):
+    def test_declared_governance_rule_violation_fails_and_names_rule_and_site(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
+    ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
         source.write_text("def evaluate_record(expression):\n    return eval(expression)\n", encoding="utf-8")
@@ -2199,7 +2352,7 @@ class TestVerifyFailureFormatting:
 
     @pytest.mark.parametrize("declared", [True, False], ids=["compliant-rule", "no-rules"])
     def test_governance_conservation_states_pass_without_a_false_rule_pass(
-        self, declared, runner, monkeypatch, tmp_path
+        self, declared, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2333,7 +2486,233 @@ class TestVerifyFailureFormatting:
         assert result["state"] == "unavailable"
         assert result["unavailable_reason"] == "declared rule configuration was not completely evaluated"
 
-    def test_annotation_removal_fails_and_names_file_symbols_and_annotations(self, runner, monkeypatch, tmp_path):
+    def test_outdated_python_construct_introduction_fails_and_names_file_and_construct(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+    ):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "from __future__ import annotations\n\n\n"
+            "def describe(records: list[str], label: str | None) -> str:\n"
+            '    return f"{label}: {len(records)}"\n',
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            "from __future__ import annotations\n\n"
+            "from typing import List\n\n\n"
+            "def describe(records: list[str], label: str | None) -> str:\n"
+            '    return f"{label}: {len(records)}"\n\n\n'
+            "def count_legacy(records: List[str]) -> str:\n"
+            '    return "count={}".format(len(records))\n',
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        modern_output = json.dumps(
+            _py_modern_envelope(
+                by_file=[self._modern_row(legacy_typing=1, dot_format=1, pep585=1, pep604=1, fstring=1)],
+                legacy_occurrences=[
+                    {"path": "service.py", "line": 10, "kind": "legacy-typing", "match": "List["},
+                    {"path": "service.py", "line": 11, "kind": "dot-format", "match": '".format('},
+                ],
+            )
+        )
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["--json", "py-modern"]:
+                return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (Python modernization regression)")
+        assert "service.py:10" in result.output
+        assert "legacy-typing" in result.output
+        assert "List[" in result.output
+        assert "service.py:11" in result.output
+        assert "dot-format" in result.output
+        assert "cause   : Python modernization regression" in result.output
+        assert ["--json", "py-modern", "--detail", "--top", "25"] in calls
+
+    def test_modern_python_clean_edit_passes(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+    ):
+        source = tmp_path / "service.py"
+        source.write_text(
+            'def describe(records: list[str], label: str | None) -> str:\n    return f"{label}: {len(records)}"\n',
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            "def describe(records: list[str], label: str | None) -> str:\n"
+            '    return f"records for {label}: {len(records)}"\n',
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        modern_output = json.dumps(
+            _py_modern_envelope(
+                by_file=[self._modern_row(legacy_typing=0, dot_format=0, pep585=1, pep604=1, fstring=1)],
+                legacy_occurrences=[],
+            )
+        )
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-modern"]:
+                return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == 0
+        assert result.output.startswith("VERDICT: PASS")
+        assert "py-modern [complete]: edited-file outdated-construct delta clean" in result.output
+
+    def test_legacy_python_clean_edit_does_not_gate_absolute_debt(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+    ):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "from typing import List\n\n\n"
+            "def describe(records: List[str]) -> str:\n"
+            '    return "count={}".format(len(records))\n',
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            "from typing import List\n\n\n"
+            "def describe(records: List[str]) -> str:\n"
+            '    return "record count={}".format(len(records))\n',
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        modern_output = json.dumps(
+            _py_modern_envelope(
+                by_file=[self._modern_row(legacy_typing=1, dot_format=1)],
+                legacy_occurrences=[
+                    {"path": "service.py", "line": 4, "kind": "legacy-typing", "match": "List["},
+                    {"path": "service.py", "line": 5, "kind": "dot-format", "match": '".format('},
+                ],
+            )
+        )
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-modern"]:
+                return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == 0
+        assert result.output.startswith("VERDICT: PASS")
+        assert "edited-file outdated-construct delta clean" in result.output
+        assert "absolute repository adoption observed at type-modern 0%, f-string 0%" in result.output
+
+    def test_non_python_edit_records_modernization_not_applicable_without_launching_evaluator(
+        self, runner, monkeypatch, tmp_path
+    ):
+        readme = tmp_path / "README.md"
+        readme.write_text("# Neutral fixture\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["README.md"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "README.md"])
+
+        assert result.exit_code == 0
+        assert "py-modern [not_applicable]: no changed Python files" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "py-modern"]] == []
+
+    def test_triggered_modernization_delta_unavailability_is_typed_at_exit_2(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        monkeypatch.setattr(
+            mod,
+            "_verify_python_modernization_delta",
+            lambda _root, _targets: (_ for _ in ()).throw(ValueError("fixture delta unavailable")),
+        )
+        fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        calls: list[list[str]] = []
+
+        def capture(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            return fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "py-modern did not run completely" in result.output
+        assert "repair Git, the Roam index, or the edited Python source" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "py-modern"]] == []
+
+    def test_partial_modernization_evidence_is_typed_unavailable_at_exit_2(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        monkeypatch.setattr(
+            mod,
+            "_verify_python_modernization_delta",
+            lambda _root, _targets: {
+                "state": "complete",
+                "python_target_count": 1,
+                "current_python_file_count": 1,
+                "current_legacy_typing": 0,
+                "current_dot_format": 0,
+                "current_by_file": {"service.py": {"legacy_typing": 0, "dot_format": 0}},
+                "regression_count": 0,
+                "findings": (),
+            },
+        )
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        modern_output = json.dumps(
+            _py_modern_envelope(
+                by_file=[self._modern_row(legacy_typing=0, dot_format=0, pep585=1, fstring=1)],
+                legacy_occurrences=[],
+                partial_success=True,
+            )
+        )
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            if list(args[:2]) == ["--json", "py-modern"]:
+                return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "py-modern did not run completely" in result.output
+        assert "complete structured result consistent with the edited files" in result.output
+
+    def test_annotation_removal_fails_and_names_file_symbols_and_annotations(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
+    ):
         source = tmp_path / "service.py"
         source.write_text(
             "from __future__ import annotations\n\n"
@@ -2516,7 +2895,14 @@ class TestVerifyFailureFormatting:
         ids=["well-typed", "legacy-untyped-noise-trap"],
     )
     def test_python_type_conservation_edits_pass_without_gating_absolute_debt(
-        self, control, findings, expected_coverage, runner, monkeypatch, tmp_path
+        self,
+        control,
+        findings,
+        expected_coverage,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(record_id, label):\n    return f'{record_id}:{label}'\n", encoding="utf-8")
@@ -2658,7 +3044,9 @@ class TestVerifyFailureFormatting:
         assert res.output.count("VERDICT:") == 1
         assert "SKIPPED" not in res.output
 
-    def test_zero_exit_accepts_an_explicit_warn_verdict(self, runner, monkeypatch):
+    def test_zero_exit_accepts_an_explicit_warn_verdict(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, _ = self._capture("VERDICT: WARN (score 75/100) -- review findings\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
 
@@ -2691,7 +3079,11 @@ class TestVerifyFailureFormatting:
         assert res.output.count("VERDICT: verifier protocol failure") == 1
 
     def test_verify_threshold_passes_through_and_shows_in_command(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2701,7 +3093,9 @@ class TestVerifyFailureFormatting:
         assert "command : compile verify --threshold 90 --changed" in res.output
         assert "next    : compile verify --threshold 90 --changed" in res.output
 
-    def test_verify_omits_threshold_so_repository_policy_governs(self, runner, monkeypatch):
+    def test_verify_omits_threshold_so_repository_policy_governs(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, captured = self._capture(
             "VERDICT: PASS (score 100/100) -- no issues\n",
             0,
@@ -2735,7 +3129,9 @@ class TestVerifyFailureFormatting:
         assert command.split(" ", 1)[0] == "compile"
         assert not any(character in command for character in "'\";&|<>()`$\n\r")
 
-    def test_changed_recovery_mode_is_executable_and_rejects_mixed_scope(self, runner, monkeypatch):
+    def test_changed_recovery_mode_is_executable_and_rejects_mixed_scope(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
 
@@ -2748,7 +3144,11 @@ class TestVerifyFailureFormatting:
         assert "cannot be combined" in mixed.output
 
     def test_failure_commands_quote_adversarial_paths_and_preserve_threshold(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         malicious_path = "src/a.py; Write-Output AUDIT_CANARY"
         findings = [
@@ -2809,7 +3209,11 @@ class TestVerifyFailureFormatting:
             assert "AUDIT_CANARY" not in completed.stdout + completed.stderr
 
     def test_verify_new_only_and_diff_only_pass_through(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2827,7 +3231,9 @@ class TestVerifyFailureFormatting:
         assert "command : compile verify --new-only --diff-only --changed" in res.output
         assert "next    : compile verify --new-only --diff-only --changed" in res.output
 
-    def test_verify_no_argument_binds_discovered_scope_before_delegation(self, runner, monkeypatch):
+    def test_verify_no_argument_binds_discovered_scope_before_delegation(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify"])
@@ -2839,7 +3245,11 @@ class TestVerifyFailureFormatting:
         assert captured["env"]["ROAM_VERIFY_SCOPE_COUNT"].isdigit()
 
     def test_no_argument_failure_uses_bound_scope_for_human_context(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2851,7 +3261,11 @@ class TestVerifyFailureFormatting:
         assert "next    : compile verify --changed" in res.output
 
     def test_failure_block_reports_parsed_failing_scope_not_all_targets(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2872,7 +3286,11 @@ class TestVerifyFailureFormatting:
         assert "next    : compile verify --changed" in res.output
 
     def test_oversized_advisory_does_not_change_delegation(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2882,7 +3300,9 @@ class TestVerifyFailureFormatting:
         assert "scope down" in res.output
         assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(files)]
 
-    def test_no_advisory_for_small_explicit_list(self, runner, monkeypatch):
+    def test_no_advisory_for_small_explicit_list(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify", "a.py", "b.py"])
@@ -2904,7 +3324,9 @@ class TestVerifyFailureFormatting:
         monkeypatch.setattr(mod, "_roam_capture", newer)
         return captured
 
-    def test_verify_accepts_a_newer_producer_and_says_what_it_ignored(self, runner, monkeypatch):
+    def test_verify_accepts_a_newer_producer_and_says_what_it_ignored(
+        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+    ):
         """An upstream envelope addition must not become a local verify outage."""
         self._newer_producer(monkeypatch, 0, "VERDICT: PASS (score 100/100) -- no issues\n")
 
@@ -2918,7 +3340,11 @@ class TestVerifyFailureFormatting:
         assert "summary.residual_wave_note" in res.output
 
     def test_a_newer_producer_does_not_soften_a_real_gate_failure(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
     ):
         self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
 
@@ -3051,7 +3477,10 @@ class TestCommandInventory:
         assert res.output.strip() == _format_command_inventory(mod.cli.commands).strip()
 
 
-@pytest.mark.usefixtures("neutralize_synthetic_verify_py_types_check")
+@pytest.mark.usefixtures(
+    "neutralize_synthetic_verify_py_types_check",
+    "neutralize_synthetic_verify_py_modern_check",
+)
 class TestVerifyReceiptV3Protocol:
     def _validate(
         self,
