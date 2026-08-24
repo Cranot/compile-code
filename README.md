@@ -230,12 +230,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1251',
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1259',
        'edge': 'call', 'call_line': 'if _require_index():',
-       'call_location': 'src/compile_code/cli.py:1260'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:6188', 'edge': 'call',
+       'call_location': 'src/compile_code/cli.py:1268'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:7006', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:6198'}
+       'call_location': 'src/compile_code/cli.py:7016'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
@@ -327,6 +327,36 @@ itself (staged, unstaged, untracked, renamed, and deleted paths), canonicalizes
 that set, and passes explicit root-bound targets to `roam verify`. Only when
 discovery yields no bound targets does it use `roam verify --changed` as the
 path-free recovery fallback.
+
+### Declared calculation semantics
+
+VERIFY can replay repository-owned golden cases when a calculation source is
+edited. Commit a JSON declaration under `.roam/calc-golden/` together with its
+JSONL corpus (use `git add -f` when the repository ignores `.roam`):
+
+```json
+{
+  "schema": "compile-code.calc-golden.v1",
+  "name": "invoice tax",
+  "corpus": ".roam/calc-golden/tax-cases.jsonl",
+  "runner": ["python", "tools/replay_tax.py"],
+  "sources": ["src/tax.py", "tools/replay_tax.py"]
+}
+```
+
+The runner uses `roam calc-golden check`'s JSONL protocol: it receives
+`{"id": ..., "inputs": {...}}` records on stdin and emits the same `id` plus
+the observed output fields on stdout. `sources` is the exact, mechanically
+matched edit scope for that calculation. An edit outside those paths, or a
+repository with no declarations, records `calc-golden [not_applicable]` and
+does not launch the runner.
+
+For a triggered declaration, VERIFY runs the same corpus against the edited
+tree and a bounded checkout of Git `HEAD`. Only newly introduced
+observed-versus-expected mismatches fail, so existing golden debt does not gate
+an unrelated semantics-preserving edit. Missing cases, malformed declarations,
+an incomplete runner, or unavailable Git evidence are a typed unavailable
+result rather than a false pass.
 
 ## Beyond Claude Code — Codex, MCP, and CI
 

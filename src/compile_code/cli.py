@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import errno
 import hashlib
+import io
 import json
 import math
 import os
@@ -32,6 +33,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -1091,6 +1093,7 @@ def _roam_capture(
     timeout: int = 600,
     executable: str = "roam",
     env: dict[str, str] | None = None,
+    cwd: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run Roam through the bounded Verify subprocess boundary."""
     argv = [executable, *args]
@@ -1100,6 +1103,7 @@ def _roam_capture(
         stdout_limit=MAX_VERIFY_JSON_BYTES,
         stderr_limit=MAX_VERIFY_STDERR_BYTES,
         env=env,
+        cwd=cwd,
     )
     return subprocess.CompletedProcess(
         proc.args,
@@ -1170,6 +1174,7 @@ def _delegate_capturing(
     timeout: int = 600,
     executable: str = "roam",
     env: dict[str, str] | None = None,
+    cwd: str | None = None,
 ) -> tuple[int, str | None]:
     """Run the toolchain and translate failure modes like ``_delegate``.
 
@@ -1184,7 +1189,10 @@ def _delegate_capturing(
     one-line verdicts rather than untrusted subprocess diagnostics.
     """
     try:
-        proc = _roam_capture(*args, timeout=timeout, executable=executable, env=env)
+        capture_kwargs: dict[str, object] = {"timeout": timeout, "executable": executable, "env": env}
+        if cwd is not None:
+            capture_kwargs["cwd"] = cwd
+        proc = _roam_capture(*args, **capture_kwargs)
         return proc.returncode, proc.stdout or ""
     except FileNotFoundError:
         click.echo(
@@ -2548,6 +2556,7 @@ _VERIFY_CAUSE_LABELS = {
     "RULES": "governance rule violation",
     "PY TYPES": "type-annotation regression",
     "PY MODERN": "Python modernization regression",
+    "CALC GOLDEN": "calculation semantic regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2656,6 +2665,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "Python edits run a bounded modernization probe and compare outdated constructs in touched files with "
         "their Git pre-edit state; non-Python edits report not_applicable and absolute legacy debt never gates.",
     ),
+    (
+        "calc-golden",
+        "Edits to source files bound by .roam/calc-golden JSON declarations replay golden cases against the "
+        "current and Git pre-edit calculations; absent declarations and unrelated edits report not_applicable.",
+    ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
     {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
@@ -2679,6 +2693,42 @@ MAX_VERIFY_MODERN_DETAIL_FILES = 25
 MAX_VERIFY_MODERN_ENVELOPE_OCCURRENCES = MAX_VERIFY_MODERN_DETAIL_FILES * 5
 MAX_VERIFY_MODERN_FINDINGS = 10
 MAX_VERIFY_MODERN_TEXT_CHARS = 1024
+_VERIFY_CALC_GOLDEN_DECLARATION_SCHEMA = "compile-code.calc-golden.v1"
+_VERIFY_CALC_SOURCE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".go",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".mjs",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".ts",
+        ".tsx",
+        ".vue",
+    }
+)
+MAX_VERIFY_CALC_DECLARATION_ENTRIES = 4096
+MAX_VERIFY_CALC_DECLARATIONS = 8
+MAX_VERIFY_CALC_DECLARATION_BYTES = 64 * 1024
+MAX_VERIFY_CALC_CORPUS_BYTES = 16 * 1024 * 1024
+MAX_VERIFY_CALC_TOTAL_CORPUS_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_CALC_RUNNER_ARGS = 32
+MAX_VERIFY_CALC_SOURCES = 256
+MAX_VERIFY_CALC_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_VERIFY_CALC_ARCHIVE_ENTRIES = 20_000
+MAX_VERIFY_CALC_ENVELOPE_FAILURES = 20
+MAX_VERIFY_CALC_DELTA_FIELDS = 16
+MAX_VERIFY_CALC_FINDINGS = 10
+MAX_VERIFY_CALC_TEXT_CHARS = 1024
+VERIFY_CALC_RUNNER_TIMEOUT = 60
 _VERIFY_MODERN_FEATURE_KEYS = (
     "walrus",
     "match_stmt",
@@ -4793,6 +4843,654 @@ def _verify_py_modern_unavailable_verdict(reason: object) -> str:
     )
 
 
+def _bounded_verify_calc_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > MAX_VERIFY_CALC_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _verify_calc_relative_path(root: Path, raw_path: object, *, reason: str, must_exist: bool = False) -> str:
+    path_text = _bounded_verify_calc_text(raw_path, reason=reason)
+    pure = PurePosixPath(path_text)
+    if pure.is_absolute() or path_text != pure.as_posix() or any(part in {"", ".", ".."} for part in pure.parts):
+        raise ValueError(reason)
+    try:
+        canonical_root = root.resolve(strict=True)
+        candidate = canonical_root.joinpath(*pure.parts)
+        resolved = candidate.resolve(strict=must_exist)
+        if not _path_is_within(resolved, canonical_root):
+            raise ValueError(reason)
+        if must_exist:
+            info = candidate.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ValueError(reason)
+        return pure.as_posix()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(reason) from exc
+
+
+def _verify_calc_head_declaration_paths(root: Path) -> frozenset[str]:
+    """Return tracked pre-edit declaration paths, so deletion cannot disable the check."""
+    try:
+        head = _verify_type_git_capture(root, ["cat-file", "-e", "HEAD^{commit}"], stdout_limit=1)
+        if head.returncode != 0:
+            return frozenset()
+        tree = _verify_type_git_capture(
+            root,
+            ["ls-tree", "-r", "-z", "--name-only", "HEAD", "--", ".roam/calc-golden"],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        raw = tree.stdout or b""
+        if tree.returncode != 0 or len(raw) > MAX_VERIFY_GIT_STATUS_BYTES or (raw and not raw.endswith(b"\0")):
+            raise ValueError("calc_golden_head_declarations")
+        paths = {
+            _decode_verify_status_path(item)
+            for item in raw.split(b"\0")
+            if item and PurePosixPath(_decode_verify_status_path(item)).suffix == ".json"
+        }
+        return frozenset(paths)
+    except (OSError, UnicodeError, ValueError):
+        if not _git_marker_has_evidence(root):
+            return frozenset()
+        raise ValueError("calc_golden_head_declarations") from None
+
+
+def _verify_calc_baseline_paths(root: Path, sources: Sequence[str]) -> dict[str, str | None]:
+    """Resolve renames and distinguish untracked additions from unchanged paths."""
+    baseline_paths = _verify_type_baseline_paths(root, sources)
+    for source, baseline_path in tuple(baseline_paths.items()):
+        if baseline_path is None:
+            continue
+        tree = _verify_type_git_capture(
+            root,
+            ["ls-tree", "-z", "HEAD", "--", baseline_path],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        raw = tree.stdout or b""
+        if tree.returncode != 0 or len(raw) > MAX_VERIFY_GIT_STATUS_BYTES or (raw and not raw.endswith(b"\0")):
+            raise ValueError("calc_golden_baseline_source")
+        if not raw:
+            baseline_paths[source] = None
+    return baseline_paths
+
+
+def _verify_calc_head_commit(root: Path) -> str | None:
+    head = _verify_type_git_capture(root, ["rev-parse", "--verify", "HEAD^{commit}"], stdout_limit=80)
+    if head.returncode != 0:
+        return None
+    try:
+        commit = (head.stdout or b"").decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("calc_golden_head_commit") from exc
+    if re.fullmatch(r"[0-9a-fA-F]{40,64}", commit) is None:
+        raise ValueError("calc_golden_head_commit")
+    return commit
+
+
+def _verify_calc_declarations_stable(root: Path, declarations: Sequence[Mapping[str, object]]) -> bool:
+    try:
+        for declaration in declarations:
+            declaration_path = root / Path(str(declaration["path"]))
+            corpus_path = root / Path(str(declaration["corpus"]))
+            declaration_raw = _read_bounded_utf8_regular_file(
+                declaration_path, max_bytes=MAX_VERIFY_CALC_DECLARATION_BYTES
+            ).encode("utf-8")
+            corpus_raw = _read_bounded_utf8_regular_file(corpus_path, max_bytes=MAX_VERIFY_CALC_CORPUS_BYTES).encode(
+                "utf-8"
+            )
+            if (
+                len(corpus_raw) > MAX_VERIFY_CALC_CORPUS_BYTES
+                or hashlib.sha256(declaration_raw).hexdigest() != declaration.get("declaration_sha256")
+                or hashlib.sha256(corpus_raw).hexdigest() != declaration.get("corpus_sha256")
+            ):
+                return False
+        return True
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return False
+
+
+def _verify_calc_golden_declaration_state(root: Path, targets: Sequence[str]) -> dict[str, object]:
+    """Read bounded public golden declarations and bind them to the edit scope."""
+    declaration_dir = root / ".roam" / "calc-golden"
+    try:
+        canonical_root = root.resolve(strict=True)
+        declarations: list[dict[str, object]] = []
+        current_paths: set[str] = set()
+        total_corpus_bytes = 0
+        if declaration_dir.exists():
+            directory_info = declaration_dir.lstat()
+            canonical_dir = declaration_dir.resolve(strict=True)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or stat.S_ISLNK(directory_info.st_mode)
+                or not _path_is_within(canonical_dir, canonical_root)
+            ):
+                raise ValueError("calc_golden_declaration_directory")
+            entry_count = 0
+            for candidate in sorted(declaration_dir.rglob("*")):
+                entry_count += 1
+                if entry_count > MAX_VERIFY_CALC_DECLARATION_ENTRIES:
+                    raise ValueError("calc_golden_declaration_bound")
+                if candidate.suffix != ".json" or not candidate.is_file():
+                    continue
+                if len(declarations) >= MAX_VERIFY_CALC_DECLARATIONS:
+                    raise ValueError("calc_golden_declaration_bound")
+                declaration_path = candidate.relative_to(root).as_posix()
+                if candidate.is_symlink() or not _path_is_within(candidate.resolve(strict=True), canonical_root):
+                    raise ValueError("calc_golden_declaration_path")
+                declaration_raw = _read_bounded_utf8_regular_file(
+                    candidate, max_bytes=MAX_VERIFY_CALC_DECLARATION_BYTES
+                )
+                document = _strict_json_document(
+                    declaration_raw,
+                    max_bytes=MAX_VERIFY_CALC_DECLARATION_BYTES,
+                )
+                if not isinstance(document, dict) or set(document) != {
+                    "schema",
+                    "name",
+                    "corpus",
+                    "runner",
+                    "sources",
+                }:
+                    raise ValueError("calc_golden_declaration_shape")
+                if document.get("schema") != _VERIFY_CALC_GOLDEN_DECLARATION_SCHEMA:
+                    raise ValueError("calc_golden_declaration_schema")
+                name = _bounded_verify_calc_text(document.get("name"), reason="calc_golden_name")
+                corpus = _verify_calc_relative_path(
+                    root, document.get("corpus"), reason="calc_golden_corpus", must_exist=True
+                )
+                corpus_content = _read_bounded_utf8_regular_file(
+                    root / Path(corpus), max_bytes=MAX_VERIFY_CALC_CORPUS_BYTES
+                ).encode("utf-8")
+                total_corpus_bytes += len(corpus_content)
+                if total_corpus_bytes > MAX_VERIFY_CALC_TOTAL_CORPUS_BYTES:
+                    raise ValueError("calc_golden_corpus_bound")
+                raw_runner = document.get("runner")
+                if (
+                    not isinstance(raw_runner, list)
+                    or not 1 <= len(raw_runner) <= MAX_VERIFY_CALC_RUNNER_ARGS
+                    or any(not isinstance(arg, str) for arg in raw_runner)
+                ):
+                    raise ValueError("calc_golden_runner")
+                runner = tuple(_bounded_verify_calc_text(arg, reason="calc_golden_runner") for arg in raw_runner)
+                raw_sources = document.get("sources")
+                if (
+                    not isinstance(raw_sources, list)
+                    or not 1 <= len(raw_sources) <= MAX_VERIFY_CALC_SOURCES
+                    or any(not isinstance(source, str) for source in raw_sources)
+                ):
+                    raise ValueError("calc_golden_sources")
+                sources = tuple(
+                    _verify_calc_relative_path(root, source, reason="calc_golden_source") for source in raw_sources
+                )
+                if len(set(sources)) != len(sources) or any(
+                    PurePosixPath(source).suffix.lower() not in _VERIFY_CALC_SOURCE_SUFFIXES for source in sources
+                ):
+                    raise ValueError("calc_golden_sources")
+                declarations.append(
+                    {
+                        "path": declaration_path,
+                        "name": name,
+                        "corpus": corpus,
+                        "runner": runner,
+                        "sources": sources,
+                        "declaration_sha256": hashlib.sha256(declaration_raw.encode("utf-8")).hexdigest(),
+                        "corpus_sha256": hashlib.sha256(corpus_content).hexdigest(),
+                        "corpus_content": corpus_content,
+                    }
+                )
+                current_paths.add(declaration_path)
+        removed = _verify_calc_head_declaration_paths(root) - current_paths
+        if removed:
+            return {
+                "state": "unavailable",
+                "reason": "tracked golden declarations were removed from the edit",
+                "declaration_count": len(declarations),
+            }
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded .roam/calc-golden declaration probe could not be completed",
+            "declaration_count": 0,
+        }
+    if not declarations:
+        return {
+            "state": "not_applicable",
+            "reason": "no .roam/calc-golden JSON declarations",
+            "declaration_count": 0,
+        }
+    triggered = tuple(
+        declaration
+        for declaration in declarations
+        if any(target == source for target in targets for source in declaration["sources"])
+    )
+    if not triggered:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed files are declared calculation sources",
+            "declaration_count": len(declarations),
+        }
+    return {
+        "state": "declared",
+        "declaration_count": len(declarations),
+        "declarations": tuple(declarations),
+        "triggered_declarations": triggered,
+    }
+
+
+def _validate_verify_calc_golden_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_runner: str,
+) -> dict[str, object]:
+    """Validate one bounded calc-golden runner replay before comparing it with HEAD."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("calc_golden_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "calc-golden"
+        or envelope.get("version") != expected_roam_version
+    ):
+        raise ValueError("calc_golden_envelope")
+    summary = envelope.get("summary")
+    raw_failures = envelope.get("failures")
+    if not isinstance(summary, dict) or not isinstance(raw_failures, list):
+        raise ValueError("calc_golden_shape")
+    if len(raw_failures) > MAX_VERIFY_CALC_ENVELOPE_FAILURES:
+        raise ValueError("calc_golden_result_bound")
+    total = _plain_int(summary.get("total"))
+    replayed = _plain_int(summary.get("replayed"), maximum=total)
+    passed = _plain_int(summary.get("passed"), maximum=replayed)
+    failed = _plain_int(summary.get("failed"), maximum=replayed)
+    missing = _plain_int(summary.get("missing"), maximum=total)
+    gate_failed = summary.get("gate_failed")
+    pass_pct = summary.get("pass_pct")
+    if (
+        type(gate_failed) is not bool
+        or isinstance(pass_pct, bool)
+        or not isinstance(pass_pct, (int, float))
+        or not math.isfinite(float(pass_pct))
+        or not 0 <= float(pass_pct) <= 100
+        or replayed + missing != total
+        or passed + failed != replayed
+        or summary.get("partial_success") is not False
+        or summary.get("oracle") != f"runner:{expected_runner}"
+    ):
+        raise ValueError("calc_golden_counts")
+    expected_pct = round(100.0 * passed / replayed, 2) if replayed else 0.0
+    expected_gate = failed > 0 or (replayed == 0 and total > 0) or missing > 0
+    if float(pass_pct) != expected_pct or gate_failed != expected_gate:
+        raise ValueError("calc_golden_counts")
+    if returncode not in {0, EXIT_VERIFY_GATE} or (returncode == EXIT_VERIFY_GATE) != expected_gate:
+        raise ValueError("calc_golden_exit_contradiction")
+    _bounded_verify_calc_text(summary.get("verdict"), reason="calc_golden_verdict")
+    buckets = summary.get("buckets")
+    if not isinstance(buckets, dict) or len(buckets) > MAX_VERIFY_CALC_ENVELOPE_FAILURES * 4:
+        raise ValueError("calc_golden_buckets")
+    bucket_replayed = 0
+    bucket_passed = 0
+    for bucket, counts in buckets.items():
+        _bounded_verify_calc_text(bucket, reason="calc_golden_bucket", allow_empty=True)
+        if not isinstance(counts, dict):
+            raise ValueError("calc_golden_buckets")
+        bucket_total = _plain_int(counts.get("replayed"))
+        bucket_ok = _plain_int(counts.get("passed"), maximum=bucket_total)
+        bucket_replayed += bucket_total
+        bucket_passed += bucket_ok
+    if bucket_replayed != replayed or bucket_passed != passed:
+        raise ValueError("calc_golden_buckets")
+
+    findings: list[dict[str, object]] = []
+    failed_case_ids: set[int] = set()
+    runner_failure = False
+    for failure in raw_failures:
+        if not isinstance(failure, dict) or set(failure) != {"id", "bucket", "inputs", "deltas"}:
+            raise ValueError("calc_golden_failure")
+        case_id = failure.get("id")
+        if type(case_id) is not int or case_id < -1:
+            raise ValueError("calc_golden_failure")
+        bucket = _bounded_verify_calc_text(failure.get("bucket"), reason="calc_golden_bucket", allow_empty=True)
+        inputs = failure.get("inputs")
+        deltas = failure.get("deltas")
+        if (
+            not isinstance(inputs, dict)
+            or len(inputs) > MAX_VERIFY_CALC_DELTA_FIELDS * 4
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or len(key) > MAX_VERIFY_CALC_TEXT_CHARS
+                or len(value) > MAX_VERIFY_CALC_TEXT_CHARS
+                for key, value in inputs.items()
+            )
+            or not isinstance(deltas, dict)
+            or not 1 <= len(deltas) <= MAX_VERIFY_CALC_DELTA_FIELDS
+        ):
+            raise ValueError("calc_golden_failure")
+        is_runner_failure = case_id == -1 or (bucket == "-" and not inputs and "runner" in deltas)
+        if is_runner_failure:
+            runner_failure = True
+        else:
+            if case_id in failed_case_ids:
+                raise ValueError("calc_golden_failure")
+            failed_case_ids.add(case_id)
+        for field, delta in deltas.items():
+            field_text = _bounded_verify_calc_text(field, reason="calc_golden_field")
+            delta_text = _bounded_verify_calc_text(delta, reason="calc_golden_delta")
+            if is_runner_failure:
+                continue
+            findings.append(
+                {
+                    "case_id": case_id,
+                    "bucket": bucket,
+                    "field": field_text,
+                    "delta": delta_text,
+                }
+            )
+    if len(failed_case_ids) != failed:
+        raise ValueError("calc_golden_failure_count")
+    incomplete_reason = None
+    if total == 0:
+        incomplete_reason = "a declared golden corpus contained no replayable cases"
+    elif missing:
+        incomplete_reason = "the declared golden runner did not answer every case"
+    elif runner_failure:
+        incomplete_reason = "the declared golden runner did not complete cleanly"
+    return {
+        "state": "unavailable" if incomplete_reason else ("failed" if failed else "complete"),
+        "total": total,
+        "failure_count": failed,
+        "findings": tuple(findings),
+        "unavailable_reason": incomplete_reason,
+    }
+
+
+def _verify_calc_extract_head_archive(root: Path, destination: Path, head_commit: str) -> None:
+    archive = _verify_type_git_capture(
+        root,
+        ["archive", "--format=tar", head_commit],
+        stdout_limit=MAX_VERIFY_CALC_ARCHIVE_BYTES,
+    )
+    raw = archive.stdout or b""
+    if archive.returncode != 0 or len(raw) > MAX_VERIFY_CALC_ARCHIVE_BYTES:
+        raise ValueError("calc_golden_head_archive")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as stream:
+            members = stream.getmembers()
+            if len(members) > MAX_VERIFY_CALC_ARCHIVE_ENTRIES:
+                raise ValueError("calc_golden_head_archive")
+            for member in members:
+                name = member.name.rstrip("/")
+                if not name:
+                    continue
+                pure = PurePosixPath(name)
+                if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+                    raise ValueError("calc_golden_head_archive")
+                target = destination.joinpath(*pure.parts)
+                if not _path_is_within(target.resolve(strict=False), destination.resolve(strict=True)):
+                    raise ValueError("calc_golden_head_archive")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if member.issym():
+                    link = PurePosixPath(member.linkname)
+                    if link.is_absolute():
+                        raise ValueError("calc_golden_head_archive")
+                    link_target = (target.parent / Path(*link.parts)).resolve(strict=False)
+                    if not _path_is_within(link_target, destination.resolve(strict=True)):
+                        raise ValueError("calc_golden_head_archive")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(member.linkname)
+                    continue
+                if not member.isfile():
+                    raise ValueError("calc_golden_head_archive")
+                source = stream.extractfile(member)
+                if source is None:
+                    raise ValueError("calc_golden_head_archive")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as output_file:
+                    while chunk := source.read(64 * 1024):
+                        output_file.write(chunk)
+                target.chmod(member.mode & 0o777)
+    except (tarfile.TarError, OSError, ValueError):
+        raise ValueError("calc_golden_head_archive") from None
+
+
+@contextmanager
+def _verify_calc_head_checkout(
+    root: Path,
+    declarations: Sequence[Mapping[str, object]],
+    baseline_paths: Mapping[str, str | None],
+    head_commit: str,
+) -> Iterator[Path]:
+    """Materialize a bounded HEAD tree, using current corpora as the unchanged oracle."""
+    with tempfile.TemporaryDirectory(prefix=".compile-code-calc-", dir=str(root)) as raw_checkout:
+        checkout = Path(raw_checkout)
+        _verify_calc_extract_head_archive(root, checkout, head_commit)
+        for declaration in declarations:
+            corpus = str(declaration["corpus"])
+            corpus_bytes = declaration.get("corpus_content")
+            if not isinstance(corpus_bytes, bytes) or len(corpus_bytes) > MAX_VERIFY_CALC_CORPUS_BYTES:
+                raise ValueError("calc_golden_corpus_bound")
+            destination = checkout / Path(corpus)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(corpus_bytes)
+        for current_path, baseline_path in baseline_paths.items():
+            if baseline_path is None or baseline_path == current_path:
+                continue
+            baseline_source = checkout / Path(baseline_path)
+            if not baseline_source.is_file() or baseline_source.is_symlink():
+                raise ValueError("calc_golden_baseline_source")
+            current_destination = checkout / Path(current_path)
+            current_destination.parent.mkdir(parents=True, exist_ok=True)
+            current_destination.write_bytes(baseline_source.read_bytes())
+        yield checkout
+
+
+def _run_verify_calc_golden_replay(
+    declaration: Mapping[str, object],
+    *,
+    cwd: Path,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    runner = declaration.get("runner")
+    if not isinstance(runner, tuple) or any(not isinstance(arg, str) for arg in runner):
+        return {"state": "unavailable", "reason": "the golden runner declaration was invalid"}, EXIT_TOOLCHAIN
+    runner_text = shlex.join(runner)
+    rc, output = _delegate_capturing(
+        "--json",
+        "calc-golden",
+        "check",
+        str(declaration["corpus"]),
+        "--runner",
+        runner_text,
+        "--timeout",
+        str(VERIFY_CALC_RUNNER_TIMEOUT),
+        timeout=VERIFY_CALC_RUNNER_TIMEOUT + 10,
+        executable=executable,
+        env=env,
+        cwd=str(cwd),
+    )
+    if output is None:
+        return None, rc
+    try:
+        result = _validate_verify_calc_golden_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_runner=runner_text,
+        )
+    except (UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "calc-golden did not return one complete structured runner result",
+        }, EXIT_TOOLCHAIN
+    return result, 0
+
+
+def _run_verify_calc_golden_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Replay declared golden cases and gate only divergences introduced by the edit."""
+    declaration_state = _verify_calc_golden_declaration_state(root, targets)
+    if declaration_state["state"] != "declared":
+        return declaration_state, 0
+    declarations = declaration_state.get("triggered_declarations")
+    if not isinstance(declarations, tuple) or any(not isinstance(declaration, Mapping) for declaration in declarations):
+        return {"state": "unavailable", "reason": "the golden declaration scope was invalid"}, EXIT_TOOLCHAIN
+    all_declarations = declaration_state.get("declarations", declarations)
+    if not isinstance(all_declarations, tuple) or any(
+        not isinstance(declaration, Mapping) for declaration in all_declarations
+    ):
+        return {"state": "unavailable", "reason": "the golden declaration set was invalid"}, EXIT_TOOLCHAIN
+
+    sources = tuple(dict.fromkeys(str(source) for declaration in declarations for source in declaration["sources"]))
+    try:
+        head_commit = _verify_calc_head_commit(root)
+        baseline_paths = _verify_calc_baseline_paths(root, sources)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the Git pre-edit calculation sources could not be derived",
+        }, EXIT_TOOLCHAIN
+
+    current_results: list[tuple[Mapping[str, object], dict[str, object]]] = []
+    for declaration in declarations:
+        result, rc = _run_verify_calc_golden_replay(
+            declaration,
+            cwd=root,
+            executable=executable,
+            expected_roam_version=expected_roam_version,
+            env=env,
+        )
+        if result is None:
+            return None, rc
+        if result.get("state") == "unavailable":
+            return {
+                "state": "unavailable",
+                "reason": result.get("unavailable_reason", result.get("reason")),
+            }, EXIT_TOOLCHAIN
+        current_results.append((declaration, result))
+    if not _verify_calc_declarations_stable(root, all_declarations):
+        return {
+            "state": "unavailable",
+            "reason": "a golden declaration or corpus changed while its runner was executing",
+        }, EXIT_TOOLCHAIN
+    baseline_results: dict[str, dict[str, object]] = {}
+    if head_commit is not None and any(path is not None for path in baseline_paths.values()):
+        try:
+            with _verify_calc_head_checkout(root, declarations, baseline_paths, head_commit) as checkout:
+                for declaration in declarations:
+                    declaration_sources = tuple(str(source) for source in declaration["sources"])
+                    if all(baseline_paths[source] is None for source in declaration_sources):
+                        continue
+                    result, rc = _run_verify_calc_golden_replay(
+                        declaration,
+                        cwd=checkout,
+                        executable=executable,
+                        expected_roam_version=expected_roam_version,
+                        env=env,
+                    )
+                    if result is None:
+                        return None, rc
+                    if result.get("state") == "unavailable":
+                        return {
+                            "state": "unavailable",
+                            "reason": "the Git pre-edit golden replay did not complete",
+                        }, EXIT_TOOLCHAIN
+                    baseline_results[str(declaration["path"])] = result
+        except (MemoryError, OSError, UnicodeError, ValueError):
+            return {
+                "state": "unavailable",
+                "reason": "the bounded Git pre-edit golden replay could not be completed",
+            }, EXIT_TOOLCHAIN
+    if not _verify_calc_declarations_stable(root, all_declarations):
+        return {
+            "state": "unavailable",
+            "reason": "a golden declaration or corpus changed while its runner was executing",
+        }, EXIT_TOOLCHAIN
+
+    regression_count = 0
+    absolute_failure_count = 0
+    baseline_failure_count = 0
+    findings: list[dict[str, object]] = []
+    for declaration, current in current_results:
+        current_findings = current.get("findings")
+        if not isinstance(current_findings, tuple):
+            return {"state": "unavailable", "reason": "the golden result was invalid"}, EXIT_TOOLCHAIN
+        baseline = baseline_results.get(str(declaration["path"]))
+        baseline_findings = () if baseline is None else baseline.get("findings")
+        if not isinstance(baseline_findings, tuple):
+            return {"state": "unavailable", "reason": "the baseline golden result was invalid"}, EXIT_TOOLCHAIN
+        baseline_signatures = {
+            (finding.get("case_id"), finding.get("bucket"), finding.get("field"), finding.get("delta"))
+            for finding in baseline_findings
+            if isinstance(finding, Mapping)
+        }
+        absolute_failure_count += int(current.get("failure_count", 0))
+        baseline_failure_count += int(baseline.get("failure_count", 0)) if baseline is not None else 0
+        for finding in current_findings:
+            if not isinstance(finding, Mapping):
+                return {"state": "unavailable", "reason": "the golden result was invalid"}, EXIT_TOOLCHAIN
+            signature = (
+                finding.get("case_id"),
+                finding.get("bucket"),
+                finding.get("field"),
+                finding.get("delta"),
+            )
+            if signature in baseline_signatures:
+                continue
+            regression_count += 1
+            if len(findings) < MAX_VERIFY_CALC_FINDINGS:
+                sources_value = declaration["sources"]
+                findings.append(
+                    {
+                        "file": sources_value[0],
+                        "calculation": declaration["name"],
+                        **dict(finding),
+                    }
+                )
+    return {
+        "state": "failed" if regression_count else "complete",
+        "declaration_count": declaration_state["declaration_count"],
+        "calculation_count": len(declarations),
+        "absolute_failure_count": absolute_failure_count,
+        "baseline_failure_count": baseline_failure_count,
+        "regression_count": regression_count,
+        "findings": tuple(findings),
+    }, 0
+
+
+def _verify_calc_golden_unavailable_verdict(reason: object) -> str:
+    safe_reason = (
+        reason
+        if isinstance(reason, str)
+        and 0 < len(reason) <= MAX_VERIFY_CALC_TEXT_CHARS
+        and all(ord(char) >= 32 for char in reason)
+        else "the golden calculation check could not establish a complete result"
+    )
+    return (
+        f"VERDICT: verify unavailable — calc-golden did not run completely: {safe_reason}. "
+        "A declared golden case that did not run cannot pass. Fix: repair Git or the .roam/calc-golden "
+        "declaration, corpus, and runner, then rerun `compile verify --changed`; preserve the golden cases."
+    )
+
+
 def _prepare_verify_request(
     files: tuple[str, ...],
 ) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
@@ -5700,6 +6398,84 @@ def _render_verify_with_product_checks(
     return "\n".join(lines)
 
 
+def _render_verify_with_calc_golden_check(
+    rendered: str,
+    envelope: Mapping[str, object],
+    calc_golden_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose the validated golden semantic delta with the other Verify checks."""
+    if calc_golden_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = calc_golden_result.get("state")
+    if state == "not_applicable":
+        reason = _bounded_verify_calc_text(calc_golden_result.get("reason"), reason="calc_golden_render_reason")
+        lines.append(f"calc-golden [not_applicable]: {reason}")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("calc_golden_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "calc-golden" not in roster:
+                lines[index] = f"{line}, calc-golden"
+            break
+    else:
+        lines.insert(1, "checks: calc-golden")
+    calculation_count = _plain_int(calc_golden_result.get("calculation_count"), minimum=1)
+    absolute_failure_count = _plain_int(calc_golden_result.get("absolute_failure_count"))
+    baseline_failure_count = _plain_int(calc_golden_result.get("baseline_failure_count"))
+    if state == "complete":
+        lines.append(
+            f"calc-golden [complete]: {calculation_count} declared calculation"
+            f"{'s' if calculation_count != 1 else ''} replayed; semantic delta clean "
+            f"({absolute_failure_count} current vs {baseline_failure_count} pre-edit golden case failures)"
+        )
+        return "\n".join(lines)
+
+    regression_count = _plain_int(calc_golden_result.get("regression_count"), minimum=1)
+    summary = envelope.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError("calc_golden_render_summary")
+    targets_checked = summary.get("targets_checked", summary.get("files_checked"))
+    _plain_int(targets_checked)
+    if lines[0].startswith("VERDICT: PASS"):
+        lines[0] = (
+            f"VERDICT: FAIL (calculation semantic regression) -- {regression_count} golden output divergence"
+            f"{'s' if regression_count != 1 else ''} introduced in {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    else:
+        label_match = re.match(r"^VERDICT: FAIL \(([^)]*)\)", lines[0])
+        previous_label = label_match.group(1) if label_match else "another Verify gate"
+        lines[0] = (
+            f"VERDICT: FAIL ({previous_label} + calculation semantic regression) -- product-owned edit gates failed"
+        )
+    findings = calc_golden_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("calc_golden_render_findings")
+    lines.extend(("", "CALC GOLDEN (0/100):"))
+    for finding in findings[:MAX_VERIFY_CALC_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("calc_golden_render_finding")
+        location = str(finding["file"])
+        calculation = str(finding["calculation"])
+        case_id = finding["case_id"]
+        bucket = str(finding["bucket"])
+        field = str(finding["field"])
+        delta = str(finding["delta"])
+        lines.append(f"  FAIL: {location} -- {calculation}: case {case_id} ({bucket}), {field}: {delta}")
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more golden output divergences omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]:
     files: list[str] = []
     findings = rules_result.get("findings")
@@ -5730,6 +6506,17 @@ def _verify_py_types_failing_files(py_types_result: Mapping[str, object]) -> lis
 def _verify_py_modern_failing_files(py_modern_result: Mapping[str, object]) -> list[str]:
     files: list[str] = []
     findings = py_modern_result.get("findings")
+    if not isinstance(findings, tuple):
+        return files
+    for finding in findings:
+        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
+            files.append(finding["file"])
+    return files
+
+
+def _verify_calc_golden_failing_files(calc_golden_result: Mapping[str, object]) -> list[str]:
+    files: list[str] = []
+    findings = calc_golden_result.get("findings")
     if not isinstance(findings, tuple):
         return files
     for finding in findings:
@@ -5994,10 +6781,12 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     product-owned adapters are also auto-selected from that scope: a bounded
     declaration probe runs `.roam/rules` YAML rules when present, and Python
     edits run `py-types` and `py-modern` with edited-file deltas against Git
-    ``HEAD`` so legacy absolute debt does not gate unrelated work. Inapplicable
-    adapters report typed not_applicable states. If any triggered check lacks
-    the inputs needed for a complete result, VERIFY names the unavailable state
-    and refuses instead of publishing a false pass.
+    ``HEAD`` so legacy absolute debt does not gate unrelated work. Declared
+    `.roam/calc-golden` calculations replay their cases against both the edited
+    source and Git ``HEAD`` so only the edit's semantic divergence gates.
+    Inapplicable adapters report typed not_applicable states. If any triggered
+    check lacks the inputs needed for a complete result, VERIFY names the
+    unavailable state and refuses instead of publishing a false pass.
     `--new-only` passes through to roam's accepted-debt baseline; `--diff-only`
     keeps the output scoped to changed lines. Only a complete, bound JSON
     receipt is rendered. A validated gate failure is followed by a block naming
@@ -6058,6 +6847,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     rules_result: dict[str, object] | None = None
     py_types_result: dict[str, object] | None = None
     py_modern_result: dict[str, object] | None = None
+    calc_golden_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -6119,6 +6909,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "calc-golden" in selected_product_checks:
+            calc_golden_result, calc_golden_rc = _run_verify_calc_golden_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if calc_golden_result is None:
+                raise SystemExit(calc_golden_rc)
+            if calc_golden_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_calc_golden_unavailable_verdict(
+                        calc_golden_result.get("unavailable_reason", calc_golden_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -6145,6 +6952,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         excluded=excluded,
         diff_only=diff_only,
     )
+    rendered = _render_verify_with_calc_golden_check(
+        rendered,
+        envelope,
+        calc_golden_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
@@ -6153,7 +6967,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     # this CLI's EXIT_TOOLCHAIN (also 2).
     product_failed = any(
         result is not None and result.get("state") == "failed"
-        for result in (rules_result, py_types_result, py_modern_result)
+        for result in (rules_result, py_types_result, py_modern_result, calc_golden_result)
     )
     final_rc = EXIT_VERIFY_GATE if product_failed else rc
     if final_rc != 0:
@@ -6164,6 +6978,10 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_py_types_failing_files(py_types_result) if path not in failing)
         if py_modern_result is not None:
             failing.extend(path for path in _verify_py_modern_failing_files(py_modern_result) if path not in failing)
+        if calc_golden_result is not None:
+            failing.extend(
+                path for path in _verify_calc_golden_failing_files(calc_golden_result) if path not in failing
+            )
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(

@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -330,6 +331,47 @@ def _py_modern_envelope(
     }
 
 
+def _calc_golden_envelope(
+    *,
+    failures: list[dict[str, object]],
+    total: int = 2,
+    missing: int = 0,
+) -> dict[str, object]:
+    """A measured roam 14.0.0 calc-golden runner envelope, with invented cases."""
+    failed = len(
+        [failure for failure in failures if failure.get("id") != -1 and "runner" not in failure.get("deltas", {})]
+    )
+    replayed = total - missing
+    passed = replayed - failed
+    gate_failed = failed > 0 or (replayed == 0 and total > 0) or missing > 0
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "calc-golden",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": f"{passed}/{replayed} replayed of {total} cases cent-exact",
+            "oracle": "runner:python calc.py",
+            "total": total,
+            "replayed": replayed,
+            "passed": passed,
+            "failed": failed,
+            "missing": missing,
+            "pass_pct": round(100.0 * passed / replayed, 2) if replayed else 0.0,
+            "gate_failed": gate_failed,
+            "buckets": {
+                "ordinary": {"replayed": max(0, replayed - 1), "passed": max(0, passed - int(failed == 0))},
+                "tie": {"replayed": int(replayed > 0), "passed": int(replayed > 0 and failed == 0)},
+            },
+            "partial_success": False,
+        },
+        "failures": failures,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -393,6 +435,25 @@ def neutralize_synthetic_verify_py_modern_check(monkeypatch):
                 "absolute_fstring_pct": 0,
                 "absolute_legacy_typing": 0,
                 "absolute_dot_format": 0,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_calc_golden_check(monkeypatch):
+    """Keep legacy synthetic fixtures independent of declared calculation replay."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_calc_golden_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "not_applicable",
+                "reason": "no .roam/calc-golden JSON declarations",
+                "declaration_count": 0,
                 "regression_count": 0,
                 "findings": (),
             },
@@ -2103,6 +2164,7 @@ class TestVerifyFailureFormatting:
         compatible_roam,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2121,7 +2183,11 @@ class TestVerifyFailureFormatting:
         assert captured["executable"] == compatible_roam["path"]
 
     def test_verify_pass_streams_roam_output_without_block(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2131,7 +2197,11 @@ class TestVerifyFailureFormatting:
         assert "verify failed" not in res.output
 
     def test_verify_auto_selects_post_edit_checks_from_the_changed_scope(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
@@ -2485,6 +2555,436 @@ class TestVerifyFailureFormatting:
 
         assert result["state"] == "unavailable"
         assert result["unavailable_reason"] == "declared rule configuration was not completely evaluated"
+
+    def test_declared_golden_semantic_change_fails_and_names_calculation_case_and_values(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+    ):
+        source = tmp_path / "calc.py"
+        source.write_text(
+            "from decimal import Decimal, ROUND_HALF_UP\n\n"
+            "def calculate_tax(base: str, rate: str) -> str:\n"
+            "    tax = (Decimal(base) * Decimal(rate) / Decimal('100')).quantize(\n"
+            "        Decimal('0.01'), rounding=ROUND_HALF_UP\n"
+            "    )\n"
+            "    return str(tax)\n",
+            encoding="utf-8",
+        )
+        declaration_dir = tmp_path / ".roam" / "calc-golden"
+        declaration_dir.mkdir(parents=True)
+        corpus = declaration_dir / "tax-cases.jsonl"
+        corpus.write_text(
+            '{"id": 1, "bucket": "tie", "inputs": {"base": "1.005", "rate": "100"}, '
+            '"expect": {"tax": "1.01"}}\n'
+            '{"id": 2, "bucket": "ordinary", "inputs": {"base": "10.00", "rate": "20"}, '
+            '"expect": {"tax": "2.00"}}\n',
+            encoding="utf-8",
+        )
+        (declaration_dir / "tax.json").write_text(
+            json.dumps(
+                {
+                    "schema": "compile-code.calc-golden.v1",
+                    "name": "invoice tax",
+                    "corpus": ".roam/calc-golden/tax-cases.jsonl",
+                    "runner": ["python", "calc.py"],
+                    "sources": ["calc.py"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "calc.py", ".roam/calc-golden"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "golden baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        source.write_text(
+            source.read_text(encoding="utf-8").replace("ROUND_HALF_UP", "ROUND_HALF_EVEN"), encoding="utf-8"
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        baseline_output = json.dumps(_calc_golden_envelope(failures=[]))
+        current_output = json.dumps(
+            _calc_golden_envelope(
+                failures=[
+                    {
+                        "id": 1,
+                        "bucket": "tie",
+                        "inputs": {"base": "1.005", "rate": "100"},
+                        "deltas": {"tax": "want 1.01 got '1.00'"},
+                    }
+                ]
+            )
+        )
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append((list(args), cwd))
+            if list(args[:3]) == ["--json", "calc-golden", "check"]:
+                is_current = Path(cwd).resolve() == tmp_path.resolve()
+                return SimpleNamespace(
+                    returncode=mod.EXIT_VERIFY_GATE if is_current else 0,
+                    stdout=current_output if is_current else baseline_output,
+                    stderr="",
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "calc.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (calculation semantic regression)")
+        assert "invoice tax" in result.output
+        assert "case 1 (tie)" in result.output
+        assert "tax: want 1.01 got '1.00'" in result.output
+        assert len([args for args, _cwd in calls if args[:3] == ["--json", "calc-golden", "check"]]) == 2
+
+    def test_declared_golden_semantics_preserving_edit_passes(self, monkeypatch, tmp_path):
+        source = tmp_path / "calc.py"
+        source.write_text("tax = base * rate\n", encoding="utf-8")
+        declaration_dir = tmp_path / ".roam" / "calc-golden"
+        declaration_dir.mkdir(parents=True)
+        (declaration_dir / "cases.jsonl").write_text(
+            '{"id":1,"inputs":{"base":"1","rate":"1"},"expect":{"tax":"1"}}\n', encoding="utf-8"
+        )
+        (declaration_dir / "tax.json").write_text(
+            json.dumps(
+                {
+                    "schema": "compile-code.calc-golden.v1",
+                    "name": "invoice tax",
+                    "corpus": ".roam/calc-golden/cases.jsonl",
+                    "runner": ["python", "calc.py"],
+                    "sources": ["calc.py"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", "calc.py", ".roam/calc-golden"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "golden baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        source.write_text("# Semantics-preserving documentation\ntax = base * rate\n", encoding="utf-8")
+        clean = {"state": "complete", "total": 1, "failure_count": 0, "findings": ()}
+        replay_roots: list[Path] = []
+
+        def replay(_declaration, *, cwd, **_kwargs):
+            replay_roots.append(cwd)
+            return clean, 0
+
+        monkeypatch.setattr(mod, "_run_verify_calc_golden_replay", replay)
+
+        result, rc = mod._run_verify_calc_golden_check(
+            tmp_path,
+            targets=["calc.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["regression_count"] == 0
+        assert len(replay_roots) == 2
+        assert replay_roots[0] == tmp_path
+        assert replay_roots[1] != tmp_path
+
+    def test_golden_delta_conservation_ignores_a_preexisting_case_mismatch(self, monkeypatch, tmp_path):
+        declaration = {
+            "path": ".roam/calc-golden/tax.json",
+            "name": "invoice tax",
+            "corpus": ".roam/calc-golden/tax-cases.jsonl",
+            "runner": ("python", "calc.py"),
+            "sources": ("calc.py",),
+        }
+        mismatch = {
+            "state": "failed",
+            "total": 2,
+            "failure_count": 1,
+            "findings": (
+                {
+                    "case_id": 1,
+                    "bucket": "tie",
+                    "field": "tax",
+                    "delta": "want 1.01 got '1.00'",
+                },
+            ),
+        }
+        monkeypatch.setattr(
+            mod,
+            "_verify_calc_golden_declaration_state",
+            lambda _root, _targets: {
+                "state": "declared",
+                "declaration_count": 1,
+                "triggered_declarations": (declaration,),
+            },
+        )
+        monkeypatch.setattr(mod, "_verify_calc_baseline_paths", lambda _root, _sources: {"calc.py": "calc.py"})
+        monkeypatch.setattr(mod, "_verify_calc_head_commit", lambda _root: "a" * 40)
+        monkeypatch.setattr(mod, "_verify_calc_declarations_stable", lambda _root, _declarations: True)
+
+        @contextmanager
+        def checkout(_root, _declarations, _baseline_paths, _head_commit):
+            yield tmp_path
+
+        monkeypatch.setattr(mod, "_verify_calc_head_checkout", checkout)
+        monkeypatch.setattr(mod, "_run_verify_calc_golden_replay", lambda *_args, **_kwargs: (mismatch, 0))
+
+        result, rc = mod._run_verify_calc_golden_check(
+            tmp_path,
+            targets=["calc.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result == {
+            "state": "complete",
+            "declaration_count": 1,
+            "calculation_count": 1,
+            "absolute_failure_count": 1,
+            "baseline_failure_count": 1,
+            "regression_count": 0,
+            "findings": (),
+        }
+
+    def test_golden_runner_cannot_rewrite_its_declaration_or_corpus(self, monkeypatch, tmp_path):
+        declaration = {
+            "path": ".roam/calc-golden/tax.json",
+            "name": "invoice tax",
+            "corpus": ".roam/calc-golden/tax-cases.jsonl",
+            "runner": ("python", "calc.py"),
+            "sources": ("calc.py",),
+        }
+        monkeypatch.setattr(
+            mod,
+            "_verify_calc_golden_declaration_state",
+            lambda _root, _targets: {
+                "state": "declared",
+                "declaration_count": 1,
+                "triggered_declarations": (declaration,),
+            },
+        )
+        monkeypatch.setattr(mod, "_verify_calc_head_commit", lambda _root: None)
+        monkeypatch.setattr(mod, "_verify_calc_baseline_paths", lambda _root, _sources: {"calc.py": None})
+        monkeypatch.setattr(
+            mod,
+            "_run_verify_calc_golden_replay",
+            lambda *_args, **_kwargs: (
+                {"state": "complete", "total": 1, "failure_count": 0, "findings": ()},
+                0,
+            ),
+        )
+        monkeypatch.setattr(mod, "_verify_calc_declarations_stable", lambda _root, _declarations: False)
+
+        result, rc = mod._run_verify_calc_golden_check(
+            tmp_path,
+            targets=["calc.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == mod.EXIT_TOOLCHAIN
+        assert result["state"] == "unavailable"
+        assert result["reason"] == "a golden declaration or corpus changed while its runner was executing"
+
+    def test_no_golden_declarations_pass_not_applicable_without_launching_evaluator(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+    ):
+        source = tmp_path / "calc.py"
+        source.write_text("tax = base * rate\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "calc.py"])
+
+        assert result.exit_code == 0
+        assert "calc-golden [not_applicable]: no .roam/calc-golden JSON declarations" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "calc-golden"]] == []
+
+    def test_removing_a_tracked_golden_declaration_is_unavailable_not_not_applicable(self, tmp_path):
+        declaration_dir = tmp_path / ".roam" / "calc-golden"
+        declaration_dir.mkdir(parents=True)
+        declaration = declaration_dir / "tax.json"
+        declaration.write_text("{}\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "add", ".roam/calc-golden/tax.json"], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "golden declaration baseline",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        declaration.unlink()
+
+        result = mod._verify_calc_golden_declaration_state(tmp_path, ["calc.py"])
+
+        assert result["state"] == "unavailable"
+        assert result["reason"] == "tracked golden declarations were removed from the edit"
+
+    def test_non_code_edit_with_golden_declaration_never_launches_evaluator(self, runner, monkeypatch, tmp_path):
+        (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("# Neutral fixture\n", encoding="utf-8")
+        declaration_dir = tmp_path / ".roam" / "calc-golden"
+        declaration_dir.mkdir(parents=True)
+        (declaration_dir / "cases.jsonl").write_text(
+            '{"id":1,"inputs":{"base":"1","rate":"1"},"expect":{"tax":"1"}}\n', encoding="utf-8"
+        )
+        (declaration_dir / "tax.json").write_text(
+            json.dumps(
+                {
+                    "schema": "compile-code.calc-golden.v1",
+                    "name": "invoice tax",
+                    "corpus": ".roam/calc-golden/cases.jsonl",
+                    "runner": ["python", "calc.py"],
+                    "sources": ["calc.py"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["README.md"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "README.md"])
+
+        assert result.exit_code == 0
+        assert "calc-golden [not_applicable]: no changed files are declared calculation sources" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "calc-golden"]] == []
+
+    def test_golden_preflight_unavailability_is_typed_at_exit_2(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+    ):
+        (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
+        monkeypatch.setattr(
+            mod,
+            "_verify_calc_golden_declaration_state",
+            lambda _root, _targets: {
+                "state": "unavailable",
+                "reason": "the bounded declaration probe could not be completed",
+                "declaration_count": 0,
+            },
+        )
+        fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "calc.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "calc-golden did not run completely" in result.output
+        assert "preserve the golden cases" in result.output
+        assert "delete" not in result.output.lower()
+
+    def test_golden_missing_runner_answers_are_typed_unavailable(self):
+        output = json.dumps(
+            _calc_golden_envelope(
+                total=2,
+                missing=2,
+                failures=[
+                    {
+                        "id": 1,
+                        "bucket": "-",
+                        "inputs": {},
+                        "deltas": {"runner": "2 case(s) never answered; first ids: [1, 2]"},
+                    }
+                ],
+            )
+        )
+
+        result = mod._validate_verify_calc_golden_protocol(
+            output,
+            returncode=mod.EXIT_VERIFY_GATE,
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            expected_runner="python calc.py",
+        )
+
+        assert result["state"] == "unavailable"
+        assert result["unavailable_reason"] == "the declared golden runner did not answer every case"
+
+    def test_golden_protocol_refuses_more_failures_than_the_output_bound(self):
+        output = json.dumps(
+            _calc_golden_envelope(
+                total=mod.MAX_VERIFY_CALC_ENVELOPE_FAILURES + 1,
+                failures=[
+                    {
+                        "id": case_id,
+                        "bucket": "tie",
+                        "inputs": {"base": "1.005", "rate": "100"},
+                        "deltas": {"tax": "want 1.01 got '1.00'"},
+                    }
+                    for case_id in range(mod.MAX_VERIFY_CALC_ENVELOPE_FAILURES + 1)
+                ],
+            )
+        )
+
+        with pytest.raises(ValueError, match="calc_golden_result_bound"):
+            mod._validate_verify_calc_golden_protocol(
+                output,
+                returncode=mod.EXIT_VERIFY_GATE,
+                expected_roam_version=mod.MIN_ROAM_VERSION,
+                expected_runner="python calc.py",
+            )
 
     def test_outdated_python_construct_introduction_fails_and_names_file_and_construct(
         self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
