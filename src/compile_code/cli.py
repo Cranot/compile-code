@@ -124,16 +124,16 @@ MAX_VERIFY_GIT_STATUS_BYTES = 1024 * 1024
 # src/venv/mod.py and a stub roam that logs the argv it is handed:
 #
 #   $ compile verify src
-#     delegated -> ["--json", "verify", "--", "src/app.py", "src/pkg/mod.py"]
+#     delegated -> ["--json", "verify", "--auto", "--", "src/app.py", "src/pkg/mod.py"]
 #   $ compile verify src/venv
-#     delegated -> ["--json", "verify", "--", "src/venv/mod.py"]
+#     delegated -> ["--json", "verify", "--auto", "--", "src/venv/mod.py"]
 #   $ compile verify src/venv/mod.py
-#     delegated -> ["--json", "verify", "--", "src/venv/mod.py"]
+#     delegated -> ["--json", "verify", "--auto", "--", "src/venv/mod.py"]
 #   $ compile verify venv
-#     delegated -> ["--json", "verify", "--", "venv/__init__.py",
+#     delegated -> ["--json", "verify", "--auto", "--", "venv/__init__.py",
 #                   "venv/mypkg/mod.py"]
 #   $ compile verify              # discovery, no arguments
-#     delegated -> ["--json", "verify", "--", "node_modules/pkg/index.js",
+#     delegated -> ["--json", "verify", "--auto", "--", "node_modules/pkg/index.js",
 #                   "src/app.py", "src/pkg/mod.py", "src/venv/mod.py",
 #                   "venv/mypkg/mod.py"]
 #
@@ -2608,6 +2608,34 @@ _VERIFY_CHECK_NAMES = frozenset(
         "test_hermeticity",
     }
 )
+_VERIFY_DELETE_CHECK_SUPPORTED_SUFFIXES = frozenset(
+    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go"}
+)
+_VERIFY_DELETE_CHECK_UNSUPPORTED_CODE_SUFFIXES = frozenset(
+    {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cs",
+        ".ex",
+        ".exs",
+        ".java",
+        ".kt",
+        ".kts",
+        ".php",
+        ".rb",
+        ".rs",
+        ".scala",
+        ".swift",
+    }
+)
+_VERIFY_DELETE_CHECK_PUBLIC_REMOVAL = re.compile(r"^\s*(?:export\b|pub(?:\([^)]*\))?(?:\s|$)|public\b|def\s+(?!_)\w+)")
+_VERIFY_DELETE_CHECK_SUPPORTED_REMOVAL = re.compile(
+    r"^\s*(?:(?:async\s+)?def\s+(?!_)\w+\s*\(|class\s+(?!_)\w+\s*[:(]|"
+    r"(?:export\s+)?(?:async\s+)?function\s+\w+\s*\(|(?:export\s+)?class\s+\w+\b|"
+    r"(?:export\s+)?const\s+\w+\s*=|func\s+(?:\([^)]*\)\s*)?\w+\s*\(|"
+    r"type\s+\w+\s+(?:struct|interface)\b|(?:export\s+)?(?:type|interface)\s+\w+\b)"
+)
 _VERIFY_CATEGORY_NAMES = _VERIFY_CHECK_NAMES | {"verification"}
 # There is deliberately no hand-copied "categories allowed to WARN on a PASS"
 # set here. Roam declares advisory-ness per category in the envelope it sends,
@@ -3527,6 +3555,123 @@ def _verification_content_sha256(root: Path, targets: list[str]) -> str:
         manifest.append([relative_path, f"sha256:{digest.hexdigest()}"])
     payload = json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _delete_check_diff_evidence(diff_text: str) -> tuple[bool, tuple[str, ...]]:
+    """Find a delete-safety trigger and any language the kernel cannot parse.
+
+    The post-edit channel already owns the Git diff and the exact target set.
+    Roam's measured delete-check parser recognizes public declarations in
+    Python, JavaScript/TypeScript, and Go shapes. A deleted/renamed code path or
+    a removed public declaration triggers the check; when that declaration is
+    in another indexed language, absence of a finding is not evidence.
+    """
+    triggered = False
+    unsupported: set[str] = set()
+    current_suffix = ""
+    pending_deleted_file = False
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            current_suffix = ""
+            pending_deleted_file = False
+            continue
+        if line.startswith("deleted file mode "):
+            pending_deleted_file = True
+            triggered = True
+            continue
+        if line.startswith("rename from "):
+            triggered = True
+            suffix = Path(line.removeprefix("rename from ")).suffix.lower()
+            if suffix in _VERIFY_DELETE_CHECK_UNSUPPORTED_CODE_SUFFIXES:
+                unsupported.add(suffix)
+            continue
+        if line.startswith("--- a/"):
+            current_suffix = Path(line.removeprefix("--- a/")).suffix.lower()
+            if pending_deleted_file and current_suffix in _VERIFY_DELETE_CHECK_UNSUPPORTED_CODE_SUFFIXES:
+                unsupported.add(current_suffix)
+            continue
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        removed = line[1:]
+        if current_suffix in _VERIFY_DELETE_CHECK_SUPPORTED_SUFFIXES:
+            triggered = triggered or bool(_VERIFY_DELETE_CHECK_SUPPORTED_REMOVAL.match(removed))
+        elif current_suffix in _VERIFY_DELETE_CHECK_UNSUPPORTED_CODE_SUFFIXES and (
+            _VERIFY_DELETE_CHECK_PUBLIC_REMOVAL.match(removed)
+        ):
+            triggered = True
+            unsupported.add(current_suffix)
+    return triggered, tuple(sorted(unsupported))
+
+
+def _delete_check_unavailable_reason(root: Path, targets: list[str]) -> str | None:
+    """Return why a triggered delete check cannot run, otherwise ``None``.
+
+    This is an availability preflight, not a second survivor detector. The
+    kernel still owns all findings. It exists so an unsupported public-symbol
+    removal cannot come back as score 100 merely because the parser extracted
+    no candidate, and so an absent index is named before auto-index chatter can
+    corrupt the receipt.
+    """
+    index_available = _require_index(str(root))
+    may_need_language_guard = any(
+        Path(path).suffix.lower() in _VERIFY_DELETE_CHECK_UNSUPPORTED_CODE_SUFFIXES for path in targets
+    )
+    if index_available and not may_need_language_guard:
+        return None
+    if not targets or not _git_marker_has_evidence(root):
+        return None
+    git_path, _reason = _resolve_trusted_executable("git", reject_workspace=True)
+    if not git_path:
+        return "the delete trigger diff is unavailable (trusted git was not found)"
+    try:
+        proc = _run_bounded_capture(
+            [
+                git_path,
+                "-c",
+                "core.fsmonitor=false",
+                "diff",
+                "--no-ext-diff",
+                "--unified=0",
+                "--find-renames",
+                "HEAD",
+                "--",
+                *targets,
+            ],
+            cwd=str(root),
+            timeout=10,
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+            stderr_limit=MAX_VERIFY_STDERR_BYTES,
+            env=_trusted_tool_env(git=True),
+        )
+        if proc.returncode != 0 or len(proc.stdout or b"") > MAX_VERIFY_GIT_STATUS_BYTES:
+            return "the bounded delete trigger diff could not be read"
+        diff_text = (proc.stdout or b"").decode("utf-8", errors="strict")
+    except (OSError, UnicodeError, ValueError, subprocess.TimeoutExpired):
+        return "the bounded delete trigger diff could not be read"
+    triggered, unsupported = _delete_check_diff_evidence(diff_text)
+    if not triggered:
+        return None
+    if not index_available:
+        return "the repository has no readable .roam/index.db"
+    if unsupported:
+        return "the changed public declaration uses an unsupported language suffix: " + ", ".join(unsupported)
+    return None
+
+
+def _delete_check_unavailable_verdict(reason: str) -> str:
+    if "index.db" in reason:
+        fix = "run `compile init`, then rerun `compile verify --changed`"
+    elif "diff" in reason or "git" in reason:
+        fix = "install or repair git, then rerun `compile verify --changed`"
+    else:
+        fix = (
+            "restore the symbol or verify and update every reference with that language's tooling, "
+            "then rerun `compile verify --changed`"
+        )
+    return (
+        f"VERDICT: verify unavailable — delete_check did not run: {reason}. "
+        f"A check that did not run cannot pass. Fix: {fix}."
+    )
 
 
 def _prepare_verify_request(
@@ -4475,12 +4620,17 @@ def _verify_protocol_verdict(error: BaseException, *, executable: str, targets: 
 def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bool, threshold: int | None) -> None:
     """Run scoped verify on changed files; on failure, explain the next local action.
 
-    Delegates to `roam verify` (naming, imports, error handling, duplicates,
-    syntax on the changed set). `--new-only` passes through to roam's accepted-
-    debt baseline; `--diff-only` keeps the output scoped to changed lines.
-    Only a complete, bound JSON receipt is rendered. A validated gate failure
-    is followed by a block naming the failing command, changed files, likely
-    cause category, and the single local rerun to run next.
+    Delegates to `roam verify --auto`, which selects checks from the bound
+    changed set. Its delete-safety check derives its trigger from the same Git
+    change: a deleted or renamed path, or a diff hunk removing an
+    exported/public symbol, is checked for surviving references. If that check
+    has no index or cannot parse the changed language, VERIFY names the
+    unavailable state and refuses instead of publishing a false pass.
+    `--new-only` passes through to roam's accepted-debt baseline; `--diff-only`
+    keeps the output scoped to changed lines. Only a complete, bound JSON
+    receipt is rendered. A validated gate failure is followed by a block naming
+    the failing command, changed files, likely cause category, and the single
+    local rerun to run next.
     """
     if changed and files:
         raise click.UsageError("--changed cannot be combined with explicit file arguments")
@@ -4506,8 +4656,16 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             _unsafe_scope_verdict(exc) or (_verify_protocol_verdict(exc, executable=str(executable), targets=targets))
         )
         raise SystemExit(EXIT_TOOLCHAIN)
+    delete_check_unavailable = _delete_check_unavailable_reason(root, bound_targets)
+    if delete_check_unavailable is not None:
+        click.echo(_delete_check_unavailable_verdict(delete_check_unavailable))
+        raise SystemExit(EXIT_TOOLCHAIN)
 
-    argv = ["--json", "verify"]
+    # VERIFY is the post-edit channel, so selection must follow the edit. In
+    # particular, roam's delete_check adapter is registered only in AUTO mode:
+    # omitting this flag left deleted public symbols outside the gate even
+    # though their changed files were bound into the receipt below.
+    argv = ["--json", "verify", "--auto"]
     if new_only:
         argv.append("--new-only")
     if diff_only:

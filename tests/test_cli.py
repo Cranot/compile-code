@@ -1676,7 +1676,7 @@ class TestVerifyFailureFormatting:
     def _stable_changed_scope(self, monkeypatch):
         monkeypatch.setattr(mod, "_discover_verify_targets", lambda _root: [(" M", "changed.py")])
 
-    def _capture(self, output, rc, *, effective_threshold=70, findings=None):
+    def _capture(self, output, rc, *, effective_threshold=70, findings=None, checks_run=None):
         """Stub _roam_capture to return a CompletedProcess-shaped object."""
         captured = {}
         provided_findings = findings
@@ -1737,6 +1737,8 @@ class TestVerifyFailureFormatting:
                     receipt=receipt,
                     violations=result_findings,
                 )
+                if checks_run is not None:
+                    envelope["summary"]["checks_run"] = list(checks_run)
                 for finding in result_findings:
                     category = finding["category"]
                     envelope["categories"].setdefault(
@@ -1823,7 +1825,7 @@ class TestVerifyFailureFormatting:
         assert "files   : src/bad.py" in res.output
         assert "cause   : naming violation + syntax error" in res.output
         assert "next    : compile verify --changed" in res.output
-        assert captured["args"][:3] == ["--json", "verify", "--"]
+        assert captured["args"][:4] == ["--json", "verify", "--auto", "--"]
         assert captured["executable"] == compatible_roam["path"]
 
     def test_verify_pass_streams_roam_output_without_block(self, runner, monkeypatch):
@@ -1833,6 +1835,135 @@ class TestVerifyFailureFormatting:
         assert res.exit_code == 0
         assert "VERDICT: PASS" in res.output
         assert "verify failed" not in res.output
+
+    def test_verify_auto_selects_post_edit_checks_from_the_changed_scope(self, runner, monkeypatch):
+        checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
+        fake, captured = self._capture(
+            "VERDICT: PASS (score 100/100) -- no issues\n",
+            0,
+            checks_run=checks,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "library.py"])
+
+        assert res.exit_code == 0
+        assert captured["args"] == ["--json", "verify", "--auto", "--", "library.py"]
+
+    @pytest.mark.parametrize(
+        ("diff", "triggered", "unsupported"),
+        [
+            (
+                "diff --git a/library.py b/library.py\n"
+                "--- a/library.py\n"
+                "+++ b/library.py\n"
+                "@@ -1 +0,0 @@\n"
+                "-def exported_helper(value):\n",
+                True,
+                (),
+            ),
+            (
+                "diff --git a/library.rs b/library.rs\n"
+                "--- a/library.rs\n"
+                "+++ b/library.rs\n"
+                "@@ -1 +0,0 @@\n"
+                "-pub fn exported_helper(value: i32) -> i32 {\n",
+                True,
+                (".rs",),
+            ),
+            (
+                "diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n",
+                True,
+                (".rs",),
+            ),
+            (
+                "diff --git a/library.rs b/library.rs\n"
+                "--- a/library.rs\n"
+                "+++ b/library.rs\n"
+                "@@ -2 +2 @@\n"
+                "-    value + 1\n"
+                "+    value + 2\n",
+                False,
+                (),
+            ),
+        ],
+        ids=["public-python-removal", "unsupported-public-removal", "unsupported-rename", "ordinary-rust-edit"],
+    )
+    def test_delete_check_trigger_is_derived_from_the_existing_git_diff(self, diff, triggered, unsupported):
+        assert mod._delete_check_diff_evidence(diff) == (triggered, unsupported)
+
+    @pytest.mark.parametrize(
+        ("reason", "remedy"),
+        [
+            ("the repository has no readable .roam/index.db", "compile init"),
+            ("the changed public declaration uses an unsupported language suffix: .rs", "language's tooling"),
+        ],
+    )
+    def test_delete_check_unavailability_is_named_and_refused_before_delegation(
+        self, reason, remedy, runner, monkeypatch
+    ):
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: reason)
+        monkeypatch.setattr(mod, "_roam_capture", lambda *args, **kwargs: pytest.fail("unavailable check must not run"))
+
+        res = runner.invoke(mod.cli, ["verify", "library.rs"])
+
+        assert res.exit_code == mod.EXIT_TOOLCHAIN
+        assert res.output.count("VERDICT:") == 1
+        assert "delete_check did not run" in res.output
+        assert "cannot pass" in res.output
+        assert remedy in res.output
+
+    def test_deleted_symbol_survivors_fail_and_name_each_referencing_site(self, runner, monkeypatch):
+        finding = {
+            "severity": "FAIL",
+            "category": "delete_check",
+            "file": "caller_one.py",
+            "line": 1,
+            "message": (
+                "deleted symbol `exported_helper` is still referenced by 2 un-edited file(s) "
+                "(caller_one.py, caller_two.py) — they will break"
+            ),
+            "hard_block": True,
+        }
+        checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
+        fake, captured = self._capture(
+            "VERDICT: FAIL (score 40/100) -- 1 issue in 1 changed file\n",
+            mod.EXIT_VERIFY_GATE,
+            findings=[finding],
+            checks_run=checks,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", "library.py"])
+
+        assert res.exit_code == mod.EXIT_VERIFY_GATE
+        assert captured["args"] == ["--json", "verify", "--auto", "--", "library.py"]
+        assert "deleted symbol `exported_helper`" in res.output
+        assert "caller_one.py" in res.output
+        assert "caller_two.py" in res.output
+
+    @pytest.mark.parametrize(
+        ("control", "targets"),
+        [
+            ("unreferenced deletion", ["library.py"]),
+            ("complete rename", ["library.py", "caller_one.py", "caller_two.py"]),
+        ],
+    )
+    def test_clean_symbol_removal_controls_pass(self, control, targets, runner, monkeypatch):
+        checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
+        fake, captured = self._capture(
+            "VERDICT: PASS (score 100/100) -- no issues\n",
+            0,
+            checks_run=checks,
+        )
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        res = runner.invoke(mod.cli, ["verify", *targets])
+
+        assert control
+        assert res.exit_code == 0
+        assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(targets)]
+        assert "VERDICT: PASS" in res.output
 
     @pytest.mark.parametrize("output", ["", "checks completed without a verdict\n"], ids=["empty", "malformed"])
     def test_zero_exit_requires_parseable_success_verdict(self, output, runner, monkeypatch):
@@ -1893,7 +2024,7 @@ class TestVerifyFailureFormatting:
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify", "--threshold", "90", "src/bad.py"])
         assert res.exit_code == 5
-        assert captured["args"] == ["--json", "verify", "--threshold", "90", "--", "src/bad.py"]
+        assert captured["args"] == ["--json", "verify", "--auto", "--threshold", "90", "--", "src/bad.py"]
         assert "command : compile verify --threshold 90 --changed" in res.output
         assert "next    : compile verify --threshold 90 --changed" in res.output
 
@@ -1908,7 +2039,7 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify", "src/cli.py"])
 
         assert res.exit_code == 0
-        assert captured["args"] == ["--json", "verify", "--", "src/cli.py"]
+        assert captured["args"] == ["--json", "verify", "--auto", "--", "src/cli.py"]
         assert "VERDICT: PASS" in res.output
 
     @pytest.mark.parametrize("threshold", ["-1", "101"])
@@ -1939,7 +2070,7 @@ class TestVerifyFailureFormatting:
         mixed = runner.invoke(mod.cli, ["verify", "--changed", "src/a.py"])
 
         assert changed.exit_code == 0
-        assert captured["args"][:4] == ["--json", "verify", "--threshold", "90"]
+        assert captured["args"][:5] == ["--json", "verify", "--auto", "--threshold", "90"]
         assert mixed.exit_code == 2
         assert "cannot be combined" in mixed.output
 
@@ -1970,6 +2101,7 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == [
             "--json",
             "verify",
+            "--auto",
             "--threshold",
             "90",
             "--",
@@ -2009,6 +2141,7 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == [
             "--json",
             "verify",
+            "--auto",
             "--new-only",
             "--diff-only",
             "--",
@@ -2022,7 +2155,10 @@ class TestVerifyFailureFormatting:
         monkeypatch.setattr(mod, "_roam_capture", fake)
         res = runner.invoke(mod.cli, ["verify"])
         assert res.exit_code == 0
-        assert captured["args"][:3] in (["--json", "verify", "--"], ["--json", "verify", "--changed"])
+        assert captured["args"][:4] in (
+            ["--json", "verify", "--auto", "--"],
+            ["--json", "verify", "--auto", "--changed"],
+        )
         assert captured["env"]["ROAM_VERIFY_SCOPE_COUNT"].isdigit()
 
     def test_no_argument_failure_uses_bound_scope_for_human_context(self, runner, monkeypatch):
@@ -2031,7 +2167,7 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify"])
 
         assert res.exit_code == 5
-        assert captured["args"][:3] == ["--json", "verify", "--"]
+        assert captured["args"][:4] == ["--json", "verify", "--auto", "--"]
         assert "files   : " in res.output
         assert "next    : compile verify --changed" in res.output
 
@@ -2045,6 +2181,7 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == [
             "--json",
             "verify",
+            "--auto",
             "--",
             "src/bad.py",
             "src/good.py",
@@ -2060,7 +2197,7 @@ class TestVerifyFailureFormatting:
         res = runner.invoke(mod.cli, ["verify", *files])
         assert res.exit_code == 5
         assert "scope down" in res.output
-        assert captured["args"] == ["--json", "verify", "--", *sorted(files)]
+        assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(files)]
 
     def test_no_advisory_for_small_explicit_list(self, runner, monkeypatch):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
@@ -2754,6 +2891,27 @@ class TestVerifyReceiptV3Protocol:
         # make a broken catalogue load.
         assert "upgrade" not in verdict.split("Fix:")[0]
         assert "roam-code>=" not in verdict
+
+    def test_an_unavailable_delete_detector_is_named_and_never_accepted_as_a_pass(self):
+        envelope = _verify_envelope(verdict="FAIL", score=40, verification_complete=False, partial_success=True)
+        envelope["summary"]["checks_run"].append("delete_check")
+        envelope["summary"]["incomplete_reasons"] = ["delete_check_incomplete"]
+        envelope["categories"]["delete_check"].update(
+            score=0,
+            available=False,
+            unavailable_reason="delete-check does not support the changed language",
+            execution_state="failed",
+            partial_success=True,
+        )
+
+        with pytest.raises(ValueError, match="verification_incomplete") as error:
+            self._validate(json.dumps(envelope), rc=mod.EXIT_VERIFY_GATE)
+
+        assert str(error.value) == "verification_incomplete: delete_check"
+        verdict = mod._verify_protocol_verdict(error.value, executable="roam", targets=["library.unknown"])
+        assert "check: delete_check" in verdict
+        assert "did not run cannot be passed" in verdict
+        assert "repair what that check depends on" in verdict
 
     def test_an_incomplete_reason_this_build_cannot_name_is_not_echoed(self):
         """Reasons are producer text; only a name already in the vocabulary survives."""
@@ -3959,7 +4117,7 @@ class TestVerifyReceiptV3Protocol:
         result = runner.invoke(mod.cli, ["verify", "--changed"])
 
         assert result.exit_code == 0
-        assert seen["argv"] == ["--json", "verify", "--", "alpha.py", "venv/mypkg/mod.py"]
+        assert seen["argv"] == ["--json", "verify", "--auto", "--", "alpha.py", "venv/mypkg/mod.py"]
         verdict_line = next(line for line in result.output.splitlines() if line.startswith("VERDICT:"))
         assert "2 changed files" in verdict_line
         assert "scope narrowed: 1 untracked path(s) under .roam excluded" in verdict_line
