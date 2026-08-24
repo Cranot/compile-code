@@ -293,9 +293,25 @@ def test_check_main_healthy_control_preserves_success(monkeypatch, capsys):
     monkeypatch.setattr(check, "artifact_scan", lambda: True)
     monkeypatch.setattr(check, "readme_sanity", lambda: True)
     monkeypatch.setattr(check, "internal_index", lambda: True)
+    monkeypatch.setattr(check, "wiring_coverage", lambda: True)
     monkeypatch.setattr(check, "release_sanity", lambda: True)
     assert check.main([]) == 0
     assert capsys.readouterr().out.strip() == "[check] all gates passed — safe to push."
+
+
+def test_wiring_coverage_gate_uses_check_mode_and_names_the_fix(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(check, "run", lambda title, argv: calls.append((title, argv)) or False)
+
+    assert check.wiring_coverage() is False
+
+    assert calls == [
+        (
+            "wiring coverage",
+            [check.sys.executable, str(check.ROOT / "scripts" / "build_wiring_coverage.py"), "--check"],
+        )
+    ]
+    assert "python scripts/build_wiring_coverage.py --write" in capsys.readouterr().out
 
 
 def test_check_main_reports_environment_before_running_gates(monkeypatch, capsys):

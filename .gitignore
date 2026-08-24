@@ -28,3 +28,6 @@ internal/
 .ruff_cache/
 .tox/
 node_modules/
+
+# Source-derived public documentation.
+!/WIRING_COVERAGE.md

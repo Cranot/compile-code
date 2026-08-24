@@ -1327,6 +1327,17 @@ def internal_index() -> bool:
     return ok
 
 
+def wiring_coverage() -> bool:
+    """Fail when the generated Roam wiring denominator differs from source."""
+    ok = run(
+        "wiring coverage",
+        [sys.executable, str(ROOT / "scripts" / "build_wiring_coverage.py"), "--check"],
+    )
+    if not ok:
+        print("    fix: python scripts/build_wiring_coverage.py --write")
+    return ok
+
+
 def release_sanity() -> bool:
     """Static release contract: exact backend, closed schema/locks, hardened workflows."""
     problems = []
@@ -1513,6 +1524,7 @@ def main(argv: list[str] | None = None) -> int:
         artifact_scan(),
         readme_sanity(),
         internal_index(),
+        wiring_coverage(),
         release_sanity(),
     ]
     if all(results):
