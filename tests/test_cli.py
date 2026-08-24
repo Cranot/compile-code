@@ -189,6 +189,38 @@ def _verify_envelope(
     }
 
 
+def _rules_envelope(
+    *,
+    results: list[dict[str, object]],
+    config_state: str = "ok",
+    partial_success: bool = False,
+) -> dict[str, object]:
+    """A measured roam 14.0.0 custom-rules envelope, with fixture data only."""
+    failed = sum(1 for result in results if result.get("passed") is False)
+    passed = len(results) - failed
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "rules",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": f"{passed} of {len(results)} rules passed, {failed} error(s)",
+            "passed": passed,
+            "failed": failed,
+            "warnings": 0,
+            "total": len(results),
+            "config_state": config_state,
+            "partial_success": partial_success,
+            "scan_incomplete": False,
+        },
+        "results": results,
+        "next_commands": [],
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 def _no_changes_envelope(receipt: dict[str, object]) -> dict[str, object]:
     """The canonical 'nothing to verify' transaction roam emits for an empty scope."""
     envelope = _verify_envelope(receipt=receipt)
@@ -1964,6 +1996,193 @@ class TestVerifyFailureFormatting:
         assert res.exit_code == 0
         assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(targets)]
         assert "VERDICT: PASS" in res.output
+
+    def test_declared_governance_rule_violation_fails_and_names_rule_and_site(self, runner, monkeypatch, tmp_path):
+        source = tmp_path / "src" / "service.py"
+        source.parent.mkdir()
+        source.write_text("def evaluate_record(expression):\n    return eval(expression)\n", encoding="utf-8")
+        rules_dir = tmp_path / ".roam" / "rules"
+        rules_dir.mkdir(parents=True)
+        (rules_dir / "no_eval.yaml").write_text(
+            "name: No eval-style execution\nseverity: error\ntype: ast_match\n", encoding="utf-8"
+        )
+        digest = mod._verification_content_sha256(tmp_path, ["src/service.py"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["src/service.py"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        rule_output = json.dumps(
+            _rules_envelope(
+                results=[
+                    {
+                        "name": "No eval-style execution",
+                        "passed": False,
+                        "severity": "error",
+                        "violations": [
+                            {
+                                "file": "src/service.py",
+                                "line": 2,
+                                "reason": "AST pattern matched: eval($EXPR)",
+                                "symbol": "",
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["--json", "rules"]:
+                return SimpleNamespace(returncode=mod.EXIT_VERIFY_GATE, stdout=rule_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "src/service.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (governance rules)")
+        assert "No eval-style execution" in result.output
+        assert "src/service.py:2" in result.output
+        assert ["--json", "rules", "--ci", "--top", "5"] in calls
+
+    @pytest.mark.parametrize("declared", [True, False], ids=["compliant-rule", "no-rules"])
+    def test_governance_conservation_states_pass_without_a_false_rule_pass(
+        self, declared, runner, monkeypatch, tmp_path
+    ):
+        source = tmp_path / "src" / "service.py"
+        source.parent.mkdir()
+        source.write_text("def load_record(record_id):\n    return str(record_id)\n", encoding="utf-8")
+        if declared:
+            rules_dir = tmp_path / ".roam" / "rules"
+            rules_dir.mkdir(parents=True)
+            (rules_dir / "naming.yaml").write_text(
+                "name: Functions use snake_case\nseverity: error\ntype: symbol_match\n", encoding="utf-8"
+            )
+        digest = mod._verification_content_sha256(tmp_path, ["src/service.py"])
+        receipt = _bound_verify_receipt()
+        receipt["content_sha256"] = digest
+        receipt["content_sha256_before"] = digest
+        receipt["content_sha256_after"] = digest
+        env = {
+            "ROAM_VERIFY_REQUEST_NONCE": receipt["request_nonce"],
+            "ROAM_VERIFY_SCOPE_SHA256": receipt["scope_sha256"],
+            "ROAM_VERIFY_CONTENT_SHA256": digest,
+            "ROAM_VERIFY_SCOPE_COUNT": "1",
+        }
+        monkeypatch.setattr(
+            mod,
+            "_prepare_verify_request",
+            lambda _files: (tmp_path, ["src/service.py"], receipt, env, []),
+        )
+        monkeypatch.setattr(mod, "_delete_check_unavailable_reason", lambda _root, _targets: None)
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        rule_output = json.dumps(
+            _rules_envelope(
+                results=[
+                    {
+                        "name": "Functions use snake_case",
+                        "passed": True,
+                        "severity": "error",
+                        "violations": [],
+                    }
+                ]
+            )
+        )
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["--json", "rules"]:
+                return SimpleNamespace(returncode=0, stdout=rule_output, stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "src/service.py"])
+
+        assert result.exit_code == 0
+        assert "VERDICT: PASS" in result.output
+        if declared:
+            assert "rules [complete]" in result.output
+            assert ["--json", "rules", "--ci", "--top", "5"] in calls
+        else:
+            assert "rules [not_applicable]" in result.output
+            assert [call for call in calls if call[:2] == ["--json", "rules"]] == []
+
+    def test_declared_rules_probe_unavailability_refuses_without_teaching_rule_deletion(self, runner, monkeypatch):
+        fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+        monkeypatch.setattr(
+            mod,
+            "_verify_rules_declaration_state",
+            lambda _root: {
+                "state": "unavailable",
+                "reason": "the bounded rule declaration probe could not be completed",
+                "declaration_count": 0,
+            },
+        )
+
+        result = runner.invoke(mod.cli, ["verify", "src/cli.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "rules did not run completely" in result.output
+        assert "repair the repository's .roam/rules declarations or index" in result.output
+        assert "delete" not in result.output.lower()
+
+    def test_declared_rule_configuration_partial_result_is_typed_unavailable(self, tmp_path):
+        rule_path = tmp_path / ".roam" / "rules" / "broken.yaml"
+        rule_path.parent.mkdir(parents=True)
+        rule_path.write_text("name: [unterminated\n", encoding="utf-8")
+        output = json.dumps(
+            _rules_envelope(
+                config_state="parse_error",
+                partial_success=True,
+                results=[
+                    {
+                        "name": "broken.yaml",
+                        "passed": False,
+                        "severity": "error",
+                        "violations": [
+                            {
+                                "file": str(rule_path),
+                                "line": None,
+                                "reason": "failed to parse broken.yaml",
+                                "symbol": "",
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+
+        result = mod._validate_verify_rules_protocol(
+            output,
+            returncode=mod.EXIT_VERIFY_GATE,
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            expected_root=tmp_path,
+            declaration_count=1,
+        )
+
+        assert result["state"] == "unavailable"
+        assert result["unavailable_reason"] == "declared rule configuration was not completely evaluated"
 
     @pytest.mark.parametrize("output", ["", "checks completed without a verdict\n"], ids=["empty", "malformed"])
     def test_zero_exit_requires_parseable_success_verdict(self, output, runner, monkeypatch):

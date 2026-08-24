@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib.metadata as importlib_metadata
+import importlib.util
 import inspect
 import os
 import sys
@@ -665,6 +666,44 @@ def _imported_command_modules(root: str, functions: dict[str, ast.FunctionDef | 
     return commands
 
 
+def _product_verify_commands(inventory: frozenset[str]) -> frozenset[str]:
+    """Commands registered by compile-code's product-owned auto-check layer."""
+    module_path = ROOT / "src" / "compile_code" / "cli.py"
+    spec = importlib.util.spec_from_file_location("_compile_code_wiring_cli", module_path)
+    if spec is None or spec.loader is None:
+        raise CoverageError("cannot load compile-code's VERIFY registry source")
+    product_cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(product_cli)
+
+    registry = product_cli._VERIFY_AUTO_CHECK_REGISTRY
+    if not isinstance(registry, tuple):
+        raise CoverageError("_VERIFY_AUTO_CHECK_REGISTRY is no longer a literal tuple")
+    registered: list[str] = []
+    for row in registry:
+        if (
+            not isinstance(row, tuple)
+            or len(row) != 2
+            or not isinstance(row[0], str)
+            or not isinstance(row[1], str)
+            or not row[1]
+        ):
+            raise CoverageError("_VERIFY_AUTO_CHECK_REGISTRY contains an invalid (command, description) row")
+        command = row[0]
+        handler = f"_run_verify_{command.replace('-', '_')}_check"
+        if not callable(getattr(product_cli, handler, None)):
+            raise CoverageError(f"VERIFY product auto check has no handler: {command}")
+        registered.append(command)
+    selected = tuple(product_cli._auto_select_product_verify_checks(["src/module.py"]))
+    if selected != tuple(registered):
+        raise CoverageError("VERIFY product auto-check registry and runtime selection disagree")
+    outside = set(selected) - inventory
+    if outside:
+        raise CoverageError(
+            "VERIFY product auto checks reference commands outside Roam inventory: " + ", ".join(outside)
+        )
+    return frozenset(selected)
+
+
 def verify_commands(inventory: frozenset[str]) -> frozenset[str]:
     """Commands represented by checks that ``verify --auto`` can select."""
     from roam.commands import cmd_verify
@@ -687,6 +726,7 @@ def verify_commands(inventory: frozenset[str]) -> frozenset[str]:
         commands.update(_imported_command_modules(handler, functions) & inventory)
     if missing_handlers:
         raise CoverageError("VERIFY auto checks have no source handler: " + ", ".join(sorted(missing_handlers)))
+    commands.update(_product_verify_commands(inventory))
     return frozenset(commands)
 
 

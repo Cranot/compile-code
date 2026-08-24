@@ -2544,6 +2544,7 @@ _VERIFY_CAUSE_LABELS = {
     "CLAIMS": "unverified claim",
     "COMMAND EXAMPLES": "broken command example",
     "SECRETS": "exposed secret",
+    "RULES": "governance rule violation",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2636,6 +2637,21 @@ _VERIFY_DELETE_CHECK_SUPPORTED_REMOVAL = re.compile(
     r"(?:export\s+)?const\s+\w+\s*=|func\s+(?:\([^)]*\)\s*)?\w+\s*\(|"
     r"type\s+\w+\s+(?:struct|interface)\b|(?:export\s+)?(?:type|interface)\s+\w+\b)"
 )
+_VERIFY_AUTO_CHECK_REGISTRY = (
+    (
+        "rules",
+        "Any edit triggers a bounded .roam/rules YAML declaration probe; declared rules run, while an absent "
+        "or empty declaration set reports not_applicable.",
+    ),
+)
+_VERIFY_RULE_CONFIG_STATES = frozenset(
+    {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
+)
+_VERIFY_RULE_SEVERITIES = frozenset({"error", "warning", "info"})
+_VERIFY_RULE_GATING_SEVERITIES = frozenset({"error"})
+MAX_VERIFY_RULE_DECLARATION_ENTRIES = 4096
+MAX_VERIFY_RULE_FINDINGS = 10
+MAX_VERIFY_RULE_TEXT_CHARS = 1024
 _VERIFY_CATEGORY_NAMES = _VERIFY_CHECK_NAMES | {"verification"}
 # There is deliberately no hand-copied "categories allowed to WARN on a PASS"
 # set here. Roam declares advisory-ness per category in the envelope it sends,
@@ -3674,6 +3690,250 @@ def _delete_check_unavailable_verdict(reason: str) -> str:
     )
 
 
+def _auto_select_product_verify_checks(target_paths: list[str]) -> tuple[str, ...]:
+    """Select product-owned post-edit checks from the same bound target list."""
+    if not target_paths:
+        return ()
+    return tuple(name for name, _description in _VERIFY_AUTO_CHECK_REGISTRY)
+
+
+def _verify_rules_declaration_state(root: Path) -> dict[str, object]:
+    """Derive whether the repository declares custom rules, without evaluating them."""
+    rules_dir = root / ".roam" / "rules"
+    try:
+        canonical_root = root.resolve(strict=True)
+        if not rules_dir.is_dir():
+            return {
+                "state": "not_applicable",
+                "reason": "no .roam/rules YAML declarations",
+                "declaration_count": 0,
+            }
+        canonical_rules_dir = rules_dir.resolve(strict=True)
+        if not _path_is_within(canonical_rules_dir, canonical_root):
+            return {
+                "state": "unavailable",
+                "reason": "the .roam/rules directory resolves outside the repository",
+                "declaration_count": 0,
+            }
+        declarations: list[str] = []
+        entry_count = 0
+        for candidate in sorted(rules_dir.rglob("*")):
+            entry_count += 1
+            if entry_count > MAX_VERIFY_RULE_DECLARATION_ENTRIES:
+                return {
+                    "state": "unavailable",
+                    "reason": "the rule declaration probe exceeded its bounded entry limit",
+                    "declaration_count": len(declarations),
+                }
+            if candidate.suffix not in {".yaml", ".yml"} or not candidate.is_file():
+                continue
+            resolved = candidate.resolve(strict=True)
+            if not _path_is_within(resolved, canonical_root):
+                return {
+                    "state": "unavailable",
+                    "reason": "a rule declaration resolves outside the repository",
+                    "declaration_count": len(declarations),
+                }
+            declarations.append(candidate.relative_to(root).as_posix())
+    except (OSError, RuntimeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded rule declaration probe could not be completed",
+            "declaration_count": 0,
+        }
+    if not declarations:
+        return {
+            "state": "not_applicable",
+            "reason": "no .roam/rules YAML declarations",
+            "declaration_count": 0,
+        }
+    return {"state": "declared", "declaration_count": len(declarations)}
+
+
+def _bounded_verify_rule_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > MAX_VERIFY_RULE_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _verify_rule_site(root: Path, raw_path: object) -> str:
+    path_text = _bounded_verify_rule_text(raw_path, reason="rules_finding_path")
+    try:
+        canonical_root = root.resolve(strict=True)
+        candidate = Path(path_text)
+        resolved = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (canonical_root / candidate).resolve(strict=False)
+        )
+        if not _path_is_within(resolved, canonical_root):
+            raise ValueError("rules_finding_path")
+        relative = resolved.relative_to(canonical_root).as_posix()
+        if _verification_scope_paths([relative]) != [relative]:
+            raise ValueError("rules_finding_path")
+        return relative
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        raise ValueError("rules_finding_path") from exc
+
+
+def _validate_verify_rules_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+    declaration_count: int,
+) -> dict[str, object]:
+    """Validate the bounded ``rules --ci`` result used by the VERIFY adapter."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("rules_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "rules"
+        or envelope.get("version") != expected_roam_version
+    ):
+        raise ValueError("rules_envelope")
+    summary = envelope.get("summary")
+    results = envelope.get("results")
+    if not isinstance(summary, dict) or not isinstance(results, list):
+        raise ValueError("rules_shape")
+    config_state = summary.get("config_state")
+    if config_state not in _VERIFY_RULE_CONFIG_STATES:
+        raise ValueError("rules_config_state")
+    total = _plain_int(summary.get("total"), maximum=len(results))
+    passed = _plain_int(summary.get("passed"), maximum=total)
+    failed = _plain_int(summary.get("failed"), maximum=total)
+    _plain_int(summary.get("warnings"), maximum=total)
+    _bounded_verify_rule_text(summary.get("verdict"), reason="rules_verdict")
+    if total != len(results) or passed + failed != total or total < declaration_count:
+        raise ValueError("rules_counts")
+
+    findings: list[dict[str, object]] = []
+    failed_count = 0
+    gating_count = 0
+    for result in results:
+        if not isinstance(result, dict):
+            raise ValueError("rules_result")
+        name = _bounded_verify_rule_text(result.get("name"), reason="rules_name")
+        severity = result.get("severity")
+        result_passed = result.get("passed")
+        violations = result.get("violations")
+        if (
+            severity not in _VERIFY_RULE_SEVERITIES
+            or type(result_passed) is not bool
+            or not isinstance(violations, list)
+        ):
+            raise ValueError("rules_result")
+        if result_passed != (len(violations) == 0):
+            raise ValueError("rules_result_contradiction")
+        if not result_passed:
+            failed_count += 1
+            if severity in _VERIFY_RULE_GATING_SEVERITIES:
+                gating_count += 1
+        for violation in violations:
+            if not isinstance(violation, dict):
+                raise ValueError("rules_finding")
+            site = _verify_rule_site(expected_root, violation.get("file"))
+            line = violation.get("line")
+            if line is not None:
+                _plain_int(line, minimum=1)
+            reason = _bounded_verify_rule_text(
+                violation.get("reason", "rule violated"), reason="rules_finding_reason", allow_empty=False
+            )
+            findings.append(
+                {
+                    "rule": name,
+                    "severity": severity,
+                    "file": site,
+                    "line": line,
+                    "reason": reason,
+                }
+            )
+    if failed_count != failed:
+        raise ValueError("rules_counts")
+    incomplete = summary.get("partial_success") is True or summary.get("scan_incomplete") is True
+    if config_state != "ok" or incomplete:
+        state = "unavailable"
+        unavailable_reason = "declared rule configuration was not completely evaluated"
+    elif gating_count:
+        state = "failed"
+        unavailable_reason = None
+    else:
+        state = "complete"
+        unavailable_reason = None
+    if returncode not in {0, EXIT_VERIFY_GATE} or (gating_count > 0) != (returncode != 0):
+        raise ValueError("rules_exit_contradiction")
+    return {
+        "state": state,
+        "declaration_count": declaration_count,
+        "rule_count": total,
+        "failed_rule_count": gating_count,
+        "findings": tuple(findings),
+        "unavailable_reason": unavailable_reason,
+    }
+
+
+def _run_verify_rules_check(
+    root: Path,
+    *,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Run the product-owned custom-rule adapter, or return its typed absence."""
+    declaration_state = _verify_rules_declaration_state(root)
+    if declaration_state["state"] != "declared":
+        return declaration_state, 0
+    rc, output = _delegate_capturing(
+        "--json",
+        "rules",
+        "--ci",
+        "--top",
+        str(MAX_VERIFY_RULE_FINDINGS // 2),
+        executable=executable,
+        env=env,
+    )
+    if output is None:
+        return None, rc
+    try:
+        result = _validate_verify_rules_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+            declaration_count=int(declaration_state["declaration_count"]),
+        )
+    except (UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "rules did not return one complete structured result",
+            "declaration_count": declaration_state["declaration_count"],
+        }, EXIT_TOOLCHAIN
+    return result, 0
+
+
+def _verify_rules_unavailable_verdict(reason: object) -> str:
+    safe_reason = (
+        reason
+        if isinstance(reason, str)
+        and 0 < len(reason) <= MAX_VERIFY_RULE_TEXT_CHARS
+        and all(ord(char) >= 32 for char in reason)
+        else "the custom-rule check could not establish a complete result"
+    )
+    return (
+        f"VERDICT: verify unavailable — rules did not run completely: {safe_reason}. "
+        "A declared rule check that did not run cannot pass. Fix: repair the repository's .roam/rules "
+        "declarations or index, then rerun `compile verify --changed`."
+    )
+
+
 def _prepare_verify_request(
     files: tuple[str, ...],
 ) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
@@ -4371,6 +4631,92 @@ def _render_verify_envelope(envelope: dict, *, excluded: Sequence[str] = (), dif
     return "\n".join(lines)
 
 
+def _render_verify_with_product_checks(
+    envelope: dict,
+    rules_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Add the validated product-owned rule result to the Verify rendering."""
+    rendered = _render_verify_envelope(envelope, excluded=excluded, diff_only=diff_only)
+    if rules_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = rules_result.get("state")
+    if state == "not_applicable":
+        lines.append("rules [not_applicable]: no .roam/rules YAML declarations")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("rules_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "rules" not in roster:
+                lines[index] = f"{line}, rules"
+            break
+    else:
+        lines.insert(1, "checks: rules")
+
+    rule_count = _plain_int(rules_result.get("rule_count"))
+    declaration_count = _plain_int(rules_result.get("declaration_count"))
+    findings_value = rules_result.get("findings")
+    if not isinstance(findings_value, tuple):
+        raise ValueError("rules_render_findings")
+    findings = list(findings_value)
+    gating_findings = [
+        finding
+        for finding in findings
+        if isinstance(finding, Mapping) and finding.get("severity") in _VERIFY_RULE_GATING_SEVERITIES
+    ]
+    if state == "complete":
+        lines.append(
+            f"rules [complete]: {rule_count} rule{'s' if rule_count != 1 else ''} from "
+            f"{declaration_count} declaration{'s' if declaration_count != 1 else ''}"
+        )
+    else:
+        issue_count = len(gating_findings)
+        summary = envelope["summary"]
+        targets_checked = summary.get("targets_checked", summary["files_checked"])
+        lines[0] = (
+            f"VERDICT: FAIL (governance rules) -- {issue_count} rule violation"
+            f"{'s' if issue_count != 1 else ''} in {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+
+    if findings:
+        lines.extend(("", f"RULES ({'0' if state == 'failed' else '100'}/100):"))
+        for finding in findings[:MAX_VERIFY_RULE_FINDINGS]:
+            if not isinstance(finding, Mapping):
+                raise ValueError("rules_render_finding")
+            location = str(finding["file"])
+            if finding.get("line") is not None:
+                location += f":{finding['line']}"
+            level = "FAIL" if finding["severity"] in _VERIFY_RULE_GATING_SEVERITIES else "WARN"
+            lines.append(f"  {level}: {location} -- {finding['rule']}: {finding['reason']}")
+        if len(findings) > MAX_VERIFY_RULE_FINDINGS:
+            lines.append(f"  (+{len(findings) - MAX_VERIFY_RULE_FINDINGS} more rule findings omitted by output bound)")
+    return "\n".join(lines)
+
+
+def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]:
+    files: list[str] = []
+    findings = rules_result.get("findings")
+    if not isinstance(findings, tuple):
+        return files
+    for finding in findings:
+        if (
+            isinstance(finding, Mapping)
+            and finding.get("severity") in _VERIFY_RULE_GATING_SEVERITIES
+            and isinstance(finding.get("file"), str)
+            and finding["file"] not in files
+        ):
+            files.append(finding["file"])
+    return files
+
+
 def _failing_files(envelope: dict) -> list[str]:
     """Return exact validated FAIL paths without round-tripping through display text."""
     failing: list[str] = []
@@ -4623,9 +4969,12 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     Delegates to `roam verify --auto`, which selects checks from the bound
     changed set. Its delete-safety check derives its trigger from the same Git
     change: a deleted or renamed path, or a diff hunk removing an
-    exported/public symbol, is checked for surviving references. If that check
-    has no index or cannot parse the changed language, VERIFY names the
-    unavailable state and refuses instead of publishing a false pass.
+    exported/public symbol, is checked for surviving references. The
+    product-owned rules adapter is also auto-selected for any edit: a bounded
+    declaration probe runs `.roam/rules` YAML rules when present and reports a
+    typed not_applicable state when none exist. If either triggered check lacks
+    the inputs needed for a complete result, VERIFY names the unavailable state
+    and refuses instead of publishing a false pass.
     `--new-only` passes through to roam's accepted-debt baseline; `--diff-only`
     keeps the output scoped to changed lines. Only a complete, bound JSON
     receipt is rendered. A validated gate failure is followed by a block naming
@@ -4683,6 +5032,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         if excluded:
             click.echo(_narrowed_scope_notice(excluded))
         raise SystemExit(rc)
+    rules_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -4693,6 +5043,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             expected_root=root,
             diff_only=diff_only,
         )
+        selected_product_checks = _auto_select_product_verify_checks(bound_targets)
+        if "rules" in selected_product_checks:
+            rules_result, rules_rc = _run_verify_rules_check(
+                root,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if rules_result is None:
+                raise SystemExit(rules_rc)
+            if rules_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_rules_unavailable_verdict(
+                        rules_result.get("unavailable_reason", rules_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -4711,15 +5078,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         if excluded and not bound_targets:
             click.echo(_unignored_tool_state_note(excluded))
         raise SystemExit(EXIT_TOOLCHAIN)
-    rendered = _render_verify_envelope(envelope, excluded=excluded, diff_only=diff_only)
+    rendered = _render_verify_with_product_checks(
+        envelope,
+        rules_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
     # completed nonzero run gets the failure block — including roam's own
     # exit 2 ("bad arguments"), which only the sentinel can distinguish from
     # this CLI's EXIT_TOOLCHAIN (also 2).
-    if rc != 0:
+    final_rc = EXIT_VERIFY_GATE if rules_result is not None and rules_result.get("state") == "failed" else rc
+    if final_rc != 0:
         failing = _failing_files(envelope)
+        if rules_result is not None:
+            failing.extend(path for path in _verify_rules_failing_files(rules_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(
@@ -4729,7 +5104,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     threshold=threshold,
                 ),
                 files=scoped,
-                cause=_classify_verify_failure(rendered, rc),
+                cause=_classify_verify_failure(rendered, final_rc),
                 next_action=_render_verify_command(
                     new_only=new_only,
                     diff_only=diff_only,
@@ -4737,7 +5112,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                 ),
             )
         )
-    raise SystemExit(rc)
+    raise SystemExit(final_rc)
 
 
 @cli.command("doctor")
