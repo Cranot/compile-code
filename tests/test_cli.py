@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,7 +76,7 @@ def roam_calls(monkeypatch):
     class _P:
         returncode = 0
 
-    def fake(*args, timeout=600):
+    def fake(*args, timeout=600, **kwargs):
         calls.append(list(args))
         if list(args) == ["hooks", "claude", "--write"]:
             wiring["active"] = True
@@ -372,6 +373,67 @@ def _calc_golden_envelope(
     }
 
 
+_COLLAPSE_RULES = {
+    "catch-to-benign-literal": (
+        "catch returns only a benign literal",
+        "Return a typed failure reason or rethrow after recording the error.",
+    ),
+    "enoent-conflation": (
+        "unreadable file is treated as absent",
+        "Check the error code and preserve a distinct failure state.",
+    ),
+    "fallback-or-zero-on-measurement": (
+        "failed measurement falls back to zero",
+        "Preserve measurement failure separately from numeric zero.",
+    ),
+    "shell-echo-fallback": (
+        "failed shell command echoes a benign literal",
+        "Emit a distinct failure state instead of echoing a benign literal.",
+    ),
+    "parse-failure-merges-with-empty": (
+        "invalid input is treated as empty input",
+        "Represent invalid input separately from empty input.",
+    ),
+}
+
+
+def _collapse_envelope(*, findings: list[dict[str, object]], path: str = "service.py") -> dict[str, object]:
+    """A measured roam 14.0.0 collapse envelope, with fixture findings only."""
+    high = sum(finding["severity"] == "high" for finding in findings)
+    medium = len(findings) - high
+    counts = Counter(str(finding["rule"]) for finding in findings)
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "collapse",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": f"{len(findings)} collapse findings in 1 scanned files",
+            "state": "completed",
+            "total_findings": len(findings),
+            "high_findings": high,
+            "medium_findings": medium,
+            "files_scanned": 1,
+            "supported_files": 1,
+            "rules_checked": len(_COLLAPSE_RULES),
+            "suppression_comment": "roam: ignore-collapse[rule-id]",
+            "findings_metric_definition": "Per-occurrence count of distinct collapsed error/default sites.",
+        },
+        "rules": [
+            {"id": rule, "label": label, "repair": repair, "count": counts[rule]}
+            for rule, (label, repair) in _COLLAPSE_RULES.items()
+        ],
+        "findings": findings,
+        "supported_languages": ["python", "javascript", "typescript", "tsx", "bash"],
+        "unreadable_files": [],
+        "unparsed_files": [],
+        "next_steps": [f"Run `roam collapse --file {path}` to narrow the findings."],
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -454,6 +516,25 @@ def neutralize_synthetic_verify_calc_golden_check(monkeypatch):
                 "state": "not_applicable",
                 "reason": "no .roam/calc-golden JSON declarations",
                 "declaration_count": 0,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_collapse_check(monkeypatch):
+    """Keep legacy synthetic fixtures independent of collapse delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_collapse_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_finding_count": 0,
+                "baseline_finding_count": 0,
                 "regression_count": 0,
                 "findings": (),
             },
@@ -569,7 +650,7 @@ class TestSurface:
     def test_run_stamps_compile_agent_mode(self, runner, monkeypatch):
         seen = []
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
 
             class _P:
@@ -587,7 +668,7 @@ class TestSurface:
     def test_run_preserves_codex_agent_mode(self, runner, monkeypatch):
         seen = []
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
 
             class _P:
@@ -608,7 +689,7 @@ class TestSurface:
     def test_stats_does_not_stamp_compile_agent_mode(self, runner, monkeypatch):
         seen = []
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             seen.append(mod.os.environ.get("ROAM_AGENT_MODE"))
 
             class _P:
@@ -1107,7 +1188,7 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         )
 
     def _invoke(self, runner, monkeypatch, mutate=None):
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-types"]:
                 envelope = _py_types_envelope(total_public=0, findings=[])
                 envelope["version"] = self.FUTURE
@@ -1139,7 +1220,11 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         return runner.invoke(mod.cli, ["verify"])
 
     def test_a_readable_envelope_from_a_future_major_is_verified(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         result = self._invoke(runner, monkeypatch)
 
@@ -1161,7 +1246,11 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         assert "warnings" in result.output
 
     def test_a_neutral_additive_field_passes_and_is_disclosed_as_unread(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         result = self._invoke(
             runner,
@@ -1186,7 +1275,7 @@ class TestWiringSmoke:
         class _P:
             returncode = 0
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             calls.append(list(args))
             if list(args) == ["hooks", "claude", "--write"]:
                 _write_valid_claude_wiring(tmp_path)
@@ -1206,7 +1295,7 @@ class TestRoamMidtaskWiring:
         class _P:
             returncode = 0
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             assert list(args) == ["hooks", "claude", "--write"]
             _write_valid_claude_wiring(tmp_path)
             return _P()
@@ -1247,7 +1336,7 @@ class TestRoamMidtaskWiring:
         class _P:
             returncode = 0
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             assert list(args) == ["hooks", "claude", "--write", "--no-verify"]
             _write_valid_claude_wiring(tmp_path, include_verify=False)
             return _P()
@@ -1666,6 +1755,16 @@ class TestBoundedVerifyCapture:
             "or the .roam/calc-golden declaration, corpus, and runner, then rerun `compile verify --changed`; "
             "preserve the golden cases.",
         ),
+        (
+            mod._verify_collapse_unavailable_verdict,
+            "VERDICT: verify unavailable — collapse did not run completely: CAPTURED_REASON. A triggered collapse "
+            "check that did not run cannot pass. Fix: repair Git, the Roam index or detector, or the edited "
+            "Python/JavaScript/TypeScript source, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — collapse did not run completely: the benign-default collapse check could "
+            "not establish a complete result. A triggered collapse check that did not run cannot pass. Fix: repair "
+            "Git, the Roam index or detector, or the edited Python/JavaScript/TypeScript source, then rerun `compile "
+            "verify --changed`.",
+        ),
     ],
 )
 def test_verify_unavailable_verdicts_are_byte_stable(builder, safe_expected: str, fallback_expected: str):
@@ -2036,7 +2135,7 @@ class TestVerifyFailureFormatting:
 
             returncode = rc
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             captured["executable"] = executable
             captured["env"] = dict(env or {})
             if list(args[:2]) == ["--json", "py-types"]:
@@ -2228,6 +2327,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2251,6 +2351,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2265,6 +2366,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
@@ -2348,6 +2450,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         finding = {
             "severity": "FAIL",
@@ -2385,7 +2488,13 @@ class TestVerifyFailureFormatting:
         ],
     )
     def test_clean_symbol_removal_controls_pass(
-        self, control, targets, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        control,
+        targets,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
@@ -2403,7 +2512,12 @@ class TestVerifyFailureFormatting:
         assert "VERDICT: PASS" in res.output
 
     def test_declared_governance_rule_violation_fails_and_names_rule_and_site(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2467,7 +2581,7 @@ class TestVerifyFailureFormatting:
         )
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             if list(args[:2]) == ["--json", "rules"]:
                 return SimpleNamespace(returncode=mod.EXIT_VERIFY_GATE, stdout=rule_output, stderr="")
@@ -2485,7 +2599,13 @@ class TestVerifyFailureFormatting:
 
     @pytest.mark.parametrize("declared", [True, False], ids=["compliant-rule", "no-rules"])
     def test_governance_conservation_states_pass_without_a_false_rule_pass(
-        self, declared, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
+        self,
+        declared,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2542,7 +2662,7 @@ class TestVerifyFailureFormatting:
         )
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             if list(args[:2]) == ["--json", "rules"]:
                 return SimpleNamespace(returncode=0, stdout=rule_output, stderr="")
@@ -2619,6 +2739,166 @@ class TestVerifyFailureFormatting:
         assert result["state"] == "unavailable"
         assert result["unavailable_reason"] == "declared rule configuration was not completely evaluated"
 
+    def test_new_benign_default_collapse_fails_and_names_the_finding(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def load_rows(client):\n    return client.fetch_rows()\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            "def load_rows(client):\n"
+            "    try:\n"
+            "        return client.fetch_rows()\n"
+            "    except Exception:\n"
+            "        return []\n",
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        finding = {
+            "file": "service.py",
+            "line": 5,
+            "rule": "catch-to-benign-literal",
+            "severity": "high",
+            "collapsed_facts": "failed load_rows returns the same [] as an empty load_rows result.",
+            "repair": "Return a typed failure reason or rethrow after recording the error.",
+            "snippet": "return []",
+            "language": "python",
+        }
+        calls: list[tuple[list[str], str | None]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append((list(args), cwd))
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "collapse"]:
+                materialized = (Path(cwd) / "service.py").read_text(encoding="utf-8")
+                findings = [finding] if "except Exception" in materialized else []
+                return SimpleNamespace(
+                    returncode=0, stdout=json.dumps(_collapse_envelope(findings=findings)), stderr=""
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (benign-default collapse regression)")
+        assert "catch-to-benign-literal" in result.output
+        assert "service.py:5" in result.output
+        collapse_calls = [args for args, _cwd in calls if args[:2] == ["--json", "collapse"]]
+        assert collapse_calls == [
+            ["--json", "collapse", "--file", "service.py", "--include-tests"],
+            ["--json", "collapse", "--file", "service.py", "--include-tests"],
+        ]
+
+    def test_preexisting_benign_default_collapse_untouched_by_edit_passes(self, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "def load_rows(client):\n"
+            "    try:\n"
+            "        return client.fetch_rows()\n"
+            "    except Exception:\n"
+            "        return []\n",
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text("# Unrelated edit.\n" + source.read_text(encoding="utf-8"), encoding="utf-8")
+        finding = {
+            "file": "service.py",
+            "line": 6,
+            "rule": "catch-to-benign-literal",
+            "severity": "high",
+            "collapsed_facts": "failed load_rows returns the same [] as an empty load_rows result.",
+            "repair": "Return a typed failure reason or rethrow after recording the error.",
+            "snippet": "return []",
+            "language": "python",
+        }
+
+        def capture(*args, **kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "collapse"]
+            materialized = (Path(kwargs["cwd"]) / "service.py").read_text(encoding="utf-8")
+            adjusted = dict(finding, line=6 if materialized.startswith("# Unrelated") else 5)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(_collapse_envelope(findings=[adjusted])), stderr="")
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_collapse_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["baseline_finding_count"] == 1
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_collapse_tool_absence_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+    ):
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "collapse"]:
+                raise FileNotFoundError("roam")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "toolchain missing" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_malformed_collapse_envelope_is_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+    ):
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "collapse"]:
+                return SimpleNamespace(returncode=0, stdout='{not "one complete envelope"', stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "collapse did not run completely" in result.output
+        assert "VERDICT: PASS" not in result.output
+
     def test_declared_golden_semantic_change_fails_and_names_calculation_case_and_values(
         self,
         runner,
@@ -2626,6 +2906,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text(
@@ -2886,6 +3167,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text("tax = base * rate\n", encoding="utf-8")
@@ -2893,7 +3175,7 @@ class TestVerifyFailureFormatting:
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
 
@@ -2957,7 +3239,7 @@ class TestVerifyFailureFormatting:
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
 
@@ -2976,6 +3258,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
         self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
@@ -3050,7 +3333,12 @@ class TestVerifyFailureFormatting:
             )
 
     def test_outdated_python_construct_introduction_fails_and_names_file_and_construct(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3082,7 +3370,7 @@ class TestVerifyFailureFormatting:
         )
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             if list(args[:2]) == ["--json", "py-modern"]:
                 return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
@@ -3103,7 +3391,12 @@ class TestVerifyFailureFormatting:
         assert ["--json", "py-modern", "--detail", "--top", "25"] in calls
 
     def test_modern_python_clean_edit_passes(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3125,7 +3418,7 @@ class TestVerifyFailureFormatting:
             )
         )
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-modern"]:
                 return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
@@ -3139,7 +3432,12 @@ class TestVerifyFailureFormatting:
         assert "py-modern [complete]: edited-file outdated-construct delta clean" in result.output
 
     def test_legacy_python_clean_edit_does_not_gate_absolute_debt(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3167,7 +3465,7 @@ class TestVerifyFailureFormatting:
             )
         )
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-modern"]:
                 return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
@@ -3190,7 +3488,7 @@ class TestVerifyFailureFormatting:
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         calls: list[list[str]] = []
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             calls.append(list(args))
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
 
@@ -3259,7 +3557,7 @@ class TestVerifyFailureFormatting:
             )
         )
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-modern"]:
                 return SimpleNamespace(returncode=0, stdout=modern_output, stderr="")
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
@@ -3274,7 +3572,12 @@ class TestVerifyFailureFormatting:
         assert "complete structured result consistent with the edited files" in result.output
 
     def test_annotation_removal_fails_and_names_file_symbols_and_annotations(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3349,7 +3652,7 @@ class TestVerifyFailureFormatting:
             )
         )
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-types"]:
                 return SimpleNamespace(returncode=0, stdout=type_output, stderr="")
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
@@ -3466,6 +3769,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(record_id, label):\n    return f'{record_id}:{label}'\n", encoding="utf-8")
@@ -3503,7 +3807,7 @@ class TestVerifyFailureFormatting:
         verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         type_output = json.dumps(_py_types_envelope(total_public=1, findings=findings))
 
-        def fake(*args, timeout=600, executable="roam", env=None):
+        def fake(*args, timeout=600, executable="roam", env=None, **kwargs):
             if list(args[:2]) == ["--json", "py-types"]:
                 return SimpleNamespace(returncode=0, stdout=type_output, stderr="")
             return verify_fake(*args, timeout=timeout, executable=executable, env=env)
@@ -3608,7 +3912,11 @@ class TestVerifyFailureFormatting:
         assert "SKIPPED" not in res.output
 
     def test_zero_exit_accepts_an_explicit_warn_verdict(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, _ = self._capture("VERDICT: WARN (score 75/100) -- review findings\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3647,6 +3955,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3657,7 +3966,11 @@ class TestVerifyFailureFormatting:
         assert "next    : compile verify --threshold 90 --changed" in res.output
 
     def test_verify_omits_threshold_so_repository_policy_governs(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(
             "VERDICT: PASS (score 100/100) -- no issues\n",
@@ -3693,7 +4006,11 @@ class TestVerifyFailureFormatting:
         assert not any(character in command for character in "'\";&|<>()`$\n\r")
 
     def test_changed_recovery_mode_is_executable_and_rejects_mixed_scope(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3712,6 +4029,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         malicious_path = "src/a.py; Write-Output AUDIT_CANARY"
         findings = [
@@ -3777,6 +4095,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3795,7 +4114,11 @@ class TestVerifyFailureFormatting:
         assert "next    : compile verify --new-only --diff-only --changed" in res.output
 
     def test_verify_no_argument_binds_discovered_scope_before_delegation(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3813,6 +4136,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3829,6 +4153,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3854,6 +4179,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3864,7 +4190,11 @@ class TestVerifyFailureFormatting:
         assert captured["args"] == ["--json", "verify", "--auto", "--", *sorted(files)]
 
     def test_no_advisory_for_small_explicit_list(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -3888,7 +4218,11 @@ class TestVerifyFailureFormatting:
         return captured
 
     def test_verify_accepts_a_newer_producer_and_says_what_it_ignored(
-        self, runner, monkeypatch, neutralize_synthetic_verify_py_modern_check
+        self,
+        runner,
+        monkeypatch,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         """An upstream envelope addition must not become a local verify outage."""
         self._newer_producer(monkeypatch, 0, "VERDICT: PASS (score 100/100) -- no issues\n")
@@ -3908,6 +4242,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_collapse_check,
     ):
         self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
 
@@ -3990,7 +4325,7 @@ class TestBaselineVerb:
         class _P:
             returncode = 0
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             calls.append((list(args), timeout))
             return _P()
 
@@ -4009,7 +4344,7 @@ class TestBaselineVerb:
         class _P:
             returncode = 0
 
-        def fake(*args, timeout=600):
+        def fake(*args, timeout=600, **kwargs):
             calls.append((list(args), timeout))
             return _P()
 
@@ -5762,7 +6097,12 @@ class TestVerifyReceiptV3Protocol:
         assert "Traceback" not in result.output
 
     def test_a_pass_over_a_narrowed_scope_says_so_in_the_same_sentence(
-        self, runner, monkeypatch, compatible_roam, tmp_path
+        self,
+        runner,
+        monkeypatch,
+        compatible_roam,
+        tmp_path,
+        neutralize_synthetic_verify_collapse_check,
     ):
         # End to end: tracked source under venv/ is verified, the untracked
         # index is not, and the PASS carries its own reduced denominator.
@@ -5886,7 +6226,13 @@ class TestVerifyReceiptV3Protocol:
         with pytest.raises(ValueError):
             mod._verification_scope_paths([path])
 
-    def test_explicit_directory_growth_after_verify_fails_closed(self, runner, monkeypatch, tmp_path):
+    def test_explicit_directory_growth_after_verify_fails_closed(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_collapse_check,
+    ):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".git").mkdir()
         expected = _bound_verify_receipt()

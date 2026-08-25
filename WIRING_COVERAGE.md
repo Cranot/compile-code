@@ -5,17 +5,17 @@ Source: resolved Roam 14.0.0. The 286-command inventory and channel sets are rea
 
 ## Summary
 
-**48 of 99 edit-relevant commands are wired** (51 distinct commands across all channels; 286 commands total).
+**49 of 99 edit-relevant commands are wired** (52 distinct commands across all channels; 286 commands total).
 
 Failure classes: 9 fully covered, 18 partial, and 0 fully uncovered.
 
 | Channel | Wired commands | Edit-relevant wired | Inventory share |
 |---|---:|---:|---:|
 | CONTEXT | 22 | 19 | 7.7% |
-| VERIFY | 23 | 23 | 8.0% |
+| VERIFY | 24 | 24 | 8.4% |
 | HOOK | 6 | 6 | 2.1% |
 | MCP | 8 | 8 | 2.8% |
-| **Union** | **51** | **48** | **17.8%** |
+| **Union** | **52** | **49** | **18.2%** |
 
 ## Derived channel sets
 
@@ -25,7 +25,7 @@ Failure classes: 9 fully covered, 18 partial, and 0 fully uncovered.
 
 ### VERIFY
 
-`affected-tests`, `breaking`, `calc-golden`, `clones`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `verify-imports`
+`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `verify-imports`
 
 ### HOOK
 
@@ -61,7 +61,7 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | F18 | Fragile-file edit | 4 | 2 | 0 | 0 | 0 | 2 / 5 | partial |
 | F19 | Blast-radius unawareness | 5 | 2 | 0 | 2 | 1 | 4 / 6 | partial |
 | F20 | Syntax error introduced | 5 | 1 | 1 | 0 | 0 | 2 / 2 | covered |
-| F21 | Error-handling anti-pattern | 4 | 1 | 0 | 1 | 0 | 2 / 5 | partial |
+| F21 | Error-handling anti-pattern | 4 | 1 | 1 | 1 | 0 | 3 / 5 | partial |
 | F22 | LLM-integration anti-pattern | 4 | 0 | 1 | 0 | 0 | 1 / 1 | covered |
 | F23 | AI rot or vibe | 3 | 0 | 0 | 1 | 0 | 1 / 1 | covered |
 | F24 | Governance or custom-rule violation | 5 | 0 | 1 | 0 | 0 | 1 / 4 | partial |
@@ -100,32 +100,31 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | 23 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
 | 24 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
 | 25 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
-| 26 | `collapse` | 4 | F21 | Detects benign-default collapse: error paths returning the same value as legitimate emptiness. |
-| 27 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
-| 28 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
-| 29 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
-| 30 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
-| 31 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
-| 32 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
-| 33 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
-| 34 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
-| 35 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
-| 36 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
-| 37 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
-| 38 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
-| 39 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
-| 40 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
-| 41 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
-| 42 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
-| 43 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
-| 44 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
-| 45 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
-| 46 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
-| 47 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
-| 48 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
-| 49 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
-| 50 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
-| 51 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
+| 26 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
+| 27 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
+| 28 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
+| 29 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
+| 30 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
+| 31 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
+| 32 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
+| 33 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
+| 34 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
+| 35 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
+| 36 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
+| 37 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
+| 38 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
+| 39 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
+| 40 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
+| 41 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
+| 42 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
+| 43 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
+| 44 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
+| 45 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
+| 46 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
+| 47 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
+| 48 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
+| 49 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
+| 50 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
 
 ## Full command classification
 
@@ -185,7 +184,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `closure` | no | — | Excluded from the edit denominator: transitive closure (graph navigation). | — |
 | `clusters` | no | — | Excluded from the edit denominator: graph clustering (reporting). | — |
 | `codeowners` | no | — | Excluded from the edit denominator: ownership coverage. | — |
-| `collapse` | yes | F21 | Detects benign-default collapse: error paths returning the same value as legitimate emptiness. | — |
+| `collapse` | yes | F21 | Compares benign-default collapses in edited Python and JavaScript/TypeScript files with their Git pre-edit state. | VERIFY |
 | `commands` | no | — | Excluded from the edit denominator: list repo runnable commands (meta). | — |
 | `compare` | no | — | Excluded from the edit denominator: cross-index structural diff (reporting). | CONTEXT |
 | `compatibility` | yes | F2 | Checks version and consumer compatibility across a change. | — |

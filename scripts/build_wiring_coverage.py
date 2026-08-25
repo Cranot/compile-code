@@ -176,7 +176,7 @@ COMMAND_CLASSIFICATION_ROWS = (
         _c(
             True,
             "F21",
-            "Detects benign-default collapse: error paths returning the same value as legitimate emptiness.",
+            "Compares benign-default collapses in edited Python and JavaScript/TypeScript files with their Git pre-edit state.",
         ),
     ),
     ("commands", _c(False, "", "Excluded from the edit denominator: list repo runnable commands (meta).")),

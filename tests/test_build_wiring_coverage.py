@@ -66,7 +66,9 @@ def test_render_starts_with_generated_by_header() -> None:
 def test_verify_derives_product_check_registration_and_trigger_descriptions() -> None:
     inventory = coverage.roam_command_inventory()
 
-    assert coverage._product_verify_commands(inventory) == frozenset({"calc-golden", "py-modern", "py-types", "rules"})
+    assert coverage._product_verify_commands(inventory) == frozenset(
+        {"calc-golden", "collapse", "py-modern", "py-types", "rules"}
+    )
 
     import compile_code.cli as cli
 
@@ -81,6 +83,9 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "absolute legacy debt never gates" in descriptions["py-modern"]
     assert ".roam/calc-golden" in descriptions["calc-golden"]
     assert "Git pre-edit" in descriptions["calc-golden"]
+    assert "Python and JavaScript/TypeScript edits" in descriptions["collapse"]
+    assert "Git pre-edit state" in descriptions["collapse"]
+    assert "absolute legacy debt never gates" in descriptions["collapse"]
     assert cli._auto_select_product_verify_checks(["README.md"]) == (
         "rules",
         "py-types",
@@ -92,5 +97,14 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "py-types",
         "py-modern",
         "calc-golden",
+        "collapse",
     )
+    assert cli._auto_select_product_verify_checks(["web/service.tsx"]) == (
+        "rules",
+        "py-types",
+        "py-modern",
+        "calc-golden",
+        "collapse",
+    )
+    assert "collapse" not in cli._auto_select_product_verify_checks(["scripts/check.sh"])
     assert cli._auto_select_product_verify_checks([]) == ()

@@ -2671,6 +2671,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "Edits to source files bound by .roam/calc-golden JSON declarations replay golden cases against the "
         "current and Git pre-edit calculations; absent declarations and unrelated edits report not_applicable.",
     ),
+    (
+        "collapse",
+        "Python and JavaScript/TypeScript edits run bounded collapse scans over the same edited files in the "
+        "current and Git pre-edit state; absolute legacy debt never gates.",
+    ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
     {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
@@ -2730,6 +2735,40 @@ MAX_VERIFY_CALC_DELTA_FIELDS = 16
 MAX_VERIFY_CALC_FINDINGS = 10
 MAX_VERIFY_CALC_TEXT_CHARS = 1024
 VERIFY_CALC_RUNNER_TIMEOUT = 60
+_VERIFY_COLLAPSE_SOURCE_SUFFIXES = frozenset(
+    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
+)
+_VERIFY_COLLAPSE_LANGUAGES = ("python", "javascript", "typescript", "tsx", "bash")
+_VERIFY_COLLAPSE_RULES = {
+    "catch-to-benign-literal": (
+        "catch returns only a benign literal",
+        "Return a typed failure reason or rethrow after recording the error.",
+    ),
+    "enoent-conflation": (
+        "unreadable file is treated as absent",
+        "Check the error code and preserve a distinct failure state.",
+    ),
+    "fallback-or-zero-on-measurement": (
+        "failed measurement falls back to zero",
+        "Preserve measurement failure separately from numeric zero.",
+    ),
+    "shell-echo-fallback": (
+        "failed shell command echoes a benign literal",
+        "Emit a distinct failure state instead of echoing a benign literal.",
+    ),
+    "parse-failure-merges-with-empty": (
+        "invalid input is treated as empty input",
+        "Represent invalid input separately from empty input.",
+    ),
+}
+_VERIFY_COLLAPSE_SEVERITIES = frozenset({"high", "medium"})
+_VERIFY_COLLAPSE_SUPPRESSION_COMMENT = "roam: ignore-collapse[rule-id]"
+_VERIFY_COLLAPSE_METRIC_DEFINITION = "Per-occurrence count of distinct collapsed error/default sites."
+MAX_VERIFY_COLLAPSE_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_VERIFY_COLLAPSE_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS = 4096
+MAX_VERIFY_COLLAPSE_FINDINGS = 10
+MAX_VERIFY_COLLAPSE_TEXT_CHARS = 1024
 _VERIFY_MODERN_FEATURE_KEYS = (
     "walrus",
     "match_stmt",
@@ -3784,7 +3823,10 @@ def _auto_select_product_verify_checks(target_paths: list[str]) -> tuple[str, ..
     """Select product-owned post-edit checks from the same bound target list."""
     if not target_paths:
         return ()
-    return tuple(name for name, _description in _VERIFY_AUTO_CHECK_REGISTRY)
+    collapse_applies = any(
+        PurePosixPath(path).suffix.lower() in _VERIFY_COLLAPSE_SOURCE_SUFFIXES for path in target_paths
+    )
+    return tuple(name for name, _description in _VERIFY_AUTO_CHECK_REGISTRY if name != "collapse" or collapse_applies)
 
 
 def _verify_rules_declaration_state(root: Path) -> dict[str, object]:
@@ -4036,6 +4078,13 @@ _VERIFY_CALC_GOLDEN_UNAVAILABLE_VERDICT = (
     "calc-golden",
     "A declared golden case that did not run cannot pass. Fix: repair Git or the .roam/calc-golden declaration, "
     "corpus, and runner, then rerun `compile verify --changed`; preserve the golden cases.",
+)
+_VERIFY_COLLAPSE_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_COLLAPSE_TEXT_CHARS,
+    "the benign-default collapse check could not establish a complete result",
+    "collapse",
+    "A triggered collapse check that did not run cannot pass. Fix: repair Git, the Roam index or detector, or the "
+    "edited Python/JavaScript/TypeScript source, then rerun `compile verify --changed`.",
 )
 
 
@@ -5493,6 +5542,360 @@ def _verify_calc_golden_unavailable_verdict(reason: object) -> str:
     return _verify_unavailable_verdict(reason, *_VERIFY_CALC_GOLDEN_UNAVAILABLE_VERDICT)
 
 
+def _verify_collapse_unavailable_verdict(reason: object) -> str:
+    return _verify_unavailable_verdict(reason, *_VERIFY_COLLAPSE_UNAVAILABLE_VERDICT)
+
+
+def _bounded_verify_collapse_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
+    if (
+        not isinstance(value, str)
+        or (not value and not allow_empty)
+        or len(value) > MAX_VERIFY_COLLAPSE_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _verify_collapse_head_source(root: Path, baseline_path: str | None) -> str:
+    if baseline_path is None:
+        return ""
+    blob = _verify_type_git_capture(
+        root,
+        ["cat-file", "blob", f"HEAD:{baseline_path}"],
+        stdout_limit=MAX_VERIFY_COLLAPSE_SOURCE_BYTES,
+    )
+    raw = blob.stdout or b""
+    if blob.returncode != 0 or len(raw) > MAX_VERIFY_COLLAPSE_SOURCE_BYTES:
+        tree = _verify_type_git_capture(
+            root,
+            ["ls-tree", "-z", "HEAD", "--", baseline_path],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        if tree.returncode == 0 and not (tree.stdout or b""):
+            return ""
+        raise ValueError("collapse_baseline_unavailable")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("collapse_baseline_non_utf8") from exc
+
+
+def _verify_edited_collapse_sources(root: Path, targets: Sequence[str]) -> tuple[tuple[str, str, str], ...]:
+    """Return bounded current/HEAD pairs for edited collapse-supported sources."""
+    supported_targets = tuple(
+        path for path in targets if PurePosixPath(path).suffix.lower() in _VERIFY_COLLAPSE_SOURCE_SUFFIXES
+    )
+    if not supported_targets:
+        return ()
+    head = _verify_type_git_capture(root, ["cat-file", "-e", "HEAD^{commit}"], stdout_limit=1)
+    if head.returncode != 0:
+        raise ValueError("collapse_baseline_unavailable")
+    baseline_paths = _verify_type_baseline_paths(root, supported_targets)
+    sources: list[tuple[str, str, str]] = []
+    total_source_bytes = 0
+    for path in supported_targets:
+        candidate = root / Path(path)
+        try:
+            current_raw = (
+                ""
+                if not candidate.exists()
+                else _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_COLLAPSE_SOURCE_BYTES)
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("collapse_current_source_unavailable") from exc
+        baseline_raw = _verify_collapse_head_source(root, baseline_paths[path])
+        total_source_bytes += len(current_raw.encode("utf-8")) + len(baseline_raw.encode("utf-8"))
+        if total_source_bytes > MAX_VERIFY_COLLAPSE_TOTAL_SOURCE_BYTES:
+            raise ValueError("collapse_source_scope_too_large")
+        sources.append((path, baseline_raw, current_raw))
+    return tuple(sources)
+
+
+@contextmanager
+def _verify_collapse_checkout(
+    root: Path,
+    sources: Sequence[tuple[str, str, str]],
+    *,
+    current: bool,
+) -> Iterator[Path]:
+    """Materialize one isolated side of the collapse comparison."""
+    with tempfile.TemporaryDirectory(prefix=".compile-code-collapse-", dir=str(root)) as raw_checkout:
+        checkout = Path(raw_checkout)
+        initialized = _verify_type_git_capture(checkout, ["init", "-q"], stdout_limit=1024)
+        if initialized.returncode != 0:
+            raise ValueError("collapse_checkout_unavailable")
+        for path, baseline_raw, current_raw in sources:
+            destination = checkout / Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(current_raw if current else baseline_raw, encoding="utf-8")
+        yield checkout
+
+
+def _verify_collapse_language(path: str) -> str:
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix in {".py", ".pyi"}:
+        return "python"
+    if suffix in {".js", ".jsx", ".mjs", ".cjs"}:
+        return "javascript"
+    if suffix == ".tsx":
+        return "tsx"
+    if suffix in {".ts", ".mts", ".cts"}:
+        return "typescript"
+    raise ValueError("collapse_language")
+
+
+def _validate_verify_collapse_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+    expected_path: str,
+) -> tuple[dict[str, object], ...]:
+    """Validate one bounded, single-file collapse result."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("collapse_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "collapse"
+        or envelope.get("version") != expected_roam_version
+        or returncode != 0
+    ):
+        raise ValueError("collapse_envelope")
+    summary = envelope.get("summary")
+    rules = envelope.get("rules")
+    raw_findings = envelope.get("findings")
+    unreadable_files = envelope.get("unreadable_files")
+    unparsed_files = envelope.get("unparsed_files")
+    if (
+        not isinstance(summary, dict)
+        or not isinstance(rules, list)
+        or not isinstance(raw_findings, list)
+        or not isinstance(unreadable_files, list)
+        or not isinstance(unparsed_files, list)
+    ):
+        raise ValueError("collapse_shape")
+    if len(raw_findings) > MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS:
+        raise ValueError("collapse_result_bound")
+    if envelope.get("supported_languages") != list(_VERIFY_COLLAPSE_LANGUAGES):
+        raise ValueError("collapse_languages")
+
+    total = _plain_int(summary.get("total_findings"), maximum=MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS)
+    high = _plain_int(summary.get("high_findings"), maximum=total)
+    medium = _plain_int(summary.get("medium_findings"), maximum=total)
+    files_scanned = _plain_int(summary.get("files_scanned"), maximum=1)
+    supported_files = _plain_int(summary.get("supported_files"), maximum=1)
+    rules_checked = _plain_int(summary.get("rules_checked"), maximum=len(_VERIFY_COLLAPSE_RULES))
+    if (
+        summary.get("state") != "completed"
+        or summary.get("partial_success") not in (None, False)
+        or total != len(raw_findings)
+        or high + medium != total
+        or files_scanned != 1
+        or supported_files != 1
+        or rules_checked != len(_VERIFY_COLLAPSE_RULES)
+        or unreadable_files
+        or unparsed_files
+        or summary.get("suppression_comment") != _VERIFY_COLLAPSE_SUPPRESSION_COMMENT
+        or summary.get("findings_metric_definition") != _VERIFY_COLLAPSE_METRIC_DEFINITION
+        or summary.get("verdict") != f"{total} collapse findings in 1 scanned files"
+    ):
+        raise ValueError("collapse_summary")
+
+    declared_counts: Counter[str] = Counter()
+    seen_rules: set[str] = set()
+    for row in rules:
+        if not isinstance(row, dict):
+            raise ValueError("collapse_rule")
+        rule = row.get("id")
+        if not isinstance(rule, str) or rule not in _VERIFY_COLLAPSE_RULES or rule in seen_rules:
+            raise ValueError("collapse_rule")
+        label, repair = _VERIFY_COLLAPSE_RULES[rule]
+        if row.get("label") != label or row.get("repair") != repair:
+            raise ValueError("collapse_rule")
+        declared_counts[rule] = _plain_int(row.get("count"), maximum=total)
+        seen_rules.add(rule)
+    if seen_rules != set(_VERIFY_COLLAPSE_RULES):
+        raise ValueError("collapse_rule")
+
+    expected_language = _verify_collapse_language(expected_path)
+    findings: list[dict[str, object]] = []
+    actual_counts: Counter[str] = Counter()
+    actual_severities: Counter[str] = Counter()
+    for raw_finding in raw_findings:
+        if not isinstance(raw_finding, dict):
+            raise ValueError("collapse_finding")
+        path = _verify_rule_site(expected_root, raw_finding.get("file"))
+        line = _plain_int(raw_finding.get("line"), minimum=1)
+        rule = raw_finding.get("rule")
+        severity = raw_finding.get("severity")
+        if (
+            path != expected_path
+            or not isinstance(rule, str)
+            or rule not in _VERIFY_COLLAPSE_RULES
+            or not isinstance(severity, str)
+            or severity not in _VERIFY_COLLAPSE_SEVERITIES
+        ):
+            raise ValueError("collapse_finding")
+        facts = _bounded_verify_collapse_text(raw_finding.get("collapsed_facts"), reason="collapse_facts")
+        repair = _bounded_verify_collapse_text(raw_finding.get("repair"), reason="collapse_repair")
+        snippet = _bounded_verify_collapse_text(raw_finding.get("snippet"), reason="collapse_snippet", allow_empty=True)
+        language = raw_finding.get("language")
+        if repair != _VERIFY_COLLAPSE_RULES[str(rule)][1] or language != expected_language:
+            raise ValueError("collapse_finding")
+        actual_counts[str(rule)] += 1
+        actual_severities[str(severity)] += 1
+        findings.append(
+            {
+                "file": path,
+                "line": line,
+                "rule": rule,
+                "severity": severity,
+                "collapsed_facts": facts,
+                "repair": repair,
+                "snippet": snippet,
+                "language": language,
+            }
+        )
+    if declared_counts != actual_counts or actual_severities != Counter({"high": high, "medium": medium}):
+        raise ValueError("collapse_counts")
+    return tuple(findings)
+
+
+def _run_verify_collapse_scan(
+    root: Path,
+    targets: Sequence[str],
+    *,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[tuple[dict[str, object], ...] | None, int, str | None]:
+    indexed_rc, indexed_output = _delegate_capturing(
+        "index",
+        "--force",
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if indexed_output is None:
+        return None, indexed_rc, None
+    if indexed_rc != 0:
+        return (), EXIT_TOOLCHAIN, "the isolated collapse scan index could not be built"
+    findings: list[dict[str, object]] = []
+    for path in targets:
+        rc, output = _delegate_capturing(
+            "--json",
+            "collapse",
+            "--file",
+            path,
+            "--include-tests",
+            executable=executable,
+            env=env,
+            cwd=str(root),
+        )
+        if output is None:
+            return None, rc, None
+        try:
+            findings.extend(
+                _validate_verify_collapse_protocol(
+                    output,
+                    returncode=rc,
+                    expected_roam_version=expected_roam_version,
+                    expected_root=root,
+                    expected_path=path,
+                )
+            )
+        except (UnicodeError, ValueError):
+            return (), EXIT_TOOLCHAIN, "collapse did not return one complete structured result for the edited file"
+        if len(findings) > MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS:
+            return (), EXIT_TOOLCHAIN, "the combined collapse result exceeded its bounded finding limit"
+    return tuple(findings), 0, None
+
+
+def _verify_collapse_finding_key(finding: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(
+        str(finding[field]) for field in ("file", "rule", "severity", "collapsed_facts", "snippet", "language")
+    )
+
+
+def _run_verify_collapse_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Run collapse on identical current/HEAD file sets and gate only new findings."""
+    try:
+        sources = _verify_edited_collapse_sources(root, targets)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded pre-edit collapse source set could not be derived from Git",
+        }, EXIT_TOOLCHAIN
+    if not sources:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed Python or JavaScript/TypeScript files",
+            "regression_count": 0,
+            "findings": (),
+        }, 0
+    scan_targets = tuple(path for path, _baseline_raw, _current_raw in sources)
+    try:
+        with _verify_collapse_checkout(root, sources, current=False) as baseline_root:
+            baseline_findings, baseline_rc, baseline_reason = _run_verify_collapse_scan(
+                baseline_root,
+                scan_targets,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if baseline_findings is None:
+            return None, baseline_rc
+        if baseline_reason is not None:
+            return {"state": "unavailable", "reason": baseline_reason}, EXIT_TOOLCHAIN
+        with _verify_collapse_checkout(root, sources, current=True) as current_root:
+            current_findings, current_rc, current_reason = _run_verify_collapse_scan(
+                current_root,
+                scan_targets,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if current_findings is None:
+            return None, current_rc
+        if current_reason is not None:
+            return {"state": "unavailable", "reason": current_reason}, EXIT_TOOLCHAIN
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the isolated pre-edit and current collapse scans could not be completed",
+        }, EXIT_TOOLCHAIN
+
+    baseline_counts = Counter(_verify_collapse_finding_key(finding) for finding in baseline_findings)
+    regressions: list[dict[str, object]] = []
+    regression_count = 0
+    for finding in current_findings:
+        key = _verify_collapse_finding_key(finding)
+        if baseline_counts[key]:
+            baseline_counts[key] -= 1
+            continue
+        regression_count += 1
+        if len(regressions) < MAX_VERIFY_COLLAPSE_FINDINGS:
+            regressions.append(finding)
+    return {
+        "state": "failed" if regression_count else "complete",
+        "absolute_finding_count": len(current_findings),
+        "baseline_finding_count": len(baseline_findings),
+        "regression_count": regression_count,
+        "findings": tuple(regressions),
+    }, 0
+
+
 def _prepare_verify_request(
     files: tuple[str, ...],
 ) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
@@ -6478,6 +6881,80 @@ def _render_verify_with_calc_golden_check(
     return "\n".join(lines)
 
 
+def _render_verify_with_collapse_check(
+    rendered: str,
+    envelope: Mapping[str, object],
+    collapse_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose the validated benign-default delta with the other Verify checks."""
+    if collapse_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = collapse_result.get("state")
+    if state == "not_applicable":
+        lines.append("collapse [not_applicable]: no changed Python or JavaScript/TypeScript files")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("collapse_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "collapse" not in roster:
+                lines[index] = f"{line}, collapse"
+            break
+    else:
+        lines.insert(1, "checks: collapse")
+    absolute_count = _plain_int(collapse_result.get("absolute_finding_count"))
+    baseline_count = _plain_int(collapse_result.get("baseline_finding_count"))
+    if state == "complete":
+        lines.append(
+            "collapse [complete]: edited-file benign-default delta clean "
+            f"({absolute_count} current vs {baseline_count} pre-edit findings)"
+        )
+        return "\n".join(lines)
+
+    regression_count = _plain_int(collapse_result.get("regression_count"), minimum=1)
+    summary = envelope.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError("collapse_render_summary")
+    targets_checked = summary.get("targets_checked", summary.get("files_checked"))
+    _plain_int(targets_checked)
+    if lines[0].startswith("VERDICT: PASS"):
+        lines[0] = (
+            f"VERDICT: FAIL (benign-default collapse regression) -- {regression_count} collapse finding"
+            f"{'s' if regression_count != 1 else ''} introduced in {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    else:
+        label_match = re.match(r"^VERDICT: FAIL \(([^)]*)\)", lines[0])
+        previous_label = label_match.group(1) if label_match else "another Verify gate"
+        lines[0] = (
+            f"VERDICT: FAIL ({previous_label} + benign-default collapse regression) -- product-owned edit gates failed"
+        )
+    findings = collapse_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("collapse_render_findings")
+    lines.extend(("", "COLLAPSE (0/100):"))
+    for finding in findings[:MAX_VERIFY_COLLAPSE_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("collapse_render_finding")
+        location = str(finding["file"])
+        if finding.get("line") is not None:
+            location += f":{finding['line']}"
+        lines.append(
+            f"  FAIL: {location} -- {finding['rule']}: {finding['collapsed_facts']} Repair: {finding['repair']}"
+        )
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more benign-default collapse regressions omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _verify_failing_files(
     result: Mapping[str, object], *, gating_severities: Container[object] | None = None
 ) -> list[str]:
@@ -6755,6 +7232,9 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     ``HEAD`` so legacy absolute debt does not gate unrelated work. Declared
     `.roam/calc-golden` calculations replay their cases against both the edited
     source and Git ``HEAD`` so only the edit's semantic divergence gates.
+    Edited Python and JavaScript/TypeScript sources run `collapse` against
+    isolated current and Git ``HEAD`` materializations of the same file set,
+    so only newly introduced benign-default collapses gate.
     Inapplicable adapters report typed not_applicable states. If any triggered
     check lacks the inputs needed for a complete result, VERIFY names the
     unavailable state and refuses instead of publishing a false pass.
@@ -6819,6 +7299,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     py_types_result: dict[str, object] | None = None
     py_modern_result: dict[str, object] | None = None
     calc_golden_result: dict[str, object] | None = None
+    collapse_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -6897,6 +7378,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "collapse" in selected_product_checks:
+            collapse_result, collapse_rc = _run_verify_collapse_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if collapse_result is None:
+                raise SystemExit(collapse_rc)
+            if collapse_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_collapse_unavailable_verdict(
+                        collapse_result.get("unavailable_reason", collapse_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -6930,6 +7428,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         excluded=excluded,
         diff_only=diff_only,
     )
+    rendered = _render_verify_with_collapse_check(
+        rendered,
+        envelope,
+        collapse_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
@@ -6938,7 +7443,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     # this CLI's EXIT_TOOLCHAIN (also 2).
     product_failed = any(
         result is not None and result.get("state") == "failed"
-        for result in (rules_result, py_types_result, py_modern_result, calc_golden_result)
+        for result in (rules_result, py_types_result, py_modern_result, calc_golden_result, collapse_result)
     )
     final_rc = EXIT_VERIFY_GATE if product_failed else rc
     if final_rc != 0:
@@ -6955,6 +7460,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_failing_files(py_modern_result) if path not in failing)
         if calc_golden_result is not None:
             failing.extend(path for path in _verify_failing_files(calc_golden_result) if path not in failing)
+        if collapse_result is not None:
+            failing.extend(path for path in _verify_failing_files(collapse_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(
