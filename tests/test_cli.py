@@ -497,6 +497,100 @@ def _orphan_imports_envelope(
     }
 
 
+_TX_HIGH_SEVERITY_CLASSIFICATIONS = frozenset({"unsafe_mutation", "unmatched_begin", "unmatched_commit"})
+
+
+def _tx_boundaries_envelope(*, boundaries: list[dict[str, object]]) -> dict[str, object]:
+    """The current roam 14.0.0 tx-boundaries envelope, with fixture boundaries only."""
+    counts = Counter(str(boundary["classification"]) for boundary in boundaries)
+    high_severity_count = sum(counts[classification] for classification in _TX_HIGH_SEVERITY_CLASSIFICATIONS)
+    parts = [
+        f"{counts[classification]} {classification}"
+        for classification in (
+            "transactional",
+            "unsafe_mutation",
+            "unmatched_begin",
+            "unmatched_commit",
+            "partial_transactional",
+        )
+        if counts[classification]
+    ]
+    if boundaries:
+        verdict = f"Classified {len(boundaries)} functions with mutations: " + ", ".join(parts)
+        state = "ok"
+        partial_success = False
+    else:
+        verdict = "No symbols available to classify (run `roam index`)."
+        state = "no_data"
+        partial_success = True
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "tx-boundaries",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": verdict,
+            "state": state,
+            "partial_success": partial_success,
+            "by_classification": dict(counts),
+            "total_classified": len(boundaries),
+            "surfaced": len(boundaries),
+            "filter_classification": None,
+            "high_severity_count": high_severity_count,
+            "classification_definition": (
+                "per-function transaction scope: transactional | partial_transactional | unsafe_mutation | "
+                "unmatched_begin | unmatched_commit | non_transactional | unknown. Heuristic "
+                "begin/commit/rollback markers + side-effects-derived mutation count; depth tracked by `with`-block "
+                "indent."
+            ),
+            "detector": "world_model.tx_boundaries (heuristic)",
+        },
+        "boundaries": boundaries,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
+def _tx_boundary(
+    *,
+    classification: str,
+    line: int,
+    symbol: str = "save_row",
+    path: str = "service.py",
+) -> dict[str, object]:
+    begin_markers = (
+        [{"line": line, "pattern": "db.begin()"}]
+        if classification in {"transactional", "partial_transactional", "unmatched_begin"}
+        else []
+    )
+    commit_markers = (
+        [{"line": line + 2, "pattern": "db.commit()"}]
+        if classification in {"transactional", "partial_transactional"}
+        else []
+    )
+    issues = {
+        "unmatched_begin": ["begin without commit/rollback (transaction leak)"],
+        "unmatched_commit": ["commit/rollback without preceding begin"],
+        "unsafe_mutation": ["mutation detected without transaction marker"],
+        "partial_transactional": ["mutations occur both inside and outside the transaction scope"],
+    }.get(classification, [])
+    return {
+        "symbol": symbol,
+        "file": path,
+        "classification": classification,
+        "begin_markers": begin_markers,
+        "commit_markers": commit_markers,
+        "rollback_markers": [],
+        "mutations_inside": int(classification in {"transactional", "partial_transactional", "unmatched_begin"}),
+        "mutations_outside": int(classification in {"partial_transactional", "unsafe_mutation"}),
+        "confidence": "high",
+        "issues": issues,
+        "line_start": line - 1,
+        "line_end": line + 2,
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -593,6 +687,25 @@ def neutralize_synthetic_verify_collapse_check(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_run_verify_collapse_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_finding_count": 0,
+                "baseline_finding_count": 0,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_tx_boundaries_check(monkeypatch):
+    """Keep legacy synthetic fixtures independent of tx-boundaries delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_tx_boundaries_check",
         lambda *_args, **_kwargs: (
             {
                 "state": "complete",
@@ -1246,6 +1359,7 @@ class TestRoamVersionEnforcement:
         assert "python metadata: roam-code 13.10.4" in res.output
 
 
+@pytest.mark.usefixtures("neutralize_synthetic_verify_tx_boundaries_check")
 class TestFutureRoamMajorIsVerifiedNotRefused:
     """A newer kernel major is verified; the CONTRACT decides, not the number.
 
@@ -1307,6 +1421,7 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         result = self._invoke(runner, monkeypatch)
 
@@ -1333,6 +1448,7 @@ class TestFutureRoamMajorIsVerifiedNotRefused:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         result = self._invoke(
             runner,
@@ -1846,6 +1962,16 @@ class TestBoundedVerifyCapture:
             "not establish a complete result. A triggered collapse check that did not run cannot pass. Fix: repair "
             "Git, the Roam index or detector, or the edited Python/JavaScript/TypeScript source, then rerun `compile "
             "verify --changed`.",
+        ),
+        (
+            mod._verify_tx_boundaries_unavailable_verdict,
+            "VERDICT: verify unavailable — tx-boundaries did not run completely: CAPTURED_REASON. A triggered "
+            "transaction-boundary check that did not run cannot pass. Fix: repair Git, the Roam index or detector, "
+            "or the changed transaction-relevant source, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — tx-boundaries did not run completely: the transaction-boundary check "
+            "could not establish a complete result. A triggered transaction-boundary check that did not run cannot "
+            "pass. Fix: repair Git, the Roam index or detector, or the changed transaction-relevant source, then "
+            "rerun `compile verify --changed`.",
         ),
         (
             mod._verify_orphan_imports_unavailable_verdict,
@@ -2420,6 +2546,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2444,6 +2571,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -2459,6 +2587,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
@@ -2543,6 +2672,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         finding = {
             "severity": "FAIL",
@@ -2587,6 +2717,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
         fake, captured = self._capture(
@@ -2610,6 +2741,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "src" / "service.py"
@@ -2699,6 +2831,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "src" / "service.py"
@@ -2993,6 +3126,277 @@ class TestVerifyFailureFormatting:
         assert "collapse did not run completely" in result.output
         assert "VERDICT: PASS" not in result.output
 
+    def test_new_unmatched_begin_fails_and_names_the_site(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def save_row(db):\n    return db.fetch_row()\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            "def save_row(db):\n    db.begin()\n    db.execute('INSERT INTO rows VALUES (1)')\n",
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        finding = _tx_boundary(classification="unmatched_begin", line=2)
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "tx-boundaries"]:
+                materialized = (Path(cwd) / "service.py").read_text(encoding="utf-8")
+                boundaries = [finding] if "db.begin()" in materialized else []
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(_tx_boundaries_envelope(boundaries=boundaries)),
+                    stderr="",
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (transaction-boundary regression)")
+        assert "unmatched_begin" in result.output
+        assert "service.py:2" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "tx-boundaries"]] == [
+            ["--json", "tx-boundaries", "--top", str(mod.MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS)],
+            ["--json", "tx-boundaries", "--top", str(mod.MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS)],
+        ]
+
+    def test_mutation_moved_outside_a_transaction_is_a_new_detector_defect(self, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "def save_row(db):\n    db.begin()\n    db.execute('INSERT INTO rows VALUES (1)')\n    db.commit()\n",
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(
+            source.read_text(encoding="utf-8") + "    db.execute('UPDATE rows SET value = 2')  # outside\n",
+            encoding="utf-8",
+        )
+
+        def capture(*args, **kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "tx-boundaries"]
+            materialized = (Path(kwargs["cwd"]) / "service.py").read_text(encoding="utf-8")
+            classification = "partial_transactional" if "# outside" in materialized else "transactional"
+            boundary = _tx_boundary(classification=classification, line=2)
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(_tx_boundaries_envelope(boundaries=[boundary])),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_tx_boundaries_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "failed"
+        assert result["regression_count"] == 1
+        assert result["findings"][0]["classification"] == "partial_transactional"
+
+    def test_preexisting_unmatched_begin_untouched_by_the_edit_passes(self, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "def save_row(db):\n    db.begin()\n    db.execute('INSERT INTO rows VALUES (1)')\n",
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text("# Unrelated edit.\n" + source.read_text(encoding="utf-8"), encoding="utf-8")
+
+        def capture(*args, **kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "tx-boundaries"]
+            materialized = (Path(kwargs["cwd"]) / "service.py").read_text(encoding="utf-8")
+            line = 3 if materialized.startswith("# Unrelated") else 2
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    _tx_boundaries_envelope(boundaries=[_tx_boundary(classification="unmatched_begin", line=line)])
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_tx_boundaries_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["baseline_finding_count"] == 1
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_tx_boundaries_without_a_git_baseline_is_typed_unavailable(self, monkeypatch, tmp_path):
+        (tmp_path / "service.py").write_text(
+            "def save_row(db):\n    db.begin()\n    db.execute('INSERT INTO rows VALUES (1)')\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        monkeypatch.setattr(
+            mod,
+            "_roam_capture",
+            lambda *args, **kwargs: pytest.fail("an untakeable baseline must stop before detector delegation"),
+        )
+
+        result, rc = mod._run_verify_tx_boundaries_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == mod.EXIT_TOOLCHAIN
+        assert result["state"] == "unavailable"
+        assert "pre-edit transaction-boundary source set" in result["reason"]
+
+    def test_sqlite_bare_commit_autocommit_shape_never_fails(self, monkeypatch, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text(
+            "import sqlite3\n\n"
+            "def save_row():\n"
+            "    conn = sqlite3.connect('state.db')\n"
+            "    conn.execute('INSERT INTO rows VALUES (1)')\n"
+            "    conn.commit()\n",
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text(source.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        transactional = _tx_boundary(classification="transactional", line=4)
+        transactional["begin_markers"] = [{"line": 6, "pattern": "implicit DB-API transaction"}]
+        transactional["commit_markers"] = [{"line": 6, "pattern": "db.commit()"}]
+
+        def capture(*args, **_kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "tx-boundaries"]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(_tx_boundaries_envelope(boundaries=[transactional])),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_tx_boundaries_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 0
+        assert result["regression_count"] == 0
+
+    def test_tx_boundaries_tool_absence_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def save_row(db):\n    return 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text("def save_row(db):\n    db.begin()\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "tx-boundaries"]:
+                raise FileNotFoundError("roam")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "toolchain missing" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_malformed_tx_boundaries_envelope_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        source = tmp_path / "service.py"
+        source.write_text("def save_row(db):\n    return 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, "service.py")
+        source.write_text("def save_row(db):\n    db.begin()\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["service.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "tx-boundaries"]:
+                return SimpleNamespace(returncode=0, stdout='{not "one complete envelope"', stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "service.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "tx-boundaries did not run completely" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_tx_boundaries_auto_selection_excludes_documentation_only_changes(self, tmp_path):
+        readme = tmp_path / "README.md"
+        readme.write_text("baseline\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, "README.md")
+        readme.write_text("database.begin() is documented here\n", encoding="utf-8")
+
+        assert "tx-boundaries" not in mod._auto_select_product_verify_checks(["README.md"], root=tmp_path)
+
     def test_deleting_an_imported_source_fails_and_names_the_untouched_importer(
         self,
         runner,
@@ -3002,6 +3406,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         package = tmp_path / "src" / "pkg"
         package.mkdir(parents=True)
@@ -3176,6 +3581,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "dependency.py"
         source.write_text("VALUE = 1\n", encoding="utf-8")
@@ -3209,6 +3615,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "dependency.py"
         source.write_text("VALUE = 1\n", encoding="utf-8")
@@ -3271,6 +3678,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "calc.py"
@@ -3533,6 +3941,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "calc.py"
@@ -3625,6 +4034,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
@@ -3706,6 +4116,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
@@ -3765,6 +4176,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3806,6 +4218,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3956,6 +4369,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -4148,6 +4562,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
@@ -4298,6 +4713,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: WARN (score 75/100) -- review findings\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4337,6 +4753,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4352,6 +4769,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(
             "VERDICT: PASS (score 100/100) -- no issues\n",
@@ -4392,6 +4810,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4411,6 +4830,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         malicious_path = "src/a.py; Write-Output AUDIT_CANARY"
         findings = [
@@ -4477,6 +4897,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4500,6 +4921,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4518,6 +4940,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4535,6 +4958,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4561,6 +4985,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4576,6 +5001,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
         monkeypatch.setattr(mod, "_roam_capture", fake)
@@ -4604,6 +5030,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         """An upstream envelope addition must not become a local verify outage."""
         self._newer_producer(monkeypatch, 0, "VERDICT: PASS (score 100/100) -- no issues\n")
@@ -4624,6 +5051,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
     ):
         self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
 
@@ -6484,6 +6912,7 @@ class TestVerifyReceiptV3Protocol:
         compatible_roam,
         tmp_path,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         # End to end: tracked source under venv/ is verified, the untracked
@@ -6614,6 +7043,7 @@ class TestVerifyReceiptV3Protocol:
         monkeypatch,
         tmp_path,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
     ):
         monkeypatch.chdir(tmp_path)

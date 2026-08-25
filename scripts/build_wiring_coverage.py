@@ -320,7 +320,10 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("memory", _c(False, "", "Excluded from the edit denominator: agent memory infra.")),
     ("metrics", _c(False, "", "Excluded from the edit denominator: metrics view.")),
     ("metrics-push", _c(False, "", "Excluded from the edit denominator: telemetry push.")),
-    ("migration-plan", _c(True, "F10", "Plans ordered data and schema changes before implementation.")),
+    (
+        "migration-plan",
+        _c(False, "", "Excluded from the edit denominator: planning ACTION, not an edit detector or verifier."),
+    ),
     ("migration-safety", _c(True, "F10", "Detects unsafe or irreversible migration operations.")),
     ("minimap", _c(False, "", "Excluded from the edit denominator: CLAUDE.md minimap.")),
     ("missing-index", _c(True, "F7", "Finds missing database indexes that can make an edit regress performance.")),
@@ -437,7 +440,14 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("trend", _c(False, "", "Excluded from the edit denominator: deprecated->trends.")),
     ("trends", _c(False, "", "Excluded from the edit denominator: health trends (reporting).")),
     ("triage", _c(False, "", "Excluded from the edit denominator: suppression mgmt.")),
-    ("tx-boundaries", _c(True, "F10", "Finds unsafe or unmatched transaction boundaries.")),
+    (
+        "tx-boundaries",
+        _c(
+            True,
+            "F10",
+            "Compares detector-marked transaction-boundary defects in edited files with their Git pre-edit state.",
+        ),
+    ),
     ("understand", _c(False, "", "Excluded from the edit denominator: comprehension.")),
     ("uses", _c(True, "F2", "Finds graph-resolved callers and references that an edit can break.")),
     ("verdict", _c(False, "", "Excluded from the edit denominator: proof-bundle verdict (compliance).")),

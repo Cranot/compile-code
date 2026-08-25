@@ -5,14 +5,14 @@ Source: resolved Roam 14.0.0. The 286-command inventory and channel sets are rea
 
 ## Summary
 
-**50 of 99 edit-relevant commands are wired** (53 distinct commands across all channels; 286 commands total).
+**50 of 98 edit-relevant commands are wired** (53 distinct commands across all channels; 286 commands total).
 
-Failure classes: 10 fully covered, 17 partial, and 0 fully uncovered.
+Failure classes: 11 fully covered, 16 partial, and 0 fully uncovered.
 
 | Channel | Wired commands | Edit-relevant wired | Inventory share |
 |---|---:|---:|---:|
 | CONTEXT | 22 | 19 | 7.7% |
-| VERIFY | 25 | 25 | 8.7% |
+| VERIFY | 26 | 26 | 9.1% |
 | HOOK | 6 | 6 | 2.1% |
 | MCP | 8 | 8 | 2.8% |
 | **Union** | **53** | **50** | **18.5%** |
@@ -25,7 +25,7 @@ Failure classes: 10 fully covered, 17 partial, and 0 fully uncovered.
 
 ### VERIFY
 
-`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `verify-imports`
+`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `tx-boundaries`, `verify-imports`
 
 ### HOOK
 
@@ -50,7 +50,7 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | F7 | Performance regression | 4 | 1 | 2 | 0 | 0 | 3 / 5 | partial |
 | F8 | Deleted but still referenced | 5 | 0 | 1 | 0 | 0 | 1 / 2 | partial |
 | F9 | Missing or insufficient test | 5 | 2 | 0 | 0 | 0 | 2 / 6 | partial |
-| F10 | Non-idempotent or transaction-unsafe operation | 5 | 2 | 1 | 0 | 0 | 3 / 4 | partial |
+| F10 | Non-idempotent or transaction-unsafe operation | 5 | 2 | 2 | 0 | 0 | 3 / 3 | covered |
 | F11 | Duplicated existing code | 4 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
 | F12 | Documentation or contract drift | 3 | 0 | 1 | 0 | 1 | 1 / 12 | partial |
 | F13 | Magic numbers | 3 | 0 | 1 | 0 | 0 | 1 / 1 | covered |
@@ -90,40 +90,39 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | 13 | `diagnose` | 5 | F3 | Finds likely root causes for a reported failure. |
 | 14 | `dict-consistency` | 5 | F26 | Detects inconsistent parallel dictionary or mapping definitions. |
 | 15 | `fitness` | 5 | F24 | Evaluates declared architectural fitness rules. |
-| 16 | `migration-plan` | 5 | F10 | Plans ordered data and schema changes before implementation. |
-| 17 | `pytest-fixtures` | 5 | F9 | Maps test fixtures that an edit may need to preserve or update. |
-| 18 | `refs` | 5 | F2 | Deprecated reference lookup alias that still finds live consumers. |
-| 19 | `safe-delete` | 5 | F8 | Plans and validates dependency-aware deletion. |
-| 20 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
-| 21 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
-| 22 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
-| 23 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
-| 24 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
-| 25 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
-| 26 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
-| 27 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
-| 28 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
-| 29 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
-| 30 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
-| 31 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
-| 32 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
-| 33 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
-| 34 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
-| 35 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
-| 36 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
-| 37 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
-| 38 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
-| 39 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
-| 40 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
-| 41 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
-| 42 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
-| 43 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
-| 44 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
-| 45 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
-| 46 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
-| 47 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
-| 48 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
-| 49 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
+| 16 | `pytest-fixtures` | 5 | F9 | Maps test fixtures that an edit may need to preserve or update. |
+| 17 | `refs` | 5 | F2 | Deprecated reference lookup alias that still finds live consumers. |
+| 18 | `safe-delete` | 5 | F8 | Plans and validates dependency-aware deletion. |
+| 19 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
+| 20 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
+| 21 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
+| 22 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
+| 23 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
+| 24 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
+| 25 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
+| 26 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
+| 27 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
+| 28 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
+| 29 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
+| 30 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
+| 31 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
+| 32 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
+| 33 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
+| 34 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
+| 35 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
+| 36 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
+| 37 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
+| 38 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
+| 39 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
+| 40 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
+| 41 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
+| 42 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
+| 43 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
+| 44 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
+| 45 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
+| 46 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
+| 47 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
+| 48 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
 
 ## Full command classification
 
@@ -292,7 +291,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `memory` | no | — | Excluded from the edit denominator: agent memory infra. | — |
 | `metrics` | no | — | Excluded from the edit denominator: metrics view. | — |
 | `metrics-push` | no | — | Excluded from the edit denominator: telemetry push. | — |
-| `migration-plan` | yes | F10 | Plans ordered data and schema changes before implementation. | — |
+| `migration-plan` | no | — | Excluded from the edit denominator: planning ACTION, not an edit detector or verifier. | — |
 | `migration-safety` | yes | F10 | Detects unsafe or irreversible migration operations. | VERIFY |
 | `minimap` | no | — | Excluded from the edit denominator: CLAUDE.md minimap. | — |
 | `missing-index` | yes | F7 | Finds missing database indexes that can make an edit regress performance. | — |
@@ -393,7 +392,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `trend` | no | — | Excluded from the edit denominator: deprecated->trends. | — |
 | `trends` | no | — | Excluded from the edit denominator: health trends (reporting). | — |
 | `triage` | no | — | Excluded from the edit denominator: suppression mgmt. | — |
-| `tx-boundaries` | yes | F10 | Finds unsafe or unmatched transaction boundaries. | CONTEXT |
+| `tx-boundaries` | yes | F10 | Compares detector-marked transaction-boundary defects in edited files with their Git pre-edit state. | CONTEXT, VERIFY |
 | `understand` | no | — | Excluded from the edit denominator: comprehension. | — |
 | `uses` | yes | F2 | Finds graph-resolved callers and references that an edit can break. | CONTEXT, MCP |
 | `verdict` | no | — | Excluded from the edit denominator: proof-bundle verdict (compliance). | — |

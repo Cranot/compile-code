@@ -37,6 +37,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import tokenize
 from bisect import bisect_left
 from collections import Counter, deque
 from collections.abc import Callable, Container, Mapping, Sequence
@@ -2559,6 +2560,7 @@ _VERIFY_CAUSE_LABELS = {
     "PY MODERN": "Python modernization regression",
     "CALC GOLDEN": "calculation semantic regression",
     "COLLAPSE": "benign-default collapse regression",
+    "TX BOUNDARIES": "transaction-boundary regression",
     "ORPHAN IMPORTS": "orphan import regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
@@ -2679,6 +2681,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "current and Git pre-edit state; absolute legacy debt never gates.",
     ),
     (
+        "tx-boundaries",
+        "Transaction-relevant Python and JavaScript/TypeScript edits run bounded detector-authoritative scans over "
+        "the same edited files in the current and Git pre-edit state; absolute legacy defects never gate.",
+    ),
+    (
         "orphan-imports",
         "Importable sources deleted or renamed, and source diffs that touch import lines, run bounded whole-tree "
         "orphan scans against the current and Git pre-edit state; only new actionable orphans gate.",
@@ -2776,6 +2783,58 @@ MAX_VERIFY_COLLAPSE_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS = 4096
 MAX_VERIFY_COLLAPSE_FINDINGS = 10
 MAX_VERIFY_COLLAPSE_TEXT_CHARS = 1024
+_VERIFY_TX_BOUNDARY_SOURCE_SUFFIXES = _VERIFY_COLLAPSE_SOURCE_SUFFIXES
+_VERIFY_TX_BOUNDARY_CLASSIFICATIONS = (
+    "transactional",
+    "partial_transactional",
+    "unsafe_mutation",
+    "unmatched_begin",
+    "unmatched_commit",
+    "non_transactional",
+    "unknown",
+)
+_VERIFY_TX_BOUNDARY_DEFECT_CLASSIFICATIONS = frozenset(
+    {"partial_transactional", "unsafe_mutation", "unmatched_begin", "unmatched_commit"}
+)
+_VERIFY_TX_BOUNDARY_HIGH_SEVERITY_CLASSIFICATIONS = frozenset(
+    {"unsafe_mutation", "unmatched_begin", "unmatched_commit"}
+)
+_VERIFY_TX_BOUNDARY_CONFIDENCES = frozenset({"high", "medium", "low"})
+_VERIFY_TX_BOUNDARY_CLASSIFICATION_DEFINITION = (
+    "per-function transaction scope: transactional | partial_transactional | unsafe_mutation | unmatched_begin | "
+    "unmatched_commit | non_transactional | unknown. Heuristic begin/commit/rollback markers + "
+    "side-effects-derived mutation count; depth tracked by `with`-block indent."
+)
+_VERIFY_TX_BOUNDARY_DETECTOR = "world_model.tx_boundaries (heuristic)"
+_VERIFY_TX_BOUNDARY_APPLICABILITY_NAMES = frozenset(
+    {
+        "atomic",
+        "begin",
+        "begin_nested",
+        "begin_transaction",
+        "commit",
+        "cursor",
+        "execute",
+        "executemany",
+        "executescript",
+        "psycopg2",
+        "rollback",
+        "sessionmaker",
+        "sqlite3",
+        "transaction",
+    }
+)
+_VERIFY_TX_BOUNDARY_NON_PYTHON_APPLICABILITY = re.compile(
+    r"\b(?:atomic|begin|begin_nested|begin_transaction|commit|cursor|execute|executemany|executescript|psycopg2|"
+    r"rollback|sessionmaker|sqlite3|transaction)\b|\.(?:exec|prepare|query)\s*\(",
+    re.IGNORECASE,
+)
+MAX_VERIFY_TX_BOUNDARY_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_VERIFY_TX_BOUNDARY_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS = 4096
+MAX_VERIFY_TX_BOUNDARY_CLASSIFIED = 1_000_000
+MAX_VERIFY_TX_BOUNDARY_FINDINGS = 10
+MAX_VERIFY_TX_BOUNDARY_TEXT_CHARS = 1024
 _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES = frozenset(
     {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte", ".go"}
 )
@@ -3977,6 +4036,58 @@ def _verify_orphan_imports_applies(root: Path | None, target_paths: Sequence[str
         return bool(direct_supported)
 
 
+def _verify_tx_boundary_source_applies(path: str, source: str) -> bool:
+    """Use the detector's lexical trigger vocabulary without classifying transaction safety."""
+    if PurePosixPath(path).suffix.lower() in {".py", ".pyi"}:
+        try:
+            for token in tokenize.generate_tokens(io.StringIO(source).readline):
+                if token.type != tokenize.NAME:
+                    continue
+                name = token.string.casefold()
+                if name in _VERIFY_TX_BOUNDARY_APPLICABILITY_NAMES or "begin" in name or "transaction" in name:
+                    return True
+            return False
+        except (IndentationError, MemoryError, SyntaxError, tokenize.TokenError):
+            # An unreadable applicability probe is selected conservatively; the
+            # isolated detector scan remains the authority on classifications.
+            return bool(_VERIFY_TX_BOUNDARY_NON_PYTHON_APPLICABILITY.search(source))
+    return bool(_VERIFY_TX_BOUNDARY_NON_PYTHON_APPLICABILITY.search(source))
+
+
+def _verify_tx_boundaries_applies(root: Path | None, target_paths: Sequence[str]) -> bool:
+    supported = tuple(
+        path for path in target_paths if PurePosixPath(path).suffix.lower() in _VERIFY_TX_BOUNDARY_SOURCE_SUFFIXES
+    )
+    # The coverage generator inspects the literal registry without a repository
+    # fixture. Runtime callers always pass the bound verification root below.
+    if root is None:
+        return bool(supported)
+    if not supported:
+        return False
+    try:
+        sources = _verify_edited_tx_boundary_sources(root, supported)
+        return any(
+            _verify_tx_boundary_source_applies(path, source)
+            for path, baseline_source, current_source in sources
+            for source in (baseline_source, current_source)
+        )
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        # Missing and deleted sources cannot prove inapplicability. Readable
+        # current sources can still avoid selecting the detector when their
+        # code tokens carry no transaction-relevant operation.
+        for path in supported:
+            candidate = root / Path(path)
+            if not candidate.is_file():
+                return True
+            try:
+                source = _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_TX_BOUNDARY_SOURCE_BYTES)
+            except (OSError, UnicodeError, ValueError):
+                return True
+            if _verify_tx_boundary_source_applies(path, source):
+                return True
+        return False
+
+
 def _auto_select_product_verify_checks(target_paths: list[str], *, root: Path | None = None) -> tuple[str, ...]:
     """Select product-owned post-edit checks from the same bound target list."""
     if not target_paths:
@@ -3984,11 +4095,14 @@ def _auto_select_product_verify_checks(target_paths: list[str], *, root: Path | 
     collapse_applies = any(
         PurePosixPath(path).suffix.lower() in _VERIFY_COLLAPSE_SOURCE_SUFFIXES for path in target_paths
     )
+    tx_boundaries_applies = _verify_tx_boundaries_applies(root, target_paths)
     orphan_imports_applies = _verify_orphan_imports_applies(root, target_paths)
     return tuple(
         name
         for name, _description in _VERIFY_AUTO_CHECK_REGISTRY
-        if (name != "collapse" or collapse_applies) and (name != "orphan-imports" or orphan_imports_applies)
+        if (name != "collapse" or collapse_applies)
+        and (name != "tx-boundaries" or tx_boundaries_applies)
+        and (name != "orphan-imports" or orphan_imports_applies)
     )
 
 
@@ -4248,6 +4362,13 @@ _VERIFY_COLLAPSE_UNAVAILABLE_VERDICT = (
     "collapse",
     "A triggered collapse check that did not run cannot pass. Fix: repair Git, the Roam index or detector, or the "
     "edited Python/JavaScript/TypeScript source, then rerun `compile verify --changed`.",
+)
+_VERIFY_TX_BOUNDARIES_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_TX_BOUNDARY_TEXT_CHARS,
+    "the transaction-boundary check could not establish a complete result",
+    "tx-boundaries",
+    "A triggered transaction-boundary check that did not run cannot pass. Fix: repair Git, the Roam index or "
+    "detector, or the changed transaction-relevant source, then rerun `compile verify --changed`.",
 )
 _VERIFY_ORPHAN_IMPORTS_UNAVAILABLE_VERDICT = (
     MAX_VERIFY_ORPHAN_IMPORTS_TEXT_CHARS,
@@ -5716,6 +5837,10 @@ def _verify_collapse_unavailable_verdict(reason: object) -> str:
     return _verify_unavailable_verdict(reason, *_VERIFY_COLLAPSE_UNAVAILABLE_VERDICT)
 
 
+def _verify_tx_boundaries_unavailable_verdict(reason: object) -> str:
+    return _verify_unavailable_verdict(reason, *_VERIFY_TX_BOUNDARIES_UNAVAILABLE_VERDICT)
+
+
 def _verify_orphan_imports_unavailable_verdict(reason: object) -> str:
     return _verify_unavailable_verdict(reason, *_VERIFY_ORPHAN_IMPORTS_UNAVAILABLE_VERDICT)
 
@@ -6060,6 +6185,371 @@ def _run_verify_collapse_check(
             continue
         regression_count += 1
         if len(regressions) < MAX_VERIFY_COLLAPSE_FINDINGS:
+            regressions.append(finding)
+    return {
+        "state": "failed" if regression_count else "complete",
+        "absolute_finding_count": len(current_findings),
+        "baseline_finding_count": len(baseline_findings),
+        "regression_count": regression_count,
+        "findings": tuple(regressions),
+    }, 0
+
+
+def _bounded_verify_tx_boundary_text(value: object, *, reason: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_VERIFY_TX_BOUNDARY_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _verify_tx_boundary_head_source(root: Path, baseline_path: str | None) -> str:
+    if baseline_path is None:
+        return ""
+    blob = _verify_type_git_capture(
+        root,
+        ["cat-file", "blob", f"HEAD:{baseline_path}"],
+        stdout_limit=MAX_VERIFY_TX_BOUNDARY_SOURCE_BYTES,
+    )
+    raw = blob.stdout or b""
+    if blob.returncode != 0 or len(raw) > MAX_VERIFY_TX_BOUNDARY_SOURCE_BYTES:
+        tree = _verify_type_git_capture(
+            root,
+            ["ls-tree", "-z", "HEAD", "--", baseline_path],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        if tree.returncode == 0 and not (tree.stdout or b""):
+            return ""
+        raise ValueError("tx_boundaries_baseline_unavailable")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("tx_boundaries_baseline_non_utf8") from exc
+
+
+def _verify_edited_tx_boundary_sources(root: Path, targets: Sequence[str]) -> tuple[tuple[str, str, str], ...]:
+    """Return bounded current/HEAD pairs for transaction-detector-supported sources."""
+    supported_targets = tuple(
+        path for path in targets if PurePosixPath(path).suffix.lower() in _VERIFY_TX_BOUNDARY_SOURCE_SUFFIXES
+    )
+    if not supported_targets:
+        return ()
+    head = _verify_type_git_capture(root, ["cat-file", "-e", "HEAD^{commit}"], stdout_limit=1)
+    if head.returncode != 0:
+        raise ValueError("tx_boundaries_baseline_unavailable")
+    baseline_paths = _verify_type_baseline_paths(root, supported_targets)
+    sources: list[tuple[str, str, str]] = []
+    total_source_bytes = 0
+    for path in supported_targets:
+        candidate = root / Path(path)
+        try:
+            current_raw = (
+                ""
+                if not candidate.exists()
+                else _read_bounded_utf8_regular_file(candidate, max_bytes=MAX_VERIFY_TX_BOUNDARY_SOURCE_BYTES)
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("tx_boundaries_current_source_unavailable") from exc
+        baseline_raw = _verify_tx_boundary_head_source(root, baseline_paths[path])
+        total_source_bytes += len(current_raw.encode("utf-8")) + len(baseline_raw.encode("utf-8"))
+        if total_source_bytes > MAX_VERIFY_TX_BOUNDARY_TOTAL_SOURCE_BYTES:
+            raise ValueError("tx_boundaries_source_scope_too_large")
+        sources.append((path, baseline_raw, current_raw))
+    return tuple(sources)
+
+
+@contextmanager
+def _verify_tx_boundary_checkout(
+    root: Path,
+    sources: Sequence[tuple[str, str, str]],
+    *,
+    current: bool,
+) -> Iterator[Path]:
+    """Materialize one isolated side of the transaction-boundary comparison."""
+    with tempfile.TemporaryDirectory(prefix=".compile-code-tx-boundaries-", dir=str(root)) as raw_checkout:
+        checkout = Path(raw_checkout)
+        initialized = _verify_type_git_capture(checkout, ["init", "-q"], stdout_limit=1024)
+        if initialized.returncode != 0:
+            raise ValueError("tx_boundaries_checkout_unavailable")
+        for path, baseline_raw, current_raw in sources:
+            destination = checkout / Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(current_raw if current else baseline_raw, encoding="utf-8")
+        yield checkout
+
+
+def _validate_verify_tx_boundary_marker(raw_marker: object) -> dict[str, object]:
+    if not isinstance(raw_marker, dict) or set(raw_marker) != {"line", "pattern"}:
+        raise ValueError("tx_boundaries_marker")
+    return {
+        "line": _plain_int(raw_marker.get("line"), minimum=1),
+        "pattern": _bounded_verify_tx_boundary_text(raw_marker.get("pattern"), reason="tx_boundaries_marker"),
+    }
+
+
+def _validate_verify_tx_boundaries_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+    expected_targets: Sequence[str],
+) -> tuple[dict[str, object], ...]:
+    """Validate one complete tx-boundaries envelope and return detector-marked defects only."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("tx_boundaries_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "tx-boundaries"
+        or envelope.get("version") != expected_roam_version
+        or returncode != 0
+    ):
+        raise ValueError("tx_boundaries_envelope")
+    summary = envelope.get("summary")
+    raw_boundaries = envelope.get("boundaries")
+    if not isinstance(summary, dict) or not isinstance(raw_boundaries, list):
+        raise ValueError("tx_boundaries_shape")
+    if len(raw_boundaries) > MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS:
+        raise ValueError("tx_boundaries_result_bound")
+
+    by_classification = summary.get("by_classification")
+    if not isinstance(by_classification, dict) or not set(by_classification).issubset(
+        _VERIFY_TX_BOUNDARY_CLASSIFICATIONS
+    ):
+        raise ValueError("tx_boundaries_summary")
+    declared_counts = Counter(
+        {
+            classification: _plain_int(count, maximum=MAX_VERIFY_TX_BOUNDARY_CLASSIFIED)
+            for classification, count in by_classification.items()
+        }
+    )
+    total_classified = _plain_int(summary.get("total_classified"), maximum=MAX_VERIFY_TX_BOUNDARY_CLASSIFIED)
+    surfaced = _plain_int(summary.get("surfaced"), maximum=MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS)
+    high_severity_count = _plain_int(
+        summary.get("high_severity_count"), maximum=MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS
+    )
+    state = summary.get("state")
+    if (
+        state not in {"ok", "no_data"}
+        or summary.get("partial_success") is not (state == "no_data")
+        or total_classified != sum(declared_counts.values())
+        or surfaced != len(raw_boundaries)
+        or high_severity_count
+        != sum(declared_counts[classification] for classification in _VERIFY_TX_BOUNDARY_HIGH_SEVERITY_CLASSIFICATIONS)
+        or summary.get("filter_classification") is not None
+        or summary.get("classification_definition") != _VERIFY_TX_BOUNDARY_CLASSIFICATION_DEFINITION
+        or summary.get("detector") != _VERIFY_TX_BOUNDARY_DETECTOR
+        or (state == "no_data" and (total_classified != 0 or raw_boundaries))
+    ):
+        raise ValueError("tx_boundaries_summary")
+    _bounded_verify_tx_boundary_text(summary.get("verdict"), reason="tx_boundaries_verdict")
+
+    expected_paths = set(expected_targets)
+    surfaced_counts: Counter[str] = Counter()
+    findings: list[dict[str, object]] = []
+    for raw_boundary in raw_boundaries:
+        expected_keys = {
+            "symbol",
+            "file",
+            "classification",
+            "begin_markers",
+            "commit_markers",
+            "rollback_markers",
+            "mutations_inside",
+            "mutations_outside",
+            "confidence",
+            "issues",
+            "line_start",
+            "line_end",
+        }
+        if not isinstance(raw_boundary, dict) or set(raw_boundary) != expected_keys:
+            raise ValueError("tx_boundaries_finding")
+        path = _verify_rule_site(expected_root, raw_boundary.get("file"))
+        classification = raw_boundary.get("classification")
+        confidence = raw_boundary.get("confidence")
+        if (
+            path not in expected_paths
+            or not isinstance(classification, str)
+            or classification not in _VERIFY_TX_BOUNDARY_CLASSIFICATIONS
+            or not isinstance(confidence, str)
+            or confidence not in _VERIFY_TX_BOUNDARY_CONFIDENCES
+        ):
+            raise ValueError("tx_boundaries_finding")
+        symbol = _bounded_verify_tx_boundary_text(raw_boundary.get("symbol"), reason="tx_boundaries_symbol")
+        raw_begin_markers = raw_boundary.get("begin_markers")
+        raw_commit_markers = raw_boundary.get("commit_markers")
+        raw_rollback_markers = raw_boundary.get("rollback_markers")
+        if not all(
+            isinstance(markers, list) for markers in (raw_begin_markers, raw_commit_markers, raw_rollback_markers)
+        ):
+            raise ValueError("tx_boundaries_finding")
+        begin_markers = tuple(_validate_verify_tx_boundary_marker(marker) for marker in raw_begin_markers)
+        commit_markers = tuple(_validate_verify_tx_boundary_marker(marker) for marker in raw_commit_markers)
+        rollback_markers = tuple(_validate_verify_tx_boundary_marker(marker) for marker in raw_rollback_markers)
+        raw_issues = raw_boundary.get("issues")
+        if not isinstance(raw_issues, list):
+            raise ValueError("tx_boundaries_finding")
+        issues = tuple(_bounded_verify_tx_boundary_text(issue, reason="tx_boundaries_issue") for issue in raw_issues)
+        mutations_inside = _plain_int(raw_boundary.get("mutations_inside"), maximum=MAX_VERIFY_TX_BOUNDARY_CLASSIFIED)
+        mutations_outside = _plain_int(raw_boundary.get("mutations_outside"), maximum=MAX_VERIFY_TX_BOUNDARY_CLASSIFIED)
+        line_start = _plain_int(raw_boundary.get("line_start"), minimum=1)
+        _plain_int(raw_boundary.get("line_end"), minimum=line_start)
+        surfaced_counts[str(classification)] += 1
+        if classification not in _VERIFY_TX_BOUNDARY_DEFECT_CLASSIFICATIONS:
+            continue
+        if not issues:
+            raise ValueError("tx_boundaries_finding")
+        site_markers = (
+            begin_markers
+            if classification == "unmatched_begin"
+            else (*commit_markers, *rollback_markers)
+            if classification == "unmatched_commit"
+            else ()
+        )
+        findings.append(
+            {
+                "file": path,
+                "line": site_markers[0]["line"] if site_markers else line_start,
+                "symbol": symbol,
+                "classification": classification,
+                "confidence": confidence,
+                "issue": issues[0],
+                "mutations_inside": mutations_inside,
+                "mutations_outside": mutations_outside,
+            }
+        )
+    if any(
+        surfaced_counts[classification] > declared_counts[classification]
+        for classification in _VERIFY_TX_BOUNDARY_CLASSIFICATIONS
+    ):
+        raise ValueError("tx_boundaries_counts")
+    if any(
+        surfaced_counts[classification] != declared_counts[classification]
+        for classification in _VERIFY_TX_BOUNDARY_DEFECT_CLASSIFICATIONS
+    ):
+        # `--top` must surface every detector-marked defect; a truncated or
+        # internally inconsistent envelope is unavailable, never clean.
+        raise ValueError("tx_boundaries_counts")
+    return tuple(findings)
+
+
+def _run_verify_tx_boundaries_scan(
+    root: Path,
+    targets: Sequence[str],
+    *,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[tuple[dict[str, object], ...] | None, int, str | None]:
+    indexed_rc, indexed_output = _delegate_capturing(
+        "index",
+        "--force",
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if indexed_output is None:
+        return None, indexed_rc, None
+    if indexed_rc != 0:
+        return (), EXIT_TOOLCHAIN, "the isolated tx-boundaries scan index could not be built"
+    rc, output = _delegate_capturing(
+        "--json",
+        "tx-boundaries",
+        "--top",
+        str(MAX_VERIFY_TX_BOUNDARY_ENVELOPE_FINDINGS),
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if output is None:
+        return None, rc, None
+    try:
+        findings = _validate_verify_tx_boundaries_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+            expected_targets=targets,
+        )
+    except (UnicodeError, ValueError):
+        return (), EXIT_TOOLCHAIN, "tx-boundaries did not return one complete structured defect result"
+    return findings, 0, None
+
+
+def _verify_tx_boundary_finding_key(finding: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(str(finding[field]) for field in ("file", "symbol", "classification"))
+
+
+def _run_verify_tx_boundaries_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Run tx-boundaries on identical current/HEAD file sets and gate only new detector defects."""
+    try:
+        sources = _verify_edited_tx_boundary_sources(root, targets)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the bounded pre-edit transaction-boundary source set could not be derived from Git",
+        }, EXIT_TOOLCHAIN
+    if not sources:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed transaction-detector-supported files",
+            "regression_count": 0,
+            "findings": (),
+        }, 0
+    scan_targets = tuple(path for path, _baseline_raw, _current_raw in sources)
+    try:
+        with _verify_tx_boundary_checkout(root, sources, current=False) as baseline_root:
+            baseline_findings, baseline_rc, baseline_reason = _run_verify_tx_boundaries_scan(
+                baseline_root,
+                scan_targets,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if baseline_findings is None:
+            return None, baseline_rc
+        if baseline_reason is not None:
+            return {"state": "unavailable", "reason": baseline_reason}, EXIT_TOOLCHAIN
+        with _verify_tx_boundary_checkout(root, sources, current=True) as current_root:
+            current_findings, current_rc, current_reason = _run_verify_tx_boundaries_scan(
+                current_root,
+                scan_targets,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if current_findings is None:
+            return None, current_rc
+        if current_reason is not None:
+            return {"state": "unavailable", "reason": current_reason}, EXIT_TOOLCHAIN
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the isolated pre-edit and current tx-boundaries scans could not be completed",
+        }, EXIT_TOOLCHAIN
+
+    baseline_counts = Counter(_verify_tx_boundary_finding_key(finding) for finding in baseline_findings)
+    regressions: list[dict[str, object]] = []
+    regression_count = 0
+    for finding in current_findings:
+        key = _verify_tx_boundary_finding_key(finding)
+        if baseline_counts[key]:
+            baseline_counts[key] -= 1
+            continue
+        regression_count += 1
+        if len(regressions) < MAX_VERIFY_TX_BOUNDARY_FINDINGS:
             regressions.append(finding)
     return {
         "state": "failed" if regression_count else "complete",
@@ -7490,6 +7980,78 @@ def _render_verify_with_collapse_check(
     return "\n".join(lines)
 
 
+def _render_verify_with_tx_boundaries_check(
+    rendered: str,
+    envelope: Mapping[str, object],
+    tx_boundaries_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose the detector-authoritative transaction-boundary delta with Verify."""
+    if tx_boundaries_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = tx_boundaries_result.get("state")
+    if state == "not_applicable":
+        lines.append("tx-boundaries [not_applicable]: no changed transaction-detector-supported files")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("tx_boundaries_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "tx-boundaries" not in roster:
+                lines[index] = f"{line}, tx-boundaries"
+            break
+    else:
+        lines.insert(1, "checks: tx-boundaries")
+    absolute_count = _plain_int(tx_boundaries_result.get("absolute_finding_count"))
+    baseline_count = _plain_int(tx_boundaries_result.get("baseline_finding_count"))
+    if state == "complete":
+        lines.append(
+            "tx-boundaries [complete]: transaction-boundary defect delta clean "
+            f"({absolute_count} current vs {baseline_count} pre-edit detector-marked defects)"
+        )
+        return "\n".join(lines)
+
+    regression_count = _plain_int(tx_boundaries_result.get("regression_count"), minimum=1)
+    summary = envelope.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError("tx_boundaries_render_summary")
+    targets_checked = summary.get("targets_checked", summary.get("files_checked"))
+    _plain_int(targets_checked)
+    if lines[0].startswith("VERDICT: PASS"):
+        lines[0] = (
+            f"VERDICT: FAIL (transaction-boundary regression) -- {regression_count} detector-marked transaction "
+            f"defect{'s' if regression_count != 1 else ''} introduced in {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    else:
+        label_match = re.match(r"^VERDICT: FAIL \(([^)]*)\)", lines[0])
+        previous_label = label_match.group(1) if label_match else "another Verify gate"
+        lines[0] = (
+            f"VERDICT: FAIL ({previous_label} + transaction-boundary regression) -- product-owned edit gates failed"
+        )
+    findings = tx_boundaries_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("tx_boundaries_render_findings")
+    lines.extend(("", "TX BOUNDARIES (0/100):"))
+    for finding in findings[:MAX_VERIFY_TX_BOUNDARY_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("tx_boundaries_render_finding")
+        location = f"{finding['file']}:{finding['line']}"
+        lines.append(
+            f"  FAIL: {location} -- {finding['symbol']} classified {finding['classification']}: {finding['issue']}"
+        )
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more transaction-boundary regressions omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _render_verify_with_orphan_imports_check(
     rendered: str,
     envelope: Mapping[str, object],
@@ -7838,6 +8400,9 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     Edited Python and JavaScript/TypeScript sources run `collapse` against
     isolated current and Git ``HEAD`` materializations of the same file set,
     so only newly introduced benign-default collapses gate.
+    Transaction-relevant sources run `tx-boundaries` over the same isolated
+    edited-file materializations; only detector-marked defects absent from the
+    Git ``HEAD`` scan gate, and detector-clean sqlite autocommit remains clean.
     Deleted or renamed importable sources and edits to import lines run
     `orphan-imports` over isolated whole-tree current and Git ``HEAD``
     materializations. Only newly introduced actionable orphans gate;
@@ -7907,6 +8472,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     py_modern_result: dict[str, object] | None = None
     calc_golden_result: dict[str, object] | None = None
     collapse_result: dict[str, object] | None = None
+    tx_boundaries_result: dict[str, object] | None = None
     orphan_imports_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
@@ -8003,6 +8569,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "tx-boundaries" in selected_product_checks:
+            tx_boundaries_result, tx_boundaries_rc = _run_verify_tx_boundaries_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if tx_boundaries_result is None:
+                raise SystemExit(tx_boundaries_rc)
+            if tx_boundaries_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_tx_boundaries_unavailable_verdict(
+                        tx_boundaries_result.get("unavailable_reason", tx_boundaries_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if "orphan-imports" in selected_product_checks:
             orphan_imports_result, orphan_imports_rc = _run_verify_orphan_imports_check(
                 root,
@@ -8060,6 +8643,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         excluded=excluded,
         diff_only=diff_only,
     )
+    rendered = _render_verify_with_tx_boundaries_check(
+        rendered,
+        envelope,
+        tx_boundaries_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     rendered = _render_verify_with_orphan_imports_check(
         rendered,
         envelope,
@@ -8081,6 +8671,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             py_modern_result,
             calc_golden_result,
             collapse_result,
+            tx_boundaries_result,
             orphan_imports_result,
         )
     )
@@ -8101,6 +8692,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_failing_files(calc_golden_result) if path not in failing)
         if collapse_result is not None:
             failing.extend(path for path in _verify_failing_files(collapse_result) if path not in failing)
+        if tx_boundaries_result is not None:
+            failing.extend(path for path in _verify_failing_files(tx_boundaries_result) if path not in failing)
         if orphan_imports_result is not None:
             failing.extend(path for path in _verify_failing_files(orphan_imports_result) if path not in failing)
         scoped = failing or targets or bound_targets

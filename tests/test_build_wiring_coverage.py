@@ -67,7 +67,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     inventory = coverage.roam_command_inventory()
 
     assert coverage._product_verify_commands(inventory) == frozenset(
-        {"calc-golden", "collapse", "orphan-imports", "py-modern", "py-types", "rules"}
+        {"calc-golden", "collapse", "orphan-imports", "py-modern", "py-types", "rules", "tx-boundaries"}
     )
 
     import compile_code.cli as cli
@@ -86,6 +86,9 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "Python and JavaScript/TypeScript edits" in descriptions["collapse"]
     assert "Git pre-edit state" in descriptions["collapse"]
     assert "absolute legacy debt never gates" in descriptions["collapse"]
+    assert "Transaction-relevant Python and JavaScript/TypeScript edits" in descriptions["tx-boundaries"]
+    assert "Git pre-edit state" in descriptions["tx-boundaries"]
+    assert "absolute legacy defects never gate" in descriptions["tx-boundaries"]
     assert "deleted or renamed" in descriptions["orphan-imports"]
     assert "import lines" in descriptions["orphan-imports"]
     assert "Git pre-edit state" in descriptions["orphan-imports"]
@@ -101,6 +104,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "py-modern",
         "calc-golden",
         "collapse",
+        "tx-boundaries",
         "orphan-imports",
     )
     assert cli._auto_select_product_verify_checks(["web/service.tsx"]) == (
@@ -109,7 +113,19 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "py-modern",
         "calc-golden",
         "collapse",
+        "tx-boundaries",
         "orphan-imports",
     )
     assert "collapse" not in cli._auto_select_product_verify_checks(["scripts/check.sh"])
     assert cli._auto_select_product_verify_checks([]) == ()
+
+
+def test_f10_review_declares_the_detector_gate_complete() -> None:
+    report = coverage.build_report()
+
+    assert "tx-boundaries" in report.channels["VERIFY"]
+    assert coverage._failure_state(report, "F10") == ("covered", 3, 3)
+    migration_plan = report.classifications["migration-plan"]
+    assert migration_plan.edit_relevant is False
+    assert migration_plan.failure_classes == ()
+    assert "planning ACTION" in migration_plan.reason
