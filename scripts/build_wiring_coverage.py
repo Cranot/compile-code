@@ -467,7 +467,14 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("version", _c(False, "", "Excluded from the edit denominator: meta.")),
     ("vibe-check", _c(True, "F23", "Detects broad generated-code and maintainability decay.")),
     ("visualize", _c(False, "", "Excluded from the edit denominator: diagram gen.")),
-    ("vue-emits", _c(True, "F2 F26", "Checks Vue emitted-event contracts against consumers.")),
+    (
+        "vue-emits",
+        _c(
+            True,
+            "F2",
+            "Compares child-emitted events with resolved parent handlers across the Vue component/consumer contract.",
+        ),
+    ),
     ("vuln-map", _c(False, "", "Excluded from the edit denominator: compliance/security ingest.")),
     ("vuln-reach", _c(False, "", "Excluded from the edit denominator: compliance/security ingest.")),
     (
@@ -716,7 +723,14 @@ def _product_verify_commands(inventory: frozenset[str]) -> frozenset[str]:
         if not callable(getattr(product_cli, handler, None)):
             raise CoverageError(f"VERIFY product auto check has no handler: {command}")
         registered.append(command)
-    selected = tuple(product_cli._auto_select_product_verify_checks(["src/module.py"]))
+    selected = tuple(
+        dict.fromkeys(
+            [
+                *product_cli._auto_select_product_verify_checks(["src/module.py"]),
+                *product_cli._auto_select_product_verify_checks(["src/App.vue"]),
+            ]
+        )
+    )
     if selected != tuple(registered):
         raise CoverageError("VERIFY product auto-check registry and runtime selection disagree")
     outside = set(selected) - inventory

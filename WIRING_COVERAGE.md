@@ -5,17 +5,17 @@ Source: resolved Roam 14.0.0. The 286-command inventory and channel sets are rea
 
 ## Summary
 
-**51 of 97 edit-relevant commands are wired** (54 distinct commands across all channels; 286 commands total).
+**52 of 97 edit-relevant commands are wired** (55 distinct commands across all channels; 286 commands total).
 
 Failure classes: 12 fully covered, 15 partial, and 0 fully uncovered.
 
 | Channel | Wired commands | Edit-relevant wired | Inventory share |
 |---|---:|---:|---:|
 | CONTEXT | 22 | 19 | 7.7% |
-| VERIFY | 27 | 27 | 9.4% |
+| VERIFY | 28 | 28 | 9.8% |
 | HOOK | 6 | 6 | 2.1% |
 | MCP | 8 | 8 | 2.8% |
-| **Union** | **54** | **51** | **18.9%** |
+| **Union** | **55** | **52** | **19.2%** |
 
 ## Derived channel sets
 
@@ -25,7 +25,7 @@ Failure classes: 12 fully covered, 15 partial, and 0 fully uncovered.
 
 ### VERIFY
 
-`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `stale-refs`, `syntax-check`, `taint`, `test-hermeticity`, `tx-boundaries`, `verify-imports`
+`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `stale-refs`, `syntax-check`, `taint`, `test-hermeticity`, `tx-boundaries`, `verify-imports`, `vue-emits`
 
 ### HOOK
 
@@ -42,7 +42,7 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | Class | Failure | Impact | CONTEXT | VERIFY | HOOK | MCP | Wired / mapped | State |
 |---|---|---:|---:|---:|---:|---:|---:|---|
 | F1 | Hallucinated API | 5 | 1 | 1 | 0 | 0 | 2 / 2 | covered |
-| F2 | Broke an importer or caller | 5 | 2 | 1 | 1 | 3 | 4 / 9 | partial |
+| F2 | Broke an importer or caller | 5 | 2 | 2 | 1 | 3 | 5 / 9 | partial |
 | F3 | Silent behavioral regression | 5 | 2 | 2 | 2 | 1 | 5 / 7 | partial |
 | F4 | Local convention violation | 3 | 1 | 0 | 0 | 1 | 1 / 1 | covered |
 | F5 | Missed coupled code | 4 | 1 | 0 | 0 | 2 | 2 / 5 | partial |
@@ -66,7 +66,7 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | F23 | AI rot or vibe | 3 | 0 | 0 | 1 | 0 | 1 / 1 | covered |
 | F24 | Governance or custom-rule violation | 5 | 0 | 1 | 0 | 0 | 1 / 4 | partial |
 | F25 | Test hermeticity | 4 | 0 | 1 | 0 | 0 | 1 / 1 | covered |
-| F26 | Broken invariant | 5 | 1 | 1 | 0 | 0 | 2 / 6 | partial |
+| F26 | Broken invariant | 5 | 1 | 1 | 0 | 0 | 2 / 5 | partial |
 | F27 | Type-annotation regression | 4 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
 
 ## Ranked gap list
@@ -77,50 +77,49 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 |---:|---|---:|---|---|
 | 1 | `calc-probe` | 10 | F3, F26 | Executes calculation probes to catch semantic divergence. |
 | 2 | `reachability-triage` | 10 | F6, F19 | Triages whether vulnerable or sensitive code is actually reachable. |
-| 3 | `vue-emits` | 10 | F2, F26 | Checks Vue emitted-event contracts against consumers. |
-| 4 | `surface-gaps` | 8 | F2, F12 | Finds missing or undocumented public-surface coverage. |
-| 5 | `api` | 5 | F2 | Maps public API consumers and compatibility-sensitive surface. |
-| 6 | `auth-gaps` | 5 | F6 | Finds routes or handlers missing expected authorization checks. |
-| 7 | `budget` | 5 | F24 | Checks whether a change exceeds declared resource or risk budgets. |
-| 8 | `calc-inventory` | 5 | F26 | Inventories calculations whose semantics an edit must preserve. |
-| 9 | `causal-graph` | 5 | F6 | Maps causal dependencies and effects that an edit may disturb. |
-| 10 | `check-rules` | 5 | F24 | Evaluates repository rules and invariants against the edit. |
-| 11 | `compatibility` | 5 | F2 | Checks version and consumer compatibility across a change. |
-| 12 | `coverage-gaps` | 5 | F6 | Finds production code lacking executable coverage. |
-| 13 | `diagnose` | 5 | F3 | Finds likely root causes for a reported failure. |
-| 14 | `dict-consistency` | 5 | F26 | Detects inconsistent parallel dictionary or mapping definitions. |
-| 15 | `fitness` | 5 | F24 | Evaluates declared architectural fitness rules. |
-| 16 | `pytest-fixtures` | 5 | F9 | Maps test fixtures that an edit may need to preserve or update. |
-| 17 | `refs` | 5 | F2 | Deprecated reference lookup alias that still finds live consumers. |
-| 18 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
-| 19 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
-| 20 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
-| 21 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
-| 22 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
-| 23 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
-| 24 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
-| 25 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
-| 26 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
-| 27 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
-| 28 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
-| 29 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
-| 30 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
-| 31 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
-| 32 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
-| 33 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
-| 34 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
-| 35 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
-| 36 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
-| 37 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
-| 38 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
-| 39 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
-| 40 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
-| 41 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
-| 42 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
-| 43 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
-| 44 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
-| 45 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
-| 46 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
+| 3 | `surface-gaps` | 8 | F2, F12 | Finds missing or undocumented public-surface coverage. |
+| 4 | `api` | 5 | F2 | Maps public API consumers and compatibility-sensitive surface. |
+| 5 | `auth-gaps` | 5 | F6 | Finds routes or handlers missing expected authorization checks. |
+| 6 | `budget` | 5 | F24 | Checks whether a change exceeds declared resource or risk budgets. |
+| 7 | `calc-inventory` | 5 | F26 | Inventories calculations whose semantics an edit must preserve. |
+| 8 | `causal-graph` | 5 | F6 | Maps causal dependencies and effects that an edit may disturb. |
+| 9 | `check-rules` | 5 | F24 | Evaluates repository rules and invariants against the edit. |
+| 10 | `compatibility` | 5 | F2 | Checks version and consumer compatibility across a change. |
+| 11 | `coverage-gaps` | 5 | F6 | Finds production code lacking executable coverage. |
+| 12 | `diagnose` | 5 | F3 | Finds likely root causes for a reported failure. |
+| 13 | `dict-consistency` | 5 | F26 | Detects inconsistent parallel dictionary or mapping definitions. |
+| 14 | `fitness` | 5 | F24 | Evaluates declared architectural fitness rules. |
+| 15 | `pytest-fixtures` | 5 | F9 | Maps test fixtures that an edit may need to preserve or update. |
+| 16 | `refs` | 5 | F2 | Deprecated reference lookup alias that still finds live consumers. |
+| 17 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
+| 18 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
+| 19 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
+| 20 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
+| 21 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
+| 22 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
+| 23 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
+| 24 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
+| 25 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
+| 26 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
+| 27 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
+| 28 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
+| 29 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
+| 30 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
+| 31 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
+| 32 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
+| 33 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
+| 34 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
+| 35 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
+| 36 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
+| 37 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
+| 38 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
+| 39 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
+| 40 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
+| 41 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
+| 42 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
+| 43 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
+| 44 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
+| 45 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
 
 ## Full command classification
 
@@ -400,7 +399,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `version` | no | — | Excluded from the edit denominator: meta. | — |
 | `vibe-check` | yes | F23 | Detects broad generated-code and maintainability decay. | HOOK |
 | `visualize` | no | — | Excluded from the edit denominator: diagram gen. | — |
-| `vue-emits` | yes | F2, F26 | Checks Vue emitted-event contracts against consumers. | — |
+| `vue-emits` | yes | F2 | Compares child-emitted events with resolved parent handlers across the Vue component/consumer contract. | VERIFY |
 | `vuln-map` | no | — | Excluded from the edit denominator: compliance/security ingest. | — |
 | `vuln-reach` | no | — | Excluded from the edit denominator: compliance/security ingest. | — |
 | `vulns` | no | — | Excluded from the edit denominator: vuln inventory mgmt (scanner-based, not edit-detector). | — |

@@ -644,6 +644,38 @@ def _tx_boundary(
     }
 
 
+def _vue_emits_envelope(
+    *,
+    findings: list[dict[str, object]],
+    components_scanned: int = 2,
+    usages_checked: int = 1,
+) -> dict[str, object]:
+    """The current roam 14.0.0 vue-emits envelope, with fixture findings only."""
+    count = len(findings)
+    verdict = (
+        f"{count} Vue emitted events lack parent handlers"
+        if count
+        else f"No unresolved Vue emitted events across {usages_checked} component usages"
+    )
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "vue-emits",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": verdict,
+            "finding_count": count,
+            "components_scanned": components_scanned,
+            "usages_checked": usages_checked,
+            "partial_success": False,
+        },
+        "findings": findings,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -2067,6 +2099,16 @@ class TestBoundedVerifyCapture:
             "establish a complete result. A triggered stale-reference check that did not run cannot pass. Fix: "
             "repair Git, the Roam detector, or the changed path and its references, then rerun `compile verify "
             "--changed`.",
+        ),
+        (
+            mod._verify_vue_emits_unavailable_verdict,
+            "VERDICT: verify unavailable — vue-emits did not run completely: CAPTURED_REASON. A triggered Vue "
+            "emitted-event check that did not run cannot pass. Fix: repair Git, the Roam detector, or the changed "
+            "Vue components and their consumers, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — vue-emits did not run completely: the Vue emitted-event contract check "
+            "could not establish a complete result. A triggered Vue emitted-event check that did not run cannot "
+            "pass. Fix: repair Git, the Roam detector, or the changed Vue components and their consumers, then "
+            "rerun `compile verify --changed`.",
         ),
     ],
 )
@@ -3983,6 +4025,201 @@ class TestVerifyFailureFormatting:
         source.write_text("edited\n", encoding="utf-8")
 
         assert "stale-refs" not in mod._auto_select_product_verify_checks(["notes.txt"], root=tmp_path)
+
+    def test_new_vue_emit_without_consumer_handler_fails_and_names_event(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
+    ):
+        (tmp_path / "Child.vue").write_text(
+            "<script setup lang=\"ts\">\nconst emit = defineEmits(['saved'])\n</script>\n",
+            encoding="utf-8",
+        )
+        parent = tmp_path / "Parent.vue"
+        parent.write_text(
+            "<script setup>\nimport Child from './Child.vue'\n</script>\n"
+            '<template><Child @saved="onSaved" /></template>\n',
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, ".")
+        parent.write_text(
+            "<script setup>\nimport Child from './Child.vue'\n</script>\n<template><Child /></template>\n",
+            encoding="utf-8",
+        )
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["Parent.vue"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        finding = {
+            "parent": "Parent.vue",
+            "child": "Child.vue",
+            "event": "saved",
+            "line": 4,
+            "child_line": 2,
+            "message": "Child.vue emits `saved` but this usage has no `@saved` handler",
+        }
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["--json", "vue-emits"]:
+                materialized = (Path(cwd) / "Parent.vue").read_text(encoding="utf-8")
+                findings = [] if "@saved" in materialized else [finding]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(_vue_emits_envelope(findings=findings)),
+                    stderr="",
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "Parent.vue"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (Vue emitted-event contract regression)")
+        assert "Parent.vue:4" in result.output
+        assert "saved" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "vue-emits"]] == [
+            ["--json", "vue-emits"],
+            ["--json", "vue-emits"],
+        ]
+
+    def test_preexisting_vue_emit_mismatch_untouched_by_edit_passes(self, monkeypatch, tmp_path):
+        (tmp_path / "Child.vue").write_text(
+            "<script setup lang=\"ts\">\nconst emit = defineEmits(['legacy-event'])\n</script>\n",
+            encoding="utf-8",
+        )
+        parent = tmp_path / "Parent.vue"
+        parent.write_text(
+            "<script setup>\nimport Child from './Child.vue'\n</script>\n<template><Child /></template>\n",
+            encoding="utf-8",
+        )
+        self._commit_fixture_baseline(tmp_path, ".")
+        parent.write_text(
+            "<script setup>\nimport Child from './Child.vue'\nconst label = 'edited'\n</script>\n"
+            "<template><Child /></template>\n",
+            encoding="utf-8",
+        )
+        finding = {
+            "parent": "Parent.vue",
+            "child": "Child.vue",
+            "event": "legacy-event",
+            "line": 5,
+            "child_line": 2,
+            "message": "Child.vue emits `legacy-event` but this usage has no `@legacy-event` handler",
+        }
+
+        def capture(*args, **kwargs):
+            assert list(args[:2]) == ["--json", "vue-emits"]
+            adjusted = dict(finding)
+            adjusted["line"] = (
+                5 if "const label" in (Path(kwargs["cwd"]) / "Parent.vue").read_text(encoding="utf-8") else 4
+            )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(_vue_emits_envelope(findings=[adjusted])),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_vue_emits_check(
+            tmp_path,
+            targets=["Parent.vue"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["baseline_finding_count"] == 1
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_vue_emits_auto_selection_follows_detector_vue_file_scope(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"dependencies":{"vue":"^3.0.0"}}\n', encoding="utf-8")
+
+        assert "vue-emits" in mod._auto_select_product_verify_checks(["src/App.vue"], root=tmp_path)
+        assert "vue-emits" not in mod._auto_select_product_verify_checks(["src/service.ts"], root=tmp_path)
+        assert "vue-emits" not in mod._auto_select_product_verify_checks(["service.py"], root=tmp_path)
+        assert "vue-emits" not in mod._auto_select_product_verify_checks(["README.md"], root=tmp_path)
+
+    def test_vue_emits_tool_absence_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
+    ):
+        component = tmp_path / "Component.vue"
+        component.write_text("<template><div /></template>\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        component.write_text("<template><span /></template>\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["Component.vue"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["--json", "vue-emits"]:
+                raise FileNotFoundError("roam")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "Component.vue"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "toolchain missing" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_malformed_vue_emits_envelope_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
+    ):
+        component = tmp_path / "Component.vue"
+        component.write_text("<template><div /></template>\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        component.write_text("<template><span /></template>\n", encoding="utf-8")
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["Component.vue"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["--json", "vue-emits"]:
+                return SimpleNamespace(returncode=0, stdout='{not "one complete envelope"', stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "Component.vue"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "vue-emits did not run completely" in result.output
+        assert "VERDICT: PASS" not in result.output
 
     def test_declared_golden_semantic_change_fails_and_names_calculation_case_and_values(
         self,

@@ -76,6 +76,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
             "rules",
             "stale-refs",
             "tx-boundaries",
+            "vue-emits",
         }
     )
 
@@ -104,6 +105,9 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "Deleted or renamed paths" in descriptions["stale-refs"]
     assert "referenced by other tracked files" in descriptions["stale-refs"]
     assert "Git pre-edit state" in descriptions["stale-refs"]
+    assert "Vue single-file-component edits" in descriptions["vue-emits"]
+    assert "Git pre-edit state" in descriptions["vue-emits"]
+    assert "only newly unmatched emitted events gate" in descriptions["vue-emits"]
     assert cli._auto_select_product_verify_checks(["README.md"]) == (
         "rules",
         "py-types",
@@ -132,7 +136,18 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "stale-refs",
     )
     assert "collapse" not in cli._auto_select_product_verify_checks(["scripts/check.sh"])
+    assert "vue-emits" not in cli._auto_select_product_verify_checks(["web/service.tsx"])
+    assert "vue-emits" in cli._auto_select_product_verify_checks(["web/App.vue"])
     assert cli._auto_select_product_verify_checks([]) == ()
+
+
+def test_f2_review_declares_the_vue_consumer_contract_gate() -> None:
+    report = coverage.build_report()
+
+    assert "vue-emits" in report.channels["VERIFY"]
+    vue_emits = report.classifications["vue-emits"]
+    assert vue_emits.failure_classes == ("F2",)
+    assert "component/consumer contract" in vue_emits.reason
 
 
 def test_f10_review_declares_the_detector_gate_complete() -> None:

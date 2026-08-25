@@ -2563,6 +2563,7 @@ _VERIFY_CAUSE_LABELS = {
     "TX BOUNDARIES": "transaction-boundary regression",
     "ORPHAN IMPORTS": "orphan import regression",
     "STALE REFS": "stale reference regression",
+    "VUE EMITS": "Vue emitted-event contract regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2695,6 +2696,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "stale-refs",
         "Deleted or renamed paths, and edits to paths referenced by other tracked files, run bounded whole-tree "
         "stale-reference scans against the current and Git pre-edit state; only newly stale references gate.",
+    ),
+    (
+        "vue-emits",
+        "Vue single-file-component edits run bounded whole-tree emitted-event/consumer scans against the current "
+        "and Git pre-edit state; only newly unmatched emitted events gate.",
     ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
@@ -2873,6 +2879,14 @@ MAX_VERIFY_STALE_REFS_FINDINGS = 10
 MAX_VERIFY_STALE_REFS_TEXT_CHARS = 1024
 MAX_VERIFY_STALE_REFS_CHECKED = 1_000_000
 MAX_VERIFY_STALE_REFS_REFERENCES = MAX_VERIFY_STALE_REFS_ENVELOPE_TARGETS * MAX_VERIFY_STALE_REFS_SOURCES_PER_TARGET
+_VERIFY_VUE_EMITS_SOURCE_SUFFIXES = frozenset({".vue"})
+_VERIFY_VUE_EMITS_EVENT = re.compile(r"^[A-Za-z_$][\w:.-]*$")
+MAX_VERIFY_VUE_EMITS_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_VERIFY_VUE_EMITS_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_VUE_EMITS_ENVELOPE_FINDINGS = 4096
+MAX_VERIFY_VUE_EMITS_USAGES = 1_000_000
+MAX_VERIFY_VUE_EMITS_FINDINGS = 10
+MAX_VERIFY_VUE_EMITS_TEXT_CHARS = 1024
 _VERIFY_MODERN_FEATURE_KEYS = (
     "walrus",
     "match_stmt",
@@ -4162,6 +4176,9 @@ def _auto_select_product_verify_checks(target_paths: list[str], *, root: Path | 
     tx_boundaries_applies = _verify_tx_boundaries_applies(root, target_paths)
     orphan_imports_applies = _verify_orphan_imports_applies(root, target_paths)
     stale_refs_applies = _verify_stale_refs_applies(root, target_paths)
+    vue_emits_applies = any(
+        PurePosixPath(path).suffix.lower() in _VERIFY_VUE_EMITS_SOURCE_SUFFIXES for path in target_paths
+    )
     return tuple(
         name
         for name, _description in _VERIFY_AUTO_CHECK_REGISTRY
@@ -4169,6 +4186,7 @@ def _auto_select_product_verify_checks(target_paths: list[str], *, root: Path | 
         and (name != "tx-boundaries" or tx_boundaries_applies)
         and (name != "orphan-imports" or orphan_imports_applies)
         and (name != "stale-refs" or stale_refs_applies)
+        and (name != "vue-emits" or vue_emits_applies)
     )
 
 
@@ -4449,6 +4467,13 @@ _VERIFY_STALE_REFS_UNAVAILABLE_VERDICT = (
     "stale-refs",
     "A triggered stale-reference check that did not run cannot pass. Fix: repair Git, the Roam detector, or the "
     "changed path and its references, then rerun `compile verify --changed`.",
+)
+_VERIFY_VUE_EMITS_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_VUE_EMITS_TEXT_CHARS,
+    "the Vue emitted-event contract check could not establish a complete result",
+    "vue-emits",
+    "A triggered Vue emitted-event check that did not run cannot pass. Fix: repair Git, the Roam detector, or the "
+    "changed Vue components and their consumers, then rerun `compile verify --changed`.",
 )
 
 
@@ -5922,6 +5947,10 @@ def _verify_stale_refs_unavailable_verdict(reason: object) -> str:
     return _verify_unavailable_verdict(reason, *_VERIFY_STALE_REFS_UNAVAILABLE_VERDICT)
 
 
+def _verify_vue_emits_unavailable_verdict(reason: object) -> str:
+    return _verify_unavailable_verdict(reason, *_VERIFY_VUE_EMITS_UNAVAILABLE_VERDICT)
+
+
 def _bounded_verify_collapse_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
     if (
         not isinstance(value, str)
@@ -7286,6 +7315,257 @@ def _run_verify_stale_refs_check(
     }, 0
 
 
+def _bounded_verify_vue_emits_text(value: object, *, reason: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_VERIFY_VUE_EMITS_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _validate_verify_vue_emits_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+) -> tuple[dict[str, object], ...]:
+    """Validate one complete detector-authoritative vue-emits envelope."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("vue_emits_envelope")
+    if (
+        returncode != 0
+        or envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "vue-emits"
+        or envelope.get("version") != expected_roam_version
+    ):
+        raise ValueError("vue_emits_envelope")
+    summary = envelope.get("summary")
+    raw_findings = envelope.get("findings")
+    if not isinstance(summary, dict) or not isinstance(raw_findings, list):
+        raise ValueError("vue_emits_shape")
+    finding_count = _plain_int(summary.get("finding_count"), maximum=MAX_VERIFY_VUE_EMITS_ENVELOPE_FINDINGS)
+    components_scanned = _plain_int(
+        summary.get("components_scanned"),
+        maximum=MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_ENTRIES + MAX_VERIFY_TARGETS,
+    )
+    usages_checked = _plain_int(summary.get("usages_checked"), maximum=MAX_VERIFY_VUE_EMITS_USAGES)
+    verdict = (
+        f"{finding_count} Vue emitted events lack parent handlers"
+        if finding_count
+        else f"No unresolved Vue emitted events across {usages_checked} component usages"
+    )
+    if (
+        summary.get("partial_success") is not False
+        or "warnings_out" in summary
+        or "warnings_out" in envelope
+        or finding_count != len(raw_findings)
+        or (finding_count > 0 and (components_scanned == 0 or usages_checked == 0))
+        or summary.get("verdict") != verdict
+    ):
+        raise ValueError("vue_emits_summary")
+
+    findings: list[dict[str, object]] = []
+    for raw_finding in raw_findings:
+        if not isinstance(raw_finding, dict) or set(raw_finding) != {
+            "parent",
+            "child",
+            "event",
+            "line",
+            "child_line",
+            "message",
+        }:
+            raise ValueError("vue_emits_finding")
+        parent = _verify_rule_site(expected_root, raw_finding.get("parent"))
+        child = _verify_rule_site(expected_root, raw_finding.get("child"))
+        if (
+            PurePosixPath(parent).suffix.lower() not in _VERIFY_VUE_EMITS_SOURCE_SUFFIXES
+            or PurePosixPath(child).suffix.lower() not in _VERIFY_VUE_EMITS_SOURCE_SUFFIXES
+        ):
+            raise ValueError("vue_emits_finding")
+        event = _bounded_verify_vue_emits_text(raw_finding.get("event"), reason="vue_emits_event")
+        if _VERIFY_VUE_EMITS_EVENT.fullmatch(event) is None:
+            raise ValueError("vue_emits_event")
+        line = _plain_int(raw_finding.get("line"), minimum=1)
+        child_line = _plain_int(raw_finding.get("child_line"), minimum=1)
+        message = _bounded_verify_vue_emits_text(raw_finding.get("message"), reason="vue_emits_message")
+        expected_message = f"{PurePosixPath(child).name} emits `{event}` but this usage has no `@{event}` handler"
+        if message != expected_message:
+            raise ValueError("vue_emits_message")
+        findings.append(
+            {
+                "file": parent,
+                "parent": parent,
+                "child": child,
+                "event": event,
+                "line": line,
+                "child_line": child_line,
+                "message": message,
+            }
+        )
+    return tuple(findings)
+
+
+@contextmanager
+def _verify_vue_emits_checkout(
+    root: Path,
+    targets: Sequence[str],
+    head_commit: str,
+    *,
+    current: bool,
+) -> Iterator[Path]:
+    """Materialize one bounded whole-tree side of the Vue contract comparison."""
+    with tempfile.TemporaryDirectory(prefix=".compile-code-vue-emits-", dir=str(root)) as raw_checkout:
+        checkout = Path(raw_checkout)
+        _verify_orphan_imports_extract_head_archive(root, checkout, head_commit)
+        initialized = _verify_type_git_capture(checkout, ["init", "-q"], stdout_limit=1024)
+        if initialized.returncode != 0:
+            raise ValueError("vue_emits_checkout")
+        if current:
+            total_source_bytes = 0
+            for path in targets:
+                if PurePosixPath(path).suffix.lower() not in _VERIFY_VUE_EMITS_SOURCE_SUFFIXES:
+                    continue
+                source = root / Path(path)
+                destination = checkout / Path(path)
+                try:
+                    source_state = source.lstat()
+                except FileNotFoundError:
+                    if destination.is_symlink() or destination.is_file():
+                        destination.unlink()
+                    elif destination.exists():
+                        raise ValueError("vue_emits_current_source")
+                    continue
+                if _is_link_or_reparse(source_state) or not stat.S_ISREG(source_state.st_mode):
+                    raise ValueError("vue_emits_current_source")
+                source_text = _read_bounded_utf8_regular_file(source, max_bytes=MAX_VERIFY_VUE_EMITS_SOURCE_BYTES)
+                total_source_bytes += len(source_text.encode("utf-8"))
+                if total_source_bytes > MAX_VERIFY_VUE_EMITS_TOTAL_SOURCE_BYTES:
+                    raise ValueError("vue_emits_current_scope")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(source_text, encoding="utf-8")
+        yield checkout
+
+
+def _run_verify_vue_emits_scan(
+    root: Path,
+    *,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[tuple[dict[str, object], ...] | None, int, str | None]:
+    rc, output = _delegate_capturing(
+        "--json",
+        "vue-emits",
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if output is None:
+        return None, rc, None
+    try:
+        findings = _validate_verify_vue_emits_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+        )
+    except (UnicodeError, ValueError):
+        return (), EXIT_TOOLCHAIN, "vue-emits did not return one complete structured contract result"
+    return findings, 0, None
+
+
+def _verify_vue_emits_finding_key(finding: Mapping[str, object]) -> tuple[str, ...]:
+    # Lines are presentation coordinates, not contract identity: an unrelated
+    # line insertion must not turn unchanged legacy debt into a regression.
+    return tuple(str(finding[field]) for field in ("parent", "child", "event"))
+
+
+def _run_verify_vue_emits_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Compare complete current/HEAD Vue contract sets and gate only new mismatches."""
+    vue_targets = tuple(
+        path for path in targets if PurePosixPath(path).suffix.lower() in _VERIFY_VUE_EMITS_SOURCE_SUFFIXES
+    )
+    if not vue_targets:
+        return {
+            "state": "not_applicable",
+            "reason": "no changed Vue single-file components",
+            "regression_count": 0,
+            "findings": (),
+        }, 0
+    try:
+        head_commit = _verify_calc_head_commit(root)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        head_commit = None
+    if head_commit is None:
+        return {
+            "state": "unavailable",
+            "reason": "the Git pre-edit tree for the Vue emitted-event comparison could not be derived",
+        }, EXIT_TOOLCHAIN
+    try:
+        rename_paths = _verify_orphan_imports_rename_paths(root, targets)
+        status_records = _verify_orphan_imports_status_records(root, targets)
+        comparison_targets = tuple(dict.fromkeys([*targets, *rename_paths, *(path for _state, path in status_records)]))
+        with _verify_vue_emits_checkout(root, comparison_targets, head_commit, current=False) as baseline_root:
+            baseline_findings, baseline_rc, baseline_reason = _run_verify_vue_emits_scan(
+                baseline_root,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if baseline_findings is None:
+            return None, baseline_rc
+        if baseline_reason is not None:
+            return {"state": "unavailable", "reason": baseline_reason}, EXIT_TOOLCHAIN
+        with _verify_vue_emits_checkout(root, comparison_targets, head_commit, current=True) as current_root:
+            current_findings, current_rc, current_reason = _run_verify_vue_emits_scan(
+                current_root,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if current_findings is None:
+            return None, current_rc
+        if current_reason is not None:
+            return {"state": "unavailable", "reason": current_reason}, EXIT_TOOLCHAIN
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the isolated pre-edit and current Vue emitted-event scans could not be completed",
+        }, EXIT_TOOLCHAIN
+
+    baseline_counts = Counter(_verify_vue_emits_finding_key(finding) for finding in baseline_findings)
+    regressions: list[dict[str, object]] = []
+    regression_count = 0
+    for finding in current_findings:
+        key = _verify_vue_emits_finding_key(finding)
+        if baseline_counts[key]:
+            baseline_counts[key] -= 1
+            continue
+        regression_count += 1
+        if len(regressions) < MAX_VERIFY_VUE_EMITS_FINDINGS:
+            regressions.append(finding)
+    return {
+        "state": "failed" if regression_count else "complete",
+        "absolute_finding_count": len(current_findings),
+        "baseline_finding_count": len(baseline_findings),
+        "regression_count": regression_count,
+        "findings": tuple(regressions),
+    }, 0
+
+
 def _prepare_verify_request(
     files: tuple[str, ...],
 ) -> tuple[Path, list[str], dict[str, object], dict[str, str], list[str]]:
@@ -8553,6 +8833,79 @@ def _render_verify_with_stale_refs_check(
     return "\n".join(lines)
 
 
+def _render_verify_with_vue_emits_check(
+    rendered: str,
+    envelope: Mapping[str, object],
+    vue_emits_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose the detector-authoritative Vue emitted-event delta with Verify."""
+    if vue_emits_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = vue_emits_result.get("state")
+    if state == "not_applicable":
+        lines.append("vue-emits [not_applicable]: no changed Vue single-file components")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("vue_emits_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "vue-emits" not in roster:
+                lines[index] = f"{line}, vue-emits"
+            break
+    else:
+        lines.insert(1, "checks: vue-emits")
+    absolute_count = _plain_int(vue_emits_result.get("absolute_finding_count"))
+    baseline_count = _plain_int(vue_emits_result.get("baseline_finding_count"))
+    if state == "complete":
+        lines.append(
+            "vue-emits [complete]: emitted-event/consumer contract delta clean "
+            f"({absolute_count} current vs {baseline_count} pre-edit mismatches)"
+        )
+        return "\n".join(lines)
+
+    regression_count = _plain_int(vue_emits_result.get("regression_count"), minimum=1)
+    summary = envelope.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError("vue_emits_render_summary")
+    targets_checked = summary.get("targets_checked", summary.get("files_checked"))
+    _plain_int(targets_checked)
+    if lines[0].startswith("VERDICT: PASS"):
+        lines[0] = (
+            f"VERDICT: FAIL (Vue emitted-event contract regression) -- {regression_count} emit/consumer contract "
+            f"mismatch{'es' if regression_count != 1 else ''} introduced by {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    else:
+        label_match = re.match(r"^VERDICT: FAIL \(([^)]*)\)", lines[0])
+        previous_label = label_match.group(1) if label_match else "another Verify gate"
+        lines[0] = (
+            f"VERDICT: FAIL ({previous_label} + Vue emitted-event contract regression) -- "
+            "product-owned edit gates failed"
+        )
+    findings = vue_emits_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("vue_emits_render_findings")
+    lines.extend(("", "VUE EMITS (0/100):"))
+    for finding in findings[:MAX_VERIFY_VUE_EMITS_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("vue_emits_render_finding")
+        location = f"{finding['parent']}:{finding['line']}"
+        lines.append(
+            f"  FAIL: {location} -- `{finding['event']}` from {finding['child']} has no matching parent handler"
+        )
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more Vue emitted-event contract regressions omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _verify_failing_files(
     result: Mapping[str, object], *, gating_severities: Container[object] | None = None
 ) -> list[str]:
@@ -8844,6 +9197,9 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     run `stale-refs` over the same whole-tree materializations. The detector's
     normalized, exclusion-aware findings are authoritative, and only references
     absent from the Git ``HEAD`` scan gate.
+    Vue single-file-component edits run `vue-emits` over isolated whole-tree
+    current and Git ``HEAD`` materializations. Only emitted-event/consumer
+    mismatches absent from the pre-edit scan gate.
     Inapplicable adapters report typed not_applicable states. If any triggered
     check lacks the inputs needed for a complete result, VERIFY names the
     unavailable state and refuses instead of publishing a false pass.
@@ -8912,6 +9268,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     tx_boundaries_result: dict[str, object] | None = None
     orphan_imports_result: dict[str, object] | None = None
     stale_refs_result: dict[str, object] | None = None
+    vue_emits_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -9058,6 +9415,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "vue-emits" in selected_product_checks:
+            vue_emits_result, vue_emits_rc = _run_verify_vue_emits_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if vue_emits_result is None:
+                raise SystemExit(vue_emits_rc)
+            if vue_emits_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_vue_emits_unavailable_verdict(
+                        vue_emits_result.get("unavailable_reason", vue_emits_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -9119,6 +9493,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         excluded=excluded,
         diff_only=diff_only,
     )
+    rendered = _render_verify_with_vue_emits_check(
+        rendered,
+        envelope,
+        vue_emits_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
@@ -9136,6 +9517,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             tx_boundaries_result,
             orphan_imports_result,
             stale_refs_result,
+            vue_emits_result,
         )
     )
     final_rc = EXIT_VERIFY_GATE if product_failed else rc
@@ -9161,6 +9543,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_failing_files(orphan_imports_result) if path not in failing)
         if stale_refs_result is not None:
             failing.extend(path for path in _verify_failing_files(stale_refs_result) if path not in failing)
+        if vue_emits_result is not None:
+            failing.extend(path for path in _verify_failing_files(vue_emits_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(
