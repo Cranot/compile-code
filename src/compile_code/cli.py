@@ -2558,6 +2558,8 @@ _VERIFY_CAUSE_LABELS = {
     "PY TYPES": "type-annotation regression",
     "PY MODERN": "Python modernization regression",
     "CALC GOLDEN": "calculation semantic regression",
+    "COLLAPSE": "benign-default collapse regression",
+    "ORPHAN IMPORTS": "orphan import regression",
 }
 # A check section header, e.g. ``SYNTAX (0/100):`` or ``ERROR HANDLING (100/100):``.
 _VERIFY_SECTION = re.compile(r"^([A-Z][A-Z _]+)\s*\(\d+/100\):\s*$")
@@ -2676,6 +2678,11 @@ _VERIFY_AUTO_CHECK_REGISTRY = (
         "Python and JavaScript/TypeScript edits run bounded collapse scans over the same edited files in the "
         "current and Git pre-edit state; absolute legacy debt never gates.",
     ),
+    (
+        "orphan-imports",
+        "Importable sources deleted or renamed, and source diffs that touch import lines, run bounded whole-tree "
+        "orphan scans against the current and Git pre-edit state; only new actionable orphans gate.",
+    ),
 )
 _VERIFY_RULE_CONFIG_STATES = frozenset(
     {"ok", "missing", "empty_file", "empty_yaml", "read_error", "parse_error", "wrong_root_type", "schema_invalid"}
@@ -2769,6 +2776,30 @@ MAX_VERIFY_COLLAPSE_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_VERIFY_COLLAPSE_ENVELOPE_FINDINGS = 4096
 MAX_VERIFY_COLLAPSE_FINDINGS = 10
 MAX_VERIFY_COLLAPSE_TEXT_CHARS = 1024
+_VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES = frozenset(
+    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte", ".go"}
+)
+_VERIFY_ORPHAN_IMPORTS_LANGUAGES = ("python", "javascript", "go")
+_VERIFY_ORPHAN_IMPORTS_KINDS = frozenset({"internal_typo", "missing_package", "missing_local"})
+_VERIFY_ORPHAN_IMPORTS_CONFIDENCES = frozenset({"high", "medium", "low"})
+_VERIFY_ORPHAN_IMPORTS_IMPORT_LINE = re.compile(
+    r"^[+-](?![+-])[ \t]*(?:from[ \t]+\S+[ \t]+import\b|import(?:[ \t(]|\b)|"
+    r"(?:export\b.*\bfrom|\}[ \t]*from)[ \t]+['\"]|"
+    r"(?:const|let|var)?[ \t\w{},*]*=?[ \t]*require[ \t]*\(|"
+    r"(?:await[ \t]+)?import[ \t]*\()",
+    re.MULTILINE,
+)
+_VERIFY_ORPHAN_IMPORTS_GO_IMPORT_LINE = re.compile(
+    r'^[+-](?![+-])[ \t]*(?:import(?:[ \t(]|\b)|(?:[\w.]+[ \t]+)?"[^"\n]+"[ \t]*)$',
+    re.MULTILINE,
+)
+MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_ENTRIES = 20_000
+MAX_VERIFY_ORPHAN_IMPORTS_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_VERIFY_ORPHAN_IMPORTS_TOTAL_SOURCE_BYTES = 32 * 1024 * 1024
+MAX_VERIFY_ORPHAN_IMPORTS_ENVELOPE_FINDINGS = 200
+MAX_VERIFY_ORPHAN_IMPORTS_FINDINGS = 10
+MAX_VERIFY_ORPHAN_IMPORTS_TEXT_CHARS = 1024
 _VERIFY_MODERN_FEATURE_KEYS = (
     "walrus",
     "match_stmt",
@@ -3819,14 +3850,146 @@ def _delete_check_unavailable_verdict(reason: str) -> str:
     )
 
 
-def _auto_select_product_verify_checks(target_paths: list[str]) -> tuple[str, ...]:
+def _verify_orphan_imports_patch_touches_imports(paths: Sequence[str], patch: str) -> bool:
+    if _VERIFY_ORPHAN_IMPORTS_IMPORT_LINE.search(patch):
+        return True
+    return any(PurePosixPath(path).suffix.lower() == ".go" for path in paths) and bool(
+        _VERIFY_ORPHAN_IMPORTS_GO_IMPORT_LINE.search(patch)
+    )
+
+
+def _verify_orphan_imports_source_has_imports(path: str, source: str) -> bool:
+    patch = "\n".join(f"+{line}" for line in source.splitlines())
+    return _verify_orphan_imports_patch_touches_imports((path,), patch)
+
+
+def _verify_orphan_imports_status_records(root: Path, target_paths: Sequence[str]) -> list[tuple[str, str]]:
+    status = _verify_type_git_capture(
+        root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *target_paths],
+        stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+    )
+    raw_status = status.stdout or b""
+    if status.returncode != 0 or len(raw_status) > MAX_VERIFY_GIT_STATUS_BYTES:
+        raise ValueError("orphan_imports_git_status")
+    return _parse_verify_status_records(raw_status)
+
+
+def _verify_orphan_imports_rename_paths(root: Path, target_paths: Sequence[str]) -> tuple[str, ...]:
+    diff = _verify_type_git_capture(
+        root,
+        ["diff", "--name-status", "-z", "--find-renames", "HEAD"],
+        stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+    )
+    raw = diff.stdout or b""
+    if diff.returncode != 0 or len(raw) > MAX_VERIFY_GIT_STATUS_BYTES or (raw and not raw.endswith(b"\0")):
+        raise ValueError("orphan_imports_rename_diff")
+    targets = set(target_paths)
+    rename_paths: list[str] = []
+    records = raw.split(b"\0")
+    index = 0
+    try:
+        while index < len(records):
+            status_raw = records[index]
+            index += 1
+            if not status_raw:
+                continue
+            status = status_raw.decode("ascii")
+            if re.fullmatch(r"(?:[AMDUT]|R\d{1,3}|C\d{1,3})", status) is None or index >= len(records):
+                raise ValueError("orphan_imports_rename_diff")
+            first_path = _decode_verify_status_path(records[index])
+            index += 1
+            if status.startswith(("R", "C")):
+                if index >= len(records):
+                    raise ValueError("orphan_imports_rename_diff")
+                current_path = _decode_verify_status_path(records[index])
+                index += 1
+                if status.startswith("R") and targets.intersection({first_path, current_path}):
+                    rename_paths.extend((first_path, current_path))
+        return tuple(dict.fromkeys(rename_paths))
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("orphan_imports_rename_diff") from exc
+
+
+def _verify_orphan_imports_applies(root: Path | None, target_paths: Sequence[str]) -> bool:
+    direct_supported = tuple(
+        path for path in target_paths if PurePosixPath(path).suffix.lower() in _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES
+    )
+    # The coverage generator inspects the literal registry without a repository
+    # fixture. Runtime callers always pass the bound verification root below.
+    if root is None:
+        return bool(direct_supported)
+    try:
+        rename_paths = _verify_orphan_imports_rename_paths(root, target_paths)
+        if any(PurePosixPath(path).suffix.lower() in _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES for path in rename_paths):
+            return True
+        records = _verify_orphan_imports_status_records(root, target_paths)
+        supported = tuple(
+            dict.fromkeys(
+                [
+                    *direct_supported,
+                    *rename_paths,
+                    *(
+                        path
+                        for _state, path in records
+                        if PurePosixPath(path).suffix.lower() in _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES
+                    ),
+                ]
+            )
+        )
+        changed = [(state, path) for state, path in records if path in supported]
+        if not supported or not changed:
+            return False
+        if any("D" in state or "R" in state for state, _path in changed):
+            return True
+        head = _verify_type_git_capture(root, ["cat-file", "-e", "HEAD^{commit}"], stdout_limit=1)
+        if head.returncode != 0:
+            for _state, path in changed:
+                source = _read_bounded_utf8_regular_file(
+                    root / Path(path), max_bytes=MAX_VERIFY_ORPHAN_IMPORTS_SOURCE_BYTES
+                )
+                if _verify_orphan_imports_source_has_imports(path, source):
+                    return True
+            return False
+        diff = _verify_type_git_capture(
+            root,
+            ["diff", "--unified=0", "--no-ext-diff", "HEAD", "--", *supported],
+            stdout_limit=MAX_VERIFY_GIT_STATUS_BYTES,
+        )
+        raw_diff = diff.stdout or b""
+        if diff.returncode != 0 or len(raw_diff) > MAX_VERIFY_GIT_STATUS_BYTES:
+            return True
+        patch = raw_diff.decode("utf-8", errors="strict")
+        if _verify_orphan_imports_patch_touches_imports(supported, patch):
+            return True
+        for state, path in changed:
+            if state != GIT_STATUS_UNTRACKED:
+                continue
+            source = _read_bounded_utf8_regular_file(
+                root / Path(path), max_bytes=MAX_VERIFY_ORPHAN_IMPORTS_SOURCE_BYTES
+            )
+            if _verify_orphan_imports_source_has_imports(path, source):
+                return True
+        return False
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        # A supported changed path whose trigger evidence cannot be read is
+        # selected conservatively; the check will report typed unavailable.
+        return bool(direct_supported)
+
+
+def _auto_select_product_verify_checks(target_paths: list[str], *, root: Path | None = None) -> tuple[str, ...]:
     """Select product-owned post-edit checks from the same bound target list."""
     if not target_paths:
         return ()
     collapse_applies = any(
         PurePosixPath(path).suffix.lower() in _VERIFY_COLLAPSE_SOURCE_SUFFIXES for path in target_paths
     )
-    return tuple(name for name, _description in _VERIFY_AUTO_CHECK_REGISTRY if name != "collapse" or collapse_applies)
+    orphan_imports_applies = _verify_orphan_imports_applies(root, target_paths)
+    return tuple(
+        name
+        for name, _description in _VERIFY_AUTO_CHECK_REGISTRY
+        if (name != "collapse" or collapse_applies) and (name != "orphan-imports" or orphan_imports_applies)
+    )
 
 
 def _verify_rules_declaration_state(root: Path) -> dict[str, object]:
@@ -4085,6 +4248,13 @@ _VERIFY_COLLAPSE_UNAVAILABLE_VERDICT = (
     "collapse",
     "A triggered collapse check that did not run cannot pass. Fix: repair Git, the Roam index or detector, or the "
     "edited Python/JavaScript/TypeScript source, then rerun `compile verify --changed`.",
+)
+_VERIFY_ORPHAN_IMPORTS_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_ORPHAN_IMPORTS_TEXT_CHARS,
+    "the actionable orphan-import check could not establish a complete result",
+    "orphan-imports",
+    "A triggered orphan-import check that did not run cannot pass. Fix: repair Git, the Roam index or detector, "
+    "or the changed importable source, then rerun `compile verify --changed`.",
 )
 
 
@@ -5546,6 +5716,10 @@ def _verify_collapse_unavailable_verdict(reason: object) -> str:
     return _verify_unavailable_verdict(reason, *_VERIFY_COLLAPSE_UNAVAILABLE_VERDICT)
 
 
+def _verify_orphan_imports_unavailable_verdict(reason: object) -> str:
+    return _verify_unavailable_verdict(reason, *_VERIFY_ORPHAN_IMPORTS_UNAVAILABLE_VERDICT)
+
+
 def _bounded_verify_collapse_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
     if (
         not isinstance(value, str)
@@ -5886,6 +6060,367 @@ def _run_verify_collapse_check(
             continue
         regression_count += 1
         if len(regressions) < MAX_VERIFY_COLLAPSE_FINDINGS:
+            regressions.append(finding)
+    return {
+        "state": "failed" if regression_count else "complete",
+        "absolute_finding_count": len(current_findings),
+        "baseline_finding_count": len(baseline_findings),
+        "regression_count": regression_count,
+        "findings": tuple(regressions),
+    }, 0
+
+
+def _bounded_verify_orphan_imports_text(value: object, *, reason: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > MAX_VERIFY_ORPHAN_IMPORTS_TEXT_CHARS
+        or any(ord(char) < 32 for char in value)
+    ):
+        raise ValueError(reason)
+    return value
+
+
+def _verify_orphan_imports_reason(language: str, module: str, kind: str) -> str:
+    if kind == "internal_typo":
+        return (
+            f"{language}: top-level package for '{module}' is indexed but the full dotted path is not — "
+            "almost certainly a typo or stale import"
+        )
+    if kind == "missing_package":
+        return (
+            f"{language}: '{module}' resolves neither in the index nor via importlib — likely typo or "
+            "uninstalled dependency"
+        )
+    return (
+        f"{language}: '{module}' is a path-style import that doesn't resolve to an indexed file — "
+        "possible build-tool resolution"
+    )
+
+
+def _validate_verify_orphan_imports_value(
+    root: Path,
+    raw_value: object,
+    *,
+    optional: bool,
+) -> dict[str, object]:
+    if not isinstance(raw_value, dict) or set(raw_value) != {"language", "file", "line", "module", "kind", "hint"}:
+        raise ValueError("orphan_imports_finding")
+    language = raw_value.get("language")
+    kind = raw_value.get("kind")
+    expected_kinds = {"optional_unresolved"} if optional else _VERIFY_ORPHAN_IMPORTS_KINDS
+    if language not in _VERIFY_ORPHAN_IMPORTS_LANGUAGES or kind not in expected_kinds:
+        raise ValueError("orphan_imports_finding")
+    path = _verify_rule_site(root, raw_value.get("file"))
+    line = _plain_int(raw_value.get("line"), minimum=1)
+    module = _bounded_verify_orphan_imports_text(raw_value.get("module"), reason="orphan_imports_module")
+    hint = _bounded_verify_orphan_imports_text(raw_value.get("hint"), reason="orphan_imports_hint")
+    return {
+        "language": language,
+        "file": path,
+        "line": line,
+        "module": module,
+        "kind": kind,
+        "hint": hint,
+    }
+
+
+def _validate_verify_orphan_imports_protocol(
+    output: str,
+    *,
+    returncode: int,
+    expected_roam_version: str,
+    expected_root: Path,
+) -> tuple[dict[str, object], ...]:
+    """Validate one complete orphan-imports result and return actionable findings only."""
+    envelope = _strict_json_document(output, max_bytes=MAX_VERIFY_JSON_BYTES)
+    if not isinstance(envelope, dict):
+        raise ValueError("orphan_imports_envelope")
+    if (
+        envelope.get("schema") != VERIFY_ENVELOPE_SCHEMA
+        or not _envelope_schema_compatible(envelope.get("schema_version"))
+        or envelope.get("command") != "orphan-imports"
+        or envelope.get("version") != expected_roam_version
+        or returncode != 0
+    ):
+        raise ValueError("orphan_imports_envelope")
+    summary = envelope.get("summary")
+    raw_orphans = envelope.get("orphans")
+    raw_optional = envelope.get("optional_unresolved")
+    if not isinstance(summary, dict) or not isinstance(raw_orphans, list) or not isinstance(raw_optional, list):
+        raise ValueError("orphan_imports_shape")
+    count = _plain_int(summary.get("count"), maximum=MAX_VERIFY_ORPHAN_IMPORTS_ENVELOPE_FINDINGS)
+    optional_count = _plain_int(summary.get("optional_unresolved_count"))
+    files_scanned = _plain_int(summary.get("files_scanned"), maximum=MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_ENTRIES)
+    distribution = summary.get("findings_confidence_distribution")
+    if (
+        summary.get("partial_success") is not False
+        or "warnings_out" in summary
+        or "warnings_out" in envelope
+        or summary.get("languages") != list(_VERIFY_ORPHAN_IMPORTS_LANGUAGES)
+        or count != len(raw_orphans)
+        or len(raw_optional) != min(optional_count, MAX_VERIFY_ORPHAN_IMPORTS_ENVELOPE_FINDINGS)
+        or not isinstance(distribution, dict)
+        or set(distribution) != _VERIFY_ORPHAN_IMPORTS_CONFIDENCES
+    ):
+        raise ValueError("orphan_imports_summary")
+
+    findings: list[dict[str, object]] = []
+    actual_distribution: Counter[str] = Counter()
+    for raw_orphan in raw_orphans:
+        if not isinstance(raw_orphan, dict) or set(raw_orphan) != {"value", "confidence", "reason"}:
+            raise ValueError("orphan_imports_finding")
+        finding = _validate_verify_orphan_imports_value(expected_root, raw_orphan.get("value"), optional=False)
+        confidence = raw_orphan.get("confidence")
+        expected_confidence = "high" if finding["kind"] == "internal_typo" else "medium"
+        reason = _bounded_verify_orphan_imports_text(raw_orphan.get("reason"), reason="orphan_imports_reason")
+        if confidence != expected_confidence or reason != _verify_orphan_imports_reason(
+            str(finding["language"]), str(finding["module"]), str(finding["kind"])
+        ):
+            raise ValueError("orphan_imports_finding")
+        actual_distribution[str(confidence)] += 1
+        findings.append(finding)
+    for raw_optional_value in raw_optional:
+        _validate_verify_orphan_imports_value(expected_root, raw_optional_value, optional=True)
+    declared_distribution = Counter(
+        {
+            confidence: _plain_int(distribution.get(confidence), maximum=count)
+            for confidence in _VERIFY_ORPHAN_IMPORTS_CONFIDENCES
+        }
+    )
+    if declared_distribution != actual_distribution:
+        raise ValueError("orphan_imports_counts")
+    verdict = (
+        f"OK — no orphan imports across {files_scanned} file(s)"
+        if not findings
+        else f"{len(findings)} orphan import(s) across {files_scanned} file(s)"
+    )
+    if optional_count:
+        verdict += f"; {optional_count} optional-unresolved import(s)"
+    high = actual_distribution["high"]
+    if high:
+        verdict += f" ({high} high-confidence)"
+    if summary.get("verdict") != verdict:
+        raise ValueError("orphan_imports_summary")
+    return tuple(findings)
+
+
+def _verify_orphan_imports_extract_head_archive(
+    root: Path,
+    destination: Path,
+    head_commit: str,
+) -> None:
+    archive = _verify_type_git_capture(
+        root,
+        ["archive", "--format=tar", head_commit],
+        stdout_limit=MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_BYTES,
+    )
+    raw = archive.stdout or b""
+    if archive.returncode != 0 or len(raw) > MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_BYTES:
+        raise ValueError("orphan_imports_head_archive")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as stream:
+            members = stream.getmembers()
+            if len(members) > MAX_VERIFY_ORPHAN_IMPORTS_ARCHIVE_ENTRIES:
+                raise ValueError("orphan_imports_head_archive")
+            canonical_destination = destination.resolve(strict=True)
+            for member in members:
+                name = member.name.rstrip("/")
+                if not name:
+                    continue
+                pure = PurePosixPath(name)
+                if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+                    raise ValueError("orphan_imports_head_archive")
+                target = destination.joinpath(*pure.parts)
+                if not _path_is_within(target.resolve(strict=False), canonical_destination):
+                    raise ValueError("orphan_imports_head_archive")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                if member.issym():
+                    link = PurePosixPath(member.linkname)
+                    if link.is_absolute():
+                        raise ValueError("orphan_imports_head_archive")
+                    link_target = (target.parent / Path(*link.parts)).resolve(strict=False)
+                    if not _path_is_within(link_target, canonical_destination):
+                        raise ValueError("orphan_imports_head_archive")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(member.linkname)
+                    continue
+                if not member.isfile():
+                    raise ValueError("orphan_imports_head_archive")
+                source = stream.extractfile(member)
+                if source is None:
+                    raise ValueError("orphan_imports_head_archive")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as output_file:
+                    while chunk := source.read(64 * 1024):
+                        output_file.write(chunk)
+                target.chmod(member.mode & 0o777)
+    except (tarfile.TarError, OSError, ValueError):
+        raise ValueError("orphan_imports_head_archive") from None
+
+
+@contextmanager
+def _verify_orphan_imports_checkout(
+    root: Path,
+    targets: Sequence[str],
+    head_commit: str,
+    *,
+    current: bool,
+) -> Iterator[Path]:
+    """Materialize one bounded whole-tree side of the actionable-orphan comparison."""
+    with tempfile.TemporaryDirectory(prefix=".compile-code-orphans-", dir=str(root)) as raw_checkout:
+        checkout = Path(raw_checkout)
+        _verify_orphan_imports_extract_head_archive(root, checkout, head_commit)
+        initialized = _verify_type_git_capture(checkout, ["init", "-q"], stdout_limit=1024)
+        if initialized.returncode != 0:
+            raise ValueError("orphan_imports_checkout")
+        if current:
+            overlay_targets = tuple(
+                path
+                for path in targets
+                if PurePosixPath(path).suffix.lower() in _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES
+                or PurePosixPath(path).name in {"pyproject.toml", "package.json", "go.mod"}
+            )
+            total_source_bytes = 0
+            for path in overlay_targets:
+                source = root / Path(path)
+                destination = checkout / Path(path)
+                try:
+                    source_state = source.lstat()
+                except FileNotFoundError:
+                    if destination.is_symlink() or destination.is_file():
+                        destination.unlink()
+                    elif destination.exists():
+                        raise ValueError("orphan_imports_current_source")
+                    continue
+                if _is_link_or_reparse(source_state) or not stat.S_ISREG(source_state.st_mode):
+                    raise ValueError("orphan_imports_current_source")
+                source_text = _read_bounded_utf8_regular_file(source, max_bytes=MAX_VERIFY_ORPHAN_IMPORTS_SOURCE_BYTES)
+                total_source_bytes += len(source_text.encode("utf-8"))
+                if total_source_bytes > MAX_VERIFY_ORPHAN_IMPORTS_TOTAL_SOURCE_BYTES:
+                    raise ValueError("orphan_imports_current_scope")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(source_text, encoding="utf-8")
+        yield checkout
+
+
+def _run_verify_orphan_imports_scan(
+    root: Path,
+    *,
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[tuple[dict[str, object], ...] | None, int, str | None]:
+    indexed_rc, indexed_output = _delegate_capturing(
+        "index",
+        "--force",
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if indexed_output is None:
+        return None, indexed_rc, None
+    if indexed_rc != 0:
+        return (), EXIT_TOOLCHAIN, "the isolated orphan-import index could not be built"
+    rc, output = _delegate_capturing(
+        "--json",
+        "orphan-imports",
+        executable=executable,
+        env=env,
+        cwd=str(root),
+    )
+    if output is None:
+        return None, rc, None
+    try:
+        findings = _validate_verify_orphan_imports_protocol(
+            output,
+            returncode=rc,
+            expected_roam_version=expected_roam_version,
+            expected_root=root,
+        )
+    except (UnicodeError, ValueError):
+        return (), EXIT_TOOLCHAIN, "orphan-imports did not return one complete structured actionable result"
+    return findings, 0, None
+
+
+def _verify_orphan_imports_finding_key(finding: Mapping[str, object]) -> tuple[str, ...]:
+    return tuple(str(finding[field]) for field in ("file", "module", "language"))
+
+
+def _run_verify_orphan_imports_check(
+    root: Path,
+    *,
+    targets: Sequence[str],
+    executable: str,
+    expected_roam_version: str,
+    env: dict[str, str],
+) -> tuple[dict[str, object] | None, int]:
+    """Compare complete current/HEAD actionable orphan sets and gate only new findings."""
+    try:
+        head_commit = _verify_calc_head_commit(root)
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        head_commit = None
+    if head_commit is None:
+        return {
+            "state": "unavailable",
+            "reason": "the Git pre-edit tree for the actionable orphan comparison could not be derived",
+        }, EXIT_TOOLCHAIN
+    try:
+        rename_paths = _verify_orphan_imports_rename_paths(root, targets)
+        status_records = _verify_orphan_imports_status_records(root, targets)
+        comparison_targets = tuple(
+            dict.fromkeys(
+                [
+                    *targets,
+                    *rename_paths,
+                    *(
+                        path
+                        for _state, path in status_records
+                        if PurePosixPath(path).suffix.lower() in _VERIFY_ORPHAN_IMPORTS_SOURCE_SUFFIXES
+                    ),
+                ]
+            )
+        )
+        with _verify_orphan_imports_checkout(root, comparison_targets, head_commit, current=False) as baseline_root:
+            baseline_findings, baseline_rc, baseline_reason = _run_verify_orphan_imports_scan(
+                baseline_root,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if baseline_findings is None:
+            return None, baseline_rc
+        if baseline_reason is not None:
+            return {"state": "unavailable", "reason": baseline_reason}, EXIT_TOOLCHAIN
+        with _verify_orphan_imports_checkout(root, comparison_targets, head_commit, current=True) as current_root:
+            current_findings, current_rc, current_reason = _run_verify_orphan_imports_scan(
+                current_root,
+                executable=executable,
+                expected_roam_version=expected_roam_version,
+                env=env,
+            )
+        if current_findings is None:
+            return None, current_rc
+        if current_reason is not None:
+            return {"state": "unavailable", "reason": current_reason}, EXIT_TOOLCHAIN
+    except (MemoryError, OSError, UnicodeError, ValueError):
+        return {
+            "state": "unavailable",
+            "reason": "the isolated pre-edit and current actionable orphan scans could not be completed",
+        }, EXIT_TOOLCHAIN
+
+    baseline_counts = Counter(_verify_orphan_imports_finding_key(finding) for finding in baseline_findings)
+    regressions: list[dict[str, object]] = []
+    regression_count = 0
+    for finding in current_findings:
+        key = _verify_orphan_imports_finding_key(finding)
+        if baseline_counts[key]:
+            baseline_counts[key] -= 1
+            continue
+        regression_count += 1
+        if len(regressions) < MAX_VERIFY_ORPHAN_IMPORTS_FINDINGS:
             regressions.append(finding)
     return {
         "state": "failed" if regression_count else "complete",
@@ -6955,6 +7490,74 @@ def _render_verify_with_collapse_check(
     return "\n".join(lines)
 
 
+def _render_verify_with_orphan_imports_check(
+    rendered: str,
+    envelope: Mapping[str, object],
+    orphan_imports_result: Mapping[str, object] | None,
+    *,
+    excluded: Sequence[str] = (),
+    diff_only: bool = False,
+) -> str:
+    """Compose the actionable-orphan delta with the other Verify checks."""
+    if orphan_imports_result is None:
+        return rendered
+    lines = rendered.splitlines()
+    state = orphan_imports_result.get("state")
+    if state == "not_applicable":
+        lines.append("orphan-imports [not_applicable]: no deletion, rename, or changed import line")
+        return "\n".join(lines)
+    if state not in {"complete", "failed"}:
+        raise ValueError("orphan_imports_render_state")
+
+    for index, line in enumerate(lines):
+        if line.startswith("checks:"):
+            roster = [item.strip() for item in line.removeprefix("checks:").split(",")]
+            if "orphan-imports" not in roster:
+                lines[index] = f"{line}, orphan-imports"
+            break
+    else:
+        lines.insert(1, "checks: orphan-imports")
+    absolute_count = _plain_int(orphan_imports_result.get("absolute_finding_count"))
+    baseline_count = _plain_int(orphan_imports_result.get("baseline_finding_count"))
+    if state == "complete":
+        lines.append(
+            "orphan-imports [complete]: actionable orphan delta clean "
+            f"({absolute_count} current vs {baseline_count} pre-edit findings; optional-unresolved excluded)"
+        )
+        return "\n".join(lines)
+
+    regression_count = _plain_int(orphan_imports_result.get("regression_count"), minimum=1)
+    summary = envelope.get("summary")
+    if not isinstance(summary, Mapping):
+        raise ValueError("orphan_imports_render_summary")
+    targets_checked = summary.get("targets_checked", summary.get("files_checked"))
+    _plain_int(targets_checked)
+    if lines[0].startswith("VERDICT: PASS"):
+        lines[0] = (
+            f"VERDICT: FAIL (orphan import regression) -- {regression_count} actionable orphan import"
+            f"{'s' if regression_count != 1 else ''} introduced by {targets_checked} changed file"
+            f"{'s' if targets_checked != 1 else ''}{_narrowed_scope_suffix(excluded)}"
+            f"{_diff_scope_suffix(diff_only)}{_suppressed_findings_suffix(summary)}"
+        )
+    else:
+        label_match = re.match(r"^VERDICT: FAIL \(([^)]*)\)", lines[0])
+        previous_label = label_match.group(1) if label_match else "another Verify gate"
+        lines[0] = f"VERDICT: FAIL ({previous_label} + orphan import regression) -- product-owned edit gates failed"
+    findings = orphan_imports_result.get("findings")
+    if not isinstance(findings, tuple):
+        raise ValueError("orphan_imports_render_findings")
+    lines.extend(("", "ORPHAN IMPORTS (0/100):"))
+    for finding in findings[:MAX_VERIFY_ORPHAN_IMPORTS_FINDINGS]:
+        if not isinstance(finding, Mapping):
+            raise ValueError("orphan_imports_render_finding")
+        location = f"{finding['file']}:{finding['line']}"
+        lines.append(f"  FAIL: {location} -- {finding['module']} ({finding['kind']}): {finding['hint']}")
+    omitted = regression_count - len(findings)
+    if omitted > 0:
+        lines.append(f"  (+{omitted} more actionable orphan import regressions omitted by output bound)")
+    return "\n".join(lines)
+
+
 def _verify_failing_files(
     result: Mapping[str, object], *, gating_severities: Container[object] | None = None
 ) -> list[str]:
@@ -7235,6 +7838,10 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     Edited Python and JavaScript/TypeScript sources run `collapse` against
     isolated current and Git ``HEAD`` materializations of the same file set,
     so only newly introduced benign-default collapses gate.
+    Deleted or renamed importable sources and edits to import lines run
+    `orphan-imports` over isolated whole-tree current and Git ``HEAD``
+    materializations. Only newly introduced actionable orphans gate;
+    optional-unresolved imports remain explicitly non-gating.
     Inapplicable adapters report typed not_applicable states. If any triggered
     check lacks the inputs needed for a complete result, VERIFY names the
     unavailable state and refuses instead of publishing a false pass.
@@ -7300,6 +7907,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     py_modern_result: dict[str, object] | None = None
     calc_golden_result: dict[str, object] | None = None
     collapse_result: dict[str, object] | None = None
+    orphan_imports_result: dict[str, object] | None = None
     try:
         envelope = _validate_verify_protocol(
             output,
@@ -7310,7 +7918,7 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             expected_root=root,
             diff_only=diff_only,
         )
-        selected_product_checks = _auto_select_product_verify_checks(bound_targets)
+        selected_product_checks = _auto_select_product_verify_checks(bound_targets, root=root)
         if "rules" in selected_product_checks:
             rules_result, rules_rc = _run_verify_rules_check(
                 root,
@@ -7395,6 +8003,23 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
                     )
                 )
                 raise SystemExit(EXIT_TOOLCHAIN)
+        if "orphan-imports" in selected_product_checks:
+            orphan_imports_result, orphan_imports_rc = _run_verify_orphan_imports_check(
+                root,
+                targets=bound_targets,
+                executable=str(executable),
+                expected_roam_version=str(roam_info["version"]),
+                env=verify_env,
+            )
+            if orphan_imports_result is None:
+                raise SystemExit(orphan_imports_rc)
+            if orphan_imports_result.get("state") == "unavailable":
+                click.echo(
+                    _verify_orphan_imports_unavailable_verdict(
+                        orphan_imports_result.get("unavailable_reason", orphan_imports_result.get("reason"))
+                    )
+                )
+                raise SystemExit(EXIT_TOOLCHAIN)
         if _verification_content_sha256(root, bound_targets) != expected_receipt["content_sha256"]:
             raise ValueError("post_verify_content_changed")
         # Recompute through the SAME narrowing as the request, or a repo whose
@@ -7435,6 +8060,13 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
         excluded=excluded,
         diff_only=diff_only,
     )
+    rendered = _render_verify_with_orphan_imports_check(
+        rendered,
+        envelope,
+        orphan_imports_result,
+        excluded=excluded,
+        diff_only=diff_only,
+    )
     click.echo(rendered)
     # output is None => the toolchain never ran to completion (missing, broken,
     # timed out, interrupted) and its verdict is already on screen. Every
@@ -7443,7 +8075,14 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     # this CLI's EXIT_TOOLCHAIN (also 2).
     product_failed = any(
         result is not None and result.get("state") == "failed"
-        for result in (rules_result, py_types_result, py_modern_result, calc_golden_result, collapse_result)
+        for result in (
+            rules_result,
+            py_types_result,
+            py_modern_result,
+            calc_golden_result,
+            collapse_result,
+            orphan_imports_result,
+        )
     )
     final_rc = EXIT_VERIFY_GATE if product_failed else rc
     if final_rc != 0:
@@ -7462,6 +8101,8 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
             failing.extend(path for path in _verify_failing_files(calc_golden_result) if path not in failing)
         if collapse_result is not None:
             failing.extend(path for path in _verify_failing_files(collapse_result) if path not in failing)
+        if orphan_imports_result is not None:
+            failing.extend(path for path in _verify_failing_files(orphan_imports_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(

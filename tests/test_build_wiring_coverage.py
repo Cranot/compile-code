@@ -67,7 +67,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     inventory = coverage.roam_command_inventory()
 
     assert coverage._product_verify_commands(inventory) == frozenset(
-        {"calc-golden", "collapse", "py-modern", "py-types", "rules"}
+        {"calc-golden", "collapse", "orphan-imports", "py-modern", "py-types", "rules"}
     )
 
     import compile_code.cli as cli
@@ -86,6 +86,9 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "Python and JavaScript/TypeScript edits" in descriptions["collapse"]
     assert "Git pre-edit state" in descriptions["collapse"]
     assert "absolute legacy debt never gates" in descriptions["collapse"]
+    assert "deleted or renamed" in descriptions["orphan-imports"]
+    assert "import lines" in descriptions["orphan-imports"]
+    assert "Git pre-edit state" in descriptions["orphan-imports"]
     assert cli._auto_select_product_verify_checks(["README.md"]) == (
         "rules",
         "py-types",
@@ -98,6 +101,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "py-modern",
         "calc-golden",
         "collapse",
+        "orphan-imports",
     )
     assert cli._auto_select_product_verify_checks(["web/service.tsx"]) == (
         "rules",
@@ -105,6 +109,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "py-modern",
         "calc-golden",
         "collapse",
+        "orphan-imports",
     )
     assert "collapse" not in cli._auto_select_product_verify_checks(["scripts/check.sh"])
     assert cli._auto_select_product_verify_checks([]) == ()

@@ -434,6 +434,69 @@ def _collapse_envelope(*, findings: list[dict[str, object]], path: str = "servic
     }
 
 
+def _orphan_imports_envelope(
+    *,
+    actionable: list[dict[str, object]],
+    optional_unresolved: list[dict[str, object]] | None = None,
+    files_scanned: int = 3,
+) -> dict[str, object]:
+    """The hardened orphan-imports envelope, with fixture findings only."""
+    optional = optional_unresolved or []
+    wrapped = []
+    distribution = {"high": 0, "medium": 0, "low": 0}
+    for finding in actionable:
+        kind = str(finding["kind"])
+        confidence = "high" if kind == "internal_typo" else "medium"
+        module = str(finding["module"])
+        language = str(finding["language"])
+        if kind == "internal_typo":
+            reason = (
+                f"{language}: top-level package for '{module}' is indexed but the full dotted path is not — "
+                "almost certainly a typo or stale import"
+            )
+        elif kind == "missing_package":
+            reason = (
+                f"{language}: '{module}' resolves neither in the index nor via importlib — likely typo or "
+                "uninstalled dependency"
+            )
+        else:
+            reason = (
+                f"{language}: '{module}' is a path-style import that doesn't resolve to an indexed file — "
+                "possible build-tool resolution"
+            )
+        distribution[confidence] += 1
+        wrapped.append({"value": finding, "confidence": confidence, "reason": reason})
+    verdict = (
+        f"OK — no orphan imports across {files_scanned} file(s)"
+        if not actionable
+        else f"{len(actionable)} orphan import(s) across {files_scanned} file(s)"
+    )
+    if optional:
+        verdict += f"; {len(optional)} optional-unresolved import(s)"
+    if distribution["high"]:
+        verdict += f" ({distribution['high']} high-confidence)"
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "orphan-imports",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": verdict,
+            "count": len(actionable),
+            "optional_unresolved_count": len(optional),
+            "files_scanned": files_scanned,
+            "languages": ["python", "javascript", "go"],
+            "findings_confidence_distribution": distribution,
+            "partial_success": False,
+        },
+        "orphans": wrapped,
+        "optional_unresolved": optional,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 @pytest.fixture
 def neutralize_synthetic_verify_type_delta(monkeypatch):
     """Keep protocol-format fixtures focused when they have no Git evidence.
@@ -530,6 +593,25 @@ def neutralize_synthetic_verify_collapse_check(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_run_verify_collapse_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_finding_count": 0,
+                "baseline_finding_count": 0,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_orphan_imports_check(monkeypatch):
+    """Keep legacy synthetic fixtures independent of orphan-import delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_orphan_imports_check",
         lambda *_args, **_kwargs: (
             {
                 "state": "complete",
@@ -1765,6 +1847,16 @@ class TestBoundedVerifyCapture:
             "Git, the Roam index or detector, or the edited Python/JavaScript/TypeScript source, then rerun `compile "
             "verify --changed`.",
         ),
+        (
+            mod._verify_orphan_imports_unavailable_verdict,
+            "VERDICT: verify unavailable — orphan-imports did not run completely: CAPTURED_REASON. A triggered "
+            "orphan-import check that did not run cannot pass. Fix: repair Git, the Roam index or detector, or the "
+            "changed importable source, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — orphan-imports did not run completely: the actionable orphan-import "
+            "check could not establish a complete result. A triggered orphan-import check that did not run cannot "
+            "pass. Fix: repair Git, the Roam index or detector, or the changed importable source, then rerun "
+            "`compile verify --changed`.",
+        ),
     ],
 )
 def test_verify_unavailable_verdicts_are_byte_stable(builder, safe_expected: str, fallback_expected: str):
@@ -2518,6 +2610,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2606,6 +2699,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2899,6 +2993,276 @@ class TestVerifyFailureFormatting:
         assert "collapse did not run completely" in result.output
         assert "VERDICT: PASS" not in result.output
 
+    def test_deleting_an_imported_source_fails_and_names_the_untouched_importer(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+    ):
+        package = tmp_path / "src" / "pkg"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        dependency = package / "dependency.py"
+        dependency.write_text("VALUE = 1\n", encoding="utf-8")
+        (package / "consumer.py").write_text("from pkg.dependency import VALUE\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        dependency.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["src/pkg/dependency.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        orphan = {
+            "language": "python",
+            "file": "src/pkg/consumer.py",
+            "line": 1,
+            "module": "pkg.dependency",
+            "kind": "internal_typo",
+            "hint": "top-level package 'pkg' is indexed but 'pkg.dependency' is not",
+        }
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "orphan-imports"]:
+                findings = [] if (Path(cwd) / "src/pkg/dependency.py").is_file() else [orphan]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(_orphan_imports_envelope(actionable=findings)),
+                    stderr="",
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "src/pkg/dependency.py"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (orphan import regression)")
+        assert "pkg.dependency" in result.output
+        assert "src/pkg/consumer.py:1" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "orphan-imports"]] == [
+            ["--json", "orphan-imports"],
+            ["--json", "orphan-imports"],
+        ]
+
+    def test_preexisting_orphan_untouched_by_the_edit_passes(self, monkeypatch, tmp_path):
+        (tmp_path / "consumer.py").write_text("import already_missing\n", encoding="utf-8")
+        source = tmp_path / "service.py"
+        source.write_text("import os\nVALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.write_text("import os\nVALUE = 2\n", encoding="utf-8")
+        orphan = {
+            "language": "python",
+            "file": "consumer.py",
+            "line": 1,
+            "module": "already_missing",
+            "kind": "missing_package",
+            "hint": "neither indexed nor importable; check spelling or install package",
+        }
+
+        def capture(*args, **_kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "orphan-imports"]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(_orphan_imports_envelope(actionable=[orphan], files_scanned=2)),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_orphan_imports_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["baseline_finding_count"] == 1
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_orphan_imports_without_a_git_baseline_is_typed_unavailable(self, monkeypatch, tmp_path):
+        (tmp_path / "service.py").write_text("import missing_dependency\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+        monkeypatch.setattr(
+            mod,
+            "_roam_capture",
+            lambda *args, **kwargs: pytest.fail("an untakeable baseline must stop before detector delegation"),
+        )
+
+        result, rc = mod._run_verify_orphan_imports_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == mod.EXIT_TOOLCHAIN
+        assert result["state"] == "unavailable"
+        assert "Git pre-edit tree" in result["reason"]
+
+    def test_optional_unresolved_entries_never_gate_an_edit_even_beside_actionable_orphans(self, monkeypatch, tmp_path):
+        (tmp_path / "consumer.py").write_text("import already_missing\n", encoding="utf-8")
+        source = tmp_path / "service.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.write_text("import optional_extra\nVALUE = 1\n", encoding="utf-8")
+        actionable = {
+            "language": "python",
+            "file": "consumer.py",
+            "line": 1,
+            "module": "already_missing",
+            "kind": "missing_package",
+            "hint": "neither indexed nor importable; check spelling or install package",
+        }
+        optional = {
+            "language": "python",
+            "file": "service.py",
+            "line": 1,
+            "module": "optional_extra",
+            "kind": "optional_unresolved",
+            "hint": "declared optional extra or project self-import; unavailable from the source index",
+        }
+
+        def capture(*args, **kwargs):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            assert list(args[:2]) == ["--json", "orphan-imports"]
+            current = "optional_extra" in (Path(kwargs["cwd"]) / "service.py").read_text(encoding="utf-8")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    _orphan_imports_envelope(
+                        actionable=[actionable],
+                        optional_unresolved=[optional] if current else [],
+                        files_scanned=2,
+                    )
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_orphan_imports_check(
+            tmp_path,
+            targets=["service.py"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["regression_count"] == 0
+
+    def test_orphan_imports_tool_absence_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+    ):
+        source = tmp_path / "dependency.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["dependency.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "orphan-imports"]:
+                raise FileNotFoundError("roam")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "dependency.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "toolchain missing" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_malformed_orphan_imports_envelope_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+    ):
+        source = tmp_path / "dependency.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["dependency.py"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["index", "--force"]:
+                return SimpleNamespace(returncode=0, stdout="indexed", stderr="")
+            if list(args[:2]) == ["--json", "orphan-imports"]:
+                return SimpleNamespace(returncode=0, stdout='{not "one complete envelope"', stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "dependency.py"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "orphan-imports did not run completely" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_orphan_imports_auto_selection_excludes_docs_and_includes_source_deletions(self, tmp_path):
+        readme = tmp_path / "README.md"
+        readme.write_text("baseline\n", encoding="utf-8")
+        source = tmp_path / "dependency.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        readme.write_text("documentation only\n", encoding="utf-8")
+
+        assert "orphan-imports" not in mod._auto_select_product_verify_checks(["README.md"], root=tmp_path)
+
+        source.unlink()
+
+        assert "orphan-imports" in mod._auto_select_product_verify_checks(["dependency.py"], root=tmp_path)
+
+    def test_orphan_imports_auto_selection_includes_edits_to_import_lines(self, tmp_path):
+        source = tmp_path / "service.py"
+        source.write_text("import os\nVALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.write_text("import missing_dependency\nVALUE = 1\n", encoding="utf-8")
+
+        assert "orphan-imports" in mod._auto_select_product_verify_checks(["service.py"], root=tmp_path)
+
+    def test_orphan_imports_auto_selection_includes_renames_from_importable_sources(self, tmp_path):
+        source = tmp_path / "dependency.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        subprocess.run(["git", "mv", "dependency.py", "dependency.txt"], cwd=tmp_path, check=True)
+
+        assert "orphan-imports" in mod._auto_select_product_verify_checks(["dependency.txt"], root=tmp_path)
+
     def test_declared_golden_semantic_change_fails_and_names_calculation_case_and_values(
         self,
         runner,
@@ -2907,6 +3271,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text(
@@ -3168,6 +3533,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text("tax = base * rate\n", encoding="utf-8")
@@ -3259,6 +3625,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
         self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
@@ -3339,6 +3706,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -3501,7 +3869,12 @@ class TestVerifyFailureFormatting:
         assert [call for call in calls if call[:2] == ["--json", "py-modern"]] == []
 
     def test_triggered_modernization_delta_unavailability_is_typed_at_exit_2(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
@@ -3529,7 +3902,12 @@ class TestVerifyFailureFormatting:
         assert [call for call in calls if call[:2] == ["--json", "py-modern"]] == []
 
     def test_partial_modernization_evidence_is_typed_unavailable_at_exit_2(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_py_types_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
@@ -3770,6 +4148,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(record_id, label):\n    return f'{record_id}:{label}'\n", encoding="utf-8")
@@ -3853,7 +4232,9 @@ class TestVerifyFailureFormatting:
         assert "py-types [not_applicable]: no changed Python files" in result.output
         assert "product_args" not in captured
 
-    def test_triggered_type_check_unavailability_is_typed_at_exit_2(self, runner, monkeypatch, tmp_path):
+    def test_triggered_type_check_unavailability_is_typed_at_exit_2(
+        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_orphan_imports_check
+    ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(value: int) -> int:\n    return value\n", encoding="utf-8")
         digest = mod._verification_content_sha256(tmp_path, ["service.py"])
@@ -6103,6 +6484,7 @@ class TestVerifyReceiptV3Protocol:
         compatible_roam,
         tmp_path,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         # End to end: tracked source under venv/ is verified, the untracked
         # index is not, and the PASS carries its own reduced denominator.
@@ -6232,6 +6614,7 @@ class TestVerifyReceiptV3Protocol:
         monkeypatch,
         tmp_path,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_orphan_imports_check,
     ):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".git").mkdir()

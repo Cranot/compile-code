@@ -333,7 +333,10 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("onboard", _c(False, "", "Excluded from the edit denominator: deprecated->understand.")),
     ("oracle", _c(False, "", "Excluded from the edit denominator: boolean oracles container (meta).")),
     ("orchestrate", _c(False, "", "Excluded from the edit denominator: workflow coordination.")),
-    ("orphan-imports", _c(True, "F14", "Finds imports orphaned by moves or deletions.")),
+    (
+        "orphan-imports",
+        _c(True, "F14", "Compares actionable orphan imports with Git pre-edit state after moves or import edits."),
+    ),
     ("orphan-routes", _c(True, "F12", "Finds routes disconnected from handlers or authorization paths.")),
     ("over-fetch", _c(True, "F7", "Detects endpoints retrieving or exposing more data than needed.")),
     ("owner", _c(True, "F18", "Identifies the owner and review context for an edit target.")),
