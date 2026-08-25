@@ -474,13 +474,13 @@ def _canonical_json(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ReleaseError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
 
 
 def _reject_json_constant(value: str) -> Any:
@@ -530,7 +530,7 @@ def _load_json_bytes(data: bytes, label: str) -> Any:
     try:
         return json.loads(
             data.decode("utf-8"),
-            object_pairs_hook=_reject_duplicate_keys,
+            object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_json_constant,
             parse_float=_parse_finite_json_float,
             parse_int=_parse_bounded_json_int,

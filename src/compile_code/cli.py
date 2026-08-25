@@ -1328,19 +1328,20 @@ def _exit_after_canonical_claude_hook_update(
     raise SystemExit(rc)
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
 def _strict_json_document(raw: str, *, max_bytes: int) -> object:
     """Parse exactly one finite JSON document and reject duplicate object keys."""
     if not isinstance(raw, str) or "\ufffd" in raw or len(raw.encode("utf-8")) > max_bytes:
         raise ValueError("invalid_json_bytes")
     _enforce_json_nesting_limit(raw)
-
-    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in pairs:
-            if key in result:
-                raise ValueError("duplicate_json_key")
-            result[key] = value
-        return result
 
     def reject_constant(_value: str) -> object:
         raise ValueError("non_finite_json_number")
@@ -1354,7 +1355,7 @@ def _strict_json_document(raw: str, *, max_bytes: int) -> object:
     try:
         return json.loads(
             raw,
-            object_pairs_hook=reject_duplicates,
+            object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=reject_constant,
             parse_float=parse_finite_float,
         )
@@ -4008,19 +4009,53 @@ def _run_verify_rules_check(
     return result, 0
 
 
-def _verify_rules_unavailable_verdict(reason: object) -> str:
+_VERIFY_RULES_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_RULE_TEXT_CHARS,
+    "the custom-rule check could not establish a complete result",
+    "rules",
+    "A declared rule check that did not run cannot pass. Fix: repair the repository's .roam/rules declarations "
+    "or index, then rerun `compile verify --changed`.",
+)
+_VERIFY_PY_TYPES_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_TYPE_TEXT_CHARS,
+    "the type-annotation check could not establish a complete result",
+    "py-types",
+    "A triggered type check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited Python "
+    "source, then rerun `compile verify --changed`.",
+)
+_VERIFY_PY_MODERN_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_MODERN_TEXT_CHARS,
+    "the Python modernization check could not establish a complete result",
+    "py-modern",
+    "A triggered modernization check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited "
+    "Python source, then rerun `compile verify --changed`.",
+)
+_VERIFY_CALC_GOLDEN_UNAVAILABLE_VERDICT = (
+    MAX_VERIFY_CALC_TEXT_CHARS,
+    "the golden calculation check could not establish a complete result",
+    "calc-golden",
+    "A declared golden case that did not run cannot pass. Fix: repair Git or the .roam/calc-golden declaration, "
+    "corpus, and runner, then rerun `compile verify --changed`; preserve the golden cases.",
+)
+
+
+def _verify_unavailable_verdict(
+    reason: object,
+    max_reason_chars: int,
+    fallback_reason: str,
+    check_name: str,
+    failure_fix: str,
+) -> str:
     safe_reason = (
         reason
-        if isinstance(reason, str)
-        and 0 < len(reason) <= MAX_VERIFY_RULE_TEXT_CHARS
-        and all(ord(char) >= 32 for char in reason)
-        else "the custom-rule check could not establish a complete result"
+        if isinstance(reason, str) and 0 < len(reason) <= max_reason_chars and all(ord(char) >= 32 for char in reason)
+        else fallback_reason
     )
-    return (
-        f"VERDICT: verify unavailable — rules did not run completely: {safe_reason}. "
-        "A declared rule check that did not run cannot pass. Fix: repair the repository's .roam/rules "
-        "declarations or index, then rerun `compile verify --changed`."
-    )
+    return f"VERDICT: verify unavailable — {check_name} did not run completely: {safe_reason}. {failure_fix}"
+
+
+def _verify_rules_unavailable_verdict(reason: object) -> str:
+    return _verify_unavailable_verdict(reason, *_VERIFY_RULES_UNAVAILABLE_VERDICT)
 
 
 def _verify_type_annotation(node: ast.expr | None) -> dict[str, object] | None:
@@ -4557,18 +4592,7 @@ def _run_verify_py_types_check(
 
 
 def _verify_py_types_unavailable_verdict(reason: object) -> str:
-    safe_reason = (
-        reason
-        if isinstance(reason, str)
-        and 0 < len(reason) <= MAX_VERIFY_TYPE_TEXT_CHARS
-        and all(ord(char) >= 32 for char in reason)
-        else "the type-annotation check could not establish a complete result"
-    )
-    return (
-        f"VERDICT: verify unavailable — py-types did not run completely: {safe_reason}. "
-        "A triggered type check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited "
-        "Python source, then rerun `compile verify --changed`."
-    )
+    return _verify_unavailable_verdict(reason, *_VERIFY_PY_TYPES_UNAVAILABLE_VERDICT)
 
 
 def _verify_modern_occurrences(path: str, raw: str) -> tuple[dict[str, object], ...]:
@@ -4829,18 +4853,7 @@ def _run_verify_py_modern_check(
 
 
 def _verify_py_modern_unavailable_verdict(reason: object) -> str:
-    safe_reason = (
-        reason
-        if isinstance(reason, str)
-        and 0 < len(reason) <= MAX_VERIFY_MODERN_TEXT_CHARS
-        and all(ord(char) >= 32 for char in reason)
-        else "the Python modernization check could not establish a complete result"
-    )
-    return (
-        f"VERDICT: verify unavailable — py-modern did not run completely: {safe_reason}. "
-        "A triggered modernization check that did not run cannot pass. Fix: repair Git, the Roam index, or the "
-        "edited Python source, then rerun `compile verify --changed`."
-    )
+    return _verify_unavailable_verdict(reason, *_VERIFY_PY_MODERN_UNAVAILABLE_VERDICT)
 
 
 def _bounded_verify_calc_text(value: object, *, reason: str, allow_empty: bool = False) -> str:
@@ -5477,18 +5490,7 @@ def _run_verify_calc_golden_check(
 
 
 def _verify_calc_golden_unavailable_verdict(reason: object) -> str:
-    safe_reason = (
-        reason
-        if isinstance(reason, str)
-        and 0 < len(reason) <= MAX_VERIFY_CALC_TEXT_CHARS
-        and all(ord(char) >= 32 for char in reason)
-        else "the golden calculation check could not establish a complete result"
-    )
-    return (
-        f"VERDICT: verify unavailable — calc-golden did not run completely: {safe_reason}. "
-        "A declared golden case that did not run cannot pass. Fix: repair Git or the .roam/calc-golden "
-        "declaration, corpus, and runner, then rerun `compile verify --changed`; preserve the golden cases."
-    )
+    return _verify_unavailable_verdict(reason, *_VERIFY_CALC_GOLDEN_UNAVAILABLE_VERDICT)
 
 
 def _prepare_verify_request(
@@ -6476,52 +6478,21 @@ def _render_verify_with_calc_golden_check(
     return "\n".join(lines)
 
 
-def _verify_rules_failing_files(rules_result: Mapping[str, object]) -> list[str]:
+def _verify_failing_files(
+    result: Mapping[str, object], *, gating_severities: Container[object] | None = None
+) -> list[str]:
     files: list[str] = []
-    findings = rules_result.get("findings")
+    findings = result.get("findings")
     if not isinstance(findings, tuple):
         return files
     for finding in findings:
-        if (
-            isinstance(finding, Mapping)
-            and finding.get("severity") in _VERIFY_RULE_GATING_SEVERITIES
-            and isinstance(finding.get("file"), str)
-            and finding["file"] not in files
-        ):
-            files.append(finding["file"])
-    return files
-
-
-def _verify_py_types_failing_files(py_types_result: Mapping[str, object]) -> list[str]:
-    files: list[str] = []
-    findings = py_types_result.get("findings")
-    if not isinstance(findings, tuple):
-        return files
-    for finding in findings:
-        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
-            files.append(finding["file"])
-    return files
-
-
-def _verify_py_modern_failing_files(py_modern_result: Mapping[str, object]) -> list[str]:
-    files: list[str] = []
-    findings = py_modern_result.get("findings")
-    if not isinstance(findings, tuple):
-        return files
-    for finding in findings:
-        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
-            files.append(finding["file"])
-    return files
-
-
-def _verify_calc_golden_failing_files(calc_golden_result: Mapping[str, object]) -> list[str]:
-    files: list[str] = []
-    findings = calc_golden_result.get("findings")
-    if not isinstance(findings, tuple):
-        return files
-    for finding in findings:
-        if isinstance(finding, Mapping) and isinstance(finding.get("file"), str) and finding["file"] not in files:
-            files.append(finding["file"])
+        if not isinstance(finding, Mapping):
+            continue
+        if gating_severities is not None and finding.get("severity") not in gating_severities:
+            continue
+        path = finding.get("file")
+        if isinstance(path, str) and path not in files:
+            files.append(path)
     return files
 
 
@@ -6973,15 +6944,17 @@ def _verify(files: tuple[str, ...], changed: bool, new_only: bool, diff_only: bo
     if final_rc != 0:
         failing = _failing_files(envelope)
         if rules_result is not None:
-            failing.extend(path for path in _verify_rules_failing_files(rules_result) if path not in failing)
-        if py_types_result is not None:
-            failing.extend(path for path in _verify_py_types_failing_files(py_types_result) if path not in failing)
-        if py_modern_result is not None:
-            failing.extend(path for path in _verify_py_modern_failing_files(py_modern_result) if path not in failing)
-        if calc_golden_result is not None:
             failing.extend(
-                path for path in _verify_calc_golden_failing_files(calc_golden_result) if path not in failing
+                path
+                for path in _verify_failing_files(rules_result, gating_severities=_VERIFY_RULE_GATING_SEVERITIES)
+                if path not in failing
             )
+        if py_types_result is not None:
+            failing.extend(path for path in _verify_failing_files(py_types_result) if path not in failing)
+        if py_modern_result is not None:
+            failing.extend(path for path in _verify_failing_files(py_modern_result) if path not in failing)
+        if calc_golden_result is not None:
+            failing.extend(path for path in _verify_failing_files(calc_golden_result) if path not in failing)
         scoped = failing or targets or bound_targets
         click.echo(
             _format_verify_failure(

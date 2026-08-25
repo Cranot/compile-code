@@ -325,7 +325,7 @@ def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, ob
     value: dict[str, object] = {}
     for key, item in pairs:
         if key in value:
-            raise ValueError(f"duplicate JSON key: {key}")
+            raise ValueError("duplicate JSON key")
         value[key] = item
     return value
 
@@ -341,7 +341,7 @@ def _parse_finite_json_float(value: str) -> float:
         raise ValueError("JSON floating-point literal is oversized")
     parsed = float(value)
     if not math.isfinite(parsed):
-        raise ValueError(f"non-finite JSON number: {value}")
+        raise ValueError(f"non-finite JSON number is forbidden: {value}")
     return parsed
 
 

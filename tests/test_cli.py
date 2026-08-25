@@ -1626,6 +1626,69 @@ class TestBoundedVerifyCapture:
         assert not any(thread.name.startswith("compile-boundary-") for thread in mod.threading.enumerate())
 
 
+@pytest.mark.parametrize(
+    ("builder", "safe_expected", "fallback_expected"),
+    [
+        (
+            mod._verify_rules_unavailable_verdict,
+            "VERDICT: verify unavailable — rules did not run completely: CAPTURED_REASON. A declared rule check "
+            "that did not run cannot pass. Fix: repair the repository's .roam/rules declarations or index, then "
+            "rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — rules did not run completely: the custom-rule check could not establish "
+            "a complete result. A declared rule check that did not run cannot pass. Fix: repair the repository's "
+            ".roam/rules declarations or index, then rerun `compile verify --changed`.",
+        ),
+        (
+            mod._verify_py_types_unavailable_verdict,
+            "VERDICT: verify unavailable — py-types did not run completely: CAPTURED_REASON. A triggered type check "
+            "that did not run cannot pass. Fix: repair Git, the Roam index, or the edited Python source, then rerun "
+            "`compile verify --changed`.",
+            "VERDICT: verify unavailable — py-types did not run completely: the type-annotation check could not "
+            "establish a complete result. A triggered type check that did not run cannot pass. Fix: repair Git, "
+            "the Roam index, or the edited Python source, then rerun `compile verify --changed`.",
+        ),
+        (
+            mod._verify_py_modern_unavailable_verdict,
+            "VERDICT: verify unavailable — py-modern did not run completely: CAPTURED_REASON. A triggered "
+            "modernization check that did not run cannot pass. Fix: repair Git, the Roam index, or the edited "
+            "Python source, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — py-modern did not run completely: the Python modernization check could "
+            "not establish a complete result. A triggered modernization check that did not run cannot pass. Fix: "
+            "repair Git, the Roam index, or the edited Python source, then rerun `compile verify --changed`.",
+        ),
+        (
+            mod._verify_calc_golden_unavailable_verdict,
+            "VERDICT: verify unavailable — calc-golden did not run completely: CAPTURED_REASON. A declared golden "
+            "case that did not run cannot pass. Fix: repair Git or the .roam/calc-golden declaration, corpus, and "
+            "runner, then rerun `compile verify --changed`; preserve the golden cases.",
+            "VERDICT: verify unavailable — calc-golden did not run completely: the golden calculation check could "
+            "not establish a complete result. A declared golden case that did not run cannot pass. Fix: repair Git "
+            "or the .roam/calc-golden declaration, corpus, and runner, then rerun `compile verify --changed`; "
+            "preserve the golden cases.",
+        ),
+    ],
+)
+def test_verify_unavailable_verdicts_are_byte_stable(builder, safe_expected: str, fallback_expected: str):
+    assert builder("CAPTURED_REASON") == safe_expected
+    assert builder(None) == fallback_expected
+
+
+def test_verify_failing_files_share_one_ordered_deduplicating_filter():
+    findings = (
+        {"severity": "warning", "file": "warning.py"},
+        {"severity": "error", "file": "error.py"},
+        {"severity": "error", "file": "error.py"},
+        {"severity": "error", "file": 42},
+        "invalid finding",
+    )
+
+    assert mod._verify_failing_files({"findings": findings}) == ["warning.py", "error.py"]
+    assert mod._verify_failing_files({"findings": findings}, gating_severities=mod._VERIFY_RULE_GATING_SEVERITIES) == [
+        "error.py"
+    ]
+    assert mod._verify_failing_files({"findings": list(findings)}) == []
+
+
 @pytest.mark.usefixtures("compatible_roam")
 class TestVerifyToolchainFailureIsNotAVerifyFailure:
     """`compile verify` must not stack its failure block on a toolchain that

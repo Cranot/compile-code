@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import importlib.util
@@ -14,6 +15,42 @@ check = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = check
 assert spec.loader is not None
 spec.loader.exec_module(check)
+
+
+def _function_source_bytes(relative_path: str, function_name: str) -> bytes:
+    source = (SCRIPTS.parent / relative_path).read_text(encoding="utf-8")
+    matches = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name
+    ]
+    assert len(matches) == 1, f"expected one {function_name} in {relative_path}"
+    segment = ast.get_source_segment(source, matches[0])
+    assert segment is not None
+    return segment.encode("utf-8")
+
+
+def test_finite_json_float_copies_are_byte_identical():
+    copies = [
+        _function_source_bytes(relative_path, "_parse_finite_json_float")
+        for relative_path in ("scripts/check.py", "scripts/release_artifacts.py")
+    ]
+
+    assert copies[1:] == copies[:-1], "standalone strict-JSON float parsers drifted"
+
+
+def test_duplicate_json_key_rejectors_are_byte_identical():
+    copies = [
+        _function_source_bytes(relative_path, "_reject_duplicate_json_keys")
+        for relative_path in (
+            "scripts/check.py",
+            "scripts/release_artifacts.py",
+            "scripts/classify_sessions.py",
+            "src/compile_code/cli.py",
+        )
+    ]
+
+    assert copies[1:] == copies[:-1], "standalone duplicate-key rejectors drifted"
 
 
 def test_flags_known_artifact_paths():
