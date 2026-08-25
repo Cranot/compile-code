@@ -5,17 +5,17 @@ Source: resolved Roam 14.0.0. The 286-command inventory and channel sets are rea
 
 ## Summary
 
-**50 of 98 edit-relevant commands are wired** (53 distinct commands across all channels; 286 commands total).
+**51 of 97 edit-relevant commands are wired** (54 distinct commands across all channels; 286 commands total).
 
-Failure classes: 11 fully covered, 16 partial, and 0 fully uncovered.
+Failure classes: 12 fully covered, 15 partial, and 0 fully uncovered.
 
 | Channel | Wired commands | Edit-relevant wired | Inventory share |
 |---|---:|---:|---:|
 | CONTEXT | 22 | 19 | 7.7% |
-| VERIFY | 26 | 26 | 9.1% |
+| VERIFY | 27 | 27 | 9.4% |
 | HOOK | 6 | 6 | 2.1% |
 | MCP | 8 | 8 | 2.8% |
-| **Union** | **53** | **50** | **18.5%** |
+| **Union** | **54** | **51** | **18.9%** |
 
 ## Derived channel sets
 
@@ -25,7 +25,7 @@ Failure classes: 11 fully covered, 16 partial, and 0 fully uncovered.
 
 ### VERIFY
 
-`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `syntax-check`, `taint`, `test-hermeticity`, `tx-boundaries`, `verify-imports`
+`affected-tests`, `breaking`, `calc-golden`, `clones`, `collapse`, `complexity`, `cycles`, `dead`, `delete-check`, `duplicates`, `llm-smells`, `magic-numbers`, `migration-safety`, `n1`, `orphan-imports`, `over-fetch`, `py-modern`, `py-types`, `rules`, `secrets`, `smells`, `stale-refs`, `syntax-check`, `taint`, `test-hermeticity`, `tx-boundaries`, `verify-imports`
 
 ### HOOK
 
@@ -48,11 +48,11 @@ A class is **covered** when every mapped command is wired, **partial** when some
 | F5 | Missed coupled code | 4 | 1 | 0 | 0 | 2 | 2 / 5 | partial |
 | F6 | Security regression | 5 | 0 | 2 | 0 | 0 | 2 / 6 | partial |
 | F7 | Performance regression | 4 | 1 | 2 | 0 | 0 | 3 / 5 | partial |
-| F8 | Deleted but still referenced | 5 | 0 | 1 | 0 | 0 | 1 / 2 | partial |
+| F8 | Deleted but still referenced | 5 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
 | F9 | Missing or insufficient test | 5 | 2 | 0 | 0 | 0 | 2 / 6 | partial |
 | F10 | Non-idempotent or transaction-unsafe operation | 5 | 2 | 2 | 0 | 0 | 3 / 3 | covered |
 | F11 | Duplicated existing code | 4 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
-| F12 | Documentation or contract drift | 3 | 0 | 1 | 0 | 1 | 1 / 12 | partial |
+| F12 | Documentation or contract drift | 3 | 0 | 2 | 0 | 1 | 2 / 12 | partial |
 | F13 | Magic numbers | 3 | 0 | 1 | 0 | 0 | 1 / 1 | covered |
 | F14 | Import-time side effects or orphan imports | 5 | 0 | 2 | 0 | 0 | 2 / 2 | covered |
 | F15 | Cycle or layering violation | 4 | 1 | 1 | 0 | 0 | 2 / 5 | partial |
@@ -92,37 +92,35 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | 15 | `fitness` | 5 | F24 | Evaluates declared architectural fitness rules. |
 | 16 | `pytest-fixtures` | 5 | F9 | Maps test fixtures that an edit may need to preserve or update. |
 | 17 | `refs` | 5 | F2 | Deprecated reference lookup alias that still finds live consumers. |
-| 18 | `safe-delete` | 5 | F8 | Plans and validates dependency-aware deletion. |
-| 19 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
-| 20 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
-| 21 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
-| 22 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
-| 23 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
-| 24 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
-| 25 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
-| 26 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
-| 27 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
-| 28 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
-| 29 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
-| 30 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
-| 31 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
-| 32 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
-| 33 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
-| 34 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
-| 35 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
-| 36 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
-| 37 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
-| 38 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
-| 39 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
-| 40 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
-| 41 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
-| 42 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
-| 43 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
-| 44 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
-| 45 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
-| 46 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
-| 47 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
-| 48 | `stale-refs` | 3 | F12 | Finds references made stale by moves, renames, or deletions. |
+| 18 | `test-gaps` | 5 | F9 | Finds missing tests for changed or risky production code. |
+| 19 | `test-pyramid` | 5 | F9 | Detects imbalance in the repository's executable test layers. |
+| 20 | `test-scaffold` | 5 | F9 | Generates tests but does not prove the generated tests are sufficient. |
+| 21 | `trace` | 5 | F19 | Traces execution paths and effects through edited code. |
+| 22 | `algo` | 4 | F7 | Finds algorithmic anti-patterns and inefficient implementations. |
+| 23 | `cut` | 4 | F15 | Finds architectural cut points for a contained refactor. |
+| 24 | `cycle-break` | 4 | F15 | Plans changes that remove dependency cycles safely. |
+| 25 | `deps` | 4 | F5 | Maps dependencies affected by code or package changes. |
+| 26 | `effects` | 4 | F21 | Traces downstream effects of a changed symbol. |
+| 27 | `fn-coupling` | 4 | F5 | Finds function-level coupling partners for an edit. |
+| 28 | `layers` | 4 | F15 | Maps layer boundaries that an edit must respect. |
+| 29 | `missing-index` | 4 | F7 | Finds missing database indexes that can make an edit regress performance. |
+| 30 | `observability-opt` | 4 | F21 | Finds missing or inefficient observability around changed behavior. |
+| 31 | `owner` | 4 | F18 | Identifies the owner and review context for an edit target. |
+| 32 | `risk` | 4 | F18 | Summarizes risk factors around a proposed edit. |
+| 33 | `safe-zones` | 4 | F18 | Identifies low-risk areas and architecture constraints for edits. |
+| 34 | `x-lang` | 4 | F5 | Checks cross-language bindings and consumer contracts. |
+| 35 | `api-drift` | 3 | F12 | Detects drift between documented and implemented API surface. |
+| 36 | `doc-staleness` | 3 | F12 | Finds documentation made stale by a code change. |
+| 37 | `docs-coverage` | 3 | F12 | Finds public code surface without matching documentation. |
+| 38 | `flag-dead` | 3 | F17 | Marks dead code that may be safely removed after review. |
+| 39 | `history-grep` | 3 | F12 | Finds when and why a relevant symbol or behavior changed. |
+| 40 | `ignore-drift` | 3 | F12 | Detects ignore-policy drift that can hide files from checks. |
+| 41 | `intent` | 3 | F12 | Links declared intent to implementation so drift can be detected. |
+| 42 | `orphan-routes` | 3 | F12 | Finds routes disconnected from handlers or authorization paths. |
+| 43 | `patterns` | 3 | F16 | Detects implementation patterns and local idiom violations. |
+| 44 | `refs-text` | 3 | F12 | Finds textual references that can make a rename or deletion unsafe. |
+| 45 | `semantic-diff` | 3 | F12 | Compares behavioral surface rather than text alone. |
+| 46 | `split` | 3 | F16 | Finds safe boundaries for splitting a module or change. |
 
 ## Full command classification
 
@@ -348,7 +346,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `rules-suggest` | no | — | Suggests future rules and does not validate the current edit. | — |
 | `rules-validate` | no | — | Excluded from the edit denominator: lint rules file. | — |
 | `runs` | no | — | Excluded from the edit denominator: event ledger. | — |
-| `safe-delete` | yes | F8 | Plans and validates dependency-aware deletion. | — |
+| `safe-delete` | no | — | Excluded from the edit denominator: deletion-planning ACTION, not an edit detector. | — |
 | `safe-zones` | yes | F18 | Identifies low-risk areas and architecture constraints for edits. | — |
 | `savings` | no | — | Reports optimization savings rather than code correctness. | — |
 | `savings-backfill` | no | — | Backfills metrics and does not validate code edits. | — |
@@ -368,7 +366,7 @@ Rank score is the sum of mapped failure-class impacts plus 100 for each still-fu
 | `snapshot` | no | — | Excluded from the edit denominator: deprecated->trends. | — |
 | `spectral` | no | — | Excluded from the edit denominator: spectral partition (reporting). | — |
 | `split` | yes | F16 | Finds safe boundaries for splitting a module or change. | — |
-| `stale-refs` | yes | F12 | Finds references made stale by moves, renames, or deletions. | — |
+| `stale-refs` | yes | F8, F12 | Compares stale references after deletes, renames, and referenced-path edits with Git pre-edit state. | VERIFY |
 | `stats` | no | — | Excluded from the edit denominator: aggregate metrics (reporting). | — |
 | `suggest-refactoring` | no | — | Excluded from the edit denominator: refactor ranking (comprehension). | — |
 | `suggest-reviewers` | no | — | Excluded from the edit denominator: PM. | — |

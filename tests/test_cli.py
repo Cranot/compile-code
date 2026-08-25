@@ -497,6 +497,59 @@ def _orphan_imports_envelope(
     }
 
 
+def _stale_refs_envelope(
+    *,
+    findings: list[dict[str, object]],
+    files_scanned: int = 3,
+    refs_checked: int | None = None,
+) -> dict[str, object]:
+    """The current roam 14.0.0 stale-refs envelope, with fixture references only."""
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for finding in findings:
+        source = {key: finding[key] for key in ("file", "line", "kind", "raw", "anchor") if key in finding}
+        grouped.setdefault(str(finding["target"]), []).append(source)
+    targets = [
+        {"target": target, "ref_count": len(sources), "sources": sources} for target, sources in sorted(grouped.items())
+    ]
+    by_kind = Counter(str(finding["kind"]) for finding in findings)
+    checked = refs_checked if refs_checked is not None else max(len(findings), 1)
+    missing_targets = len(targets)
+    verdict = (
+        f"{len(findings)} stale ref(s) · {missing_targets} missing target(s) · "
+        f"{checked} refs checked · {files_scanned} files · 0.01s"
+        if findings
+        else f"all refs resolve · {checked} checked · {files_scanned} files · 0.01s"
+    )
+    return {
+        "schema": "roam-envelope-v1",
+        "schema_version": "1.2.0",
+        "command": "stale-refs",
+        "version": mod.MIN_ROAM_VERSION,
+        "project": "fixture",
+        "summary": {
+            "verdict": verdict,
+            "missing_targets": missing_targets,
+            "stale_refs": len(findings),
+            "files_scanned": files_scanned,
+            "files_unreadable": 0,
+            "scan_incomplete": False,
+            "partial_success": False,
+            "refs_checked": checked,
+            "displayed": missing_targets,
+            "scan_seconds": 0.01,
+            "sort_by": "priority",
+            "anchor_findings": 0,
+            "fixable_count": 0,
+            "by_kind": dict(by_kind),
+            "by_confidence": {"NONE": missing_targets} if missing_targets else {},
+            "next_steps": [],
+        },
+        "targets": targets,
+        "agent_contract": {"confidence": None, "facts": [], "risks": [], "next_commands": []},
+        "_meta": {},
+    }
+
+
 _TX_HIGH_SEVERITY_CLASSIFICATIONS = frozenset({"unsafe_mutation", "unmatched_begin", "unmatched_commit"})
 
 
@@ -725,6 +778,25 @@ def neutralize_synthetic_verify_orphan_imports_check(monkeypatch):
     monkeypatch.setattr(
         mod,
         "_run_verify_orphan_imports_check",
+        lambda *_args, **_kwargs: (
+            {
+                "state": "complete",
+                "absolute_finding_count": 0,
+                "baseline_finding_count": 0,
+                "regression_count": 0,
+                "findings": (),
+            },
+            0,
+        ),
+    )
+
+
+@pytest.fixture
+def neutralize_synthetic_verify_stale_refs_check(monkeypatch):
+    """Keep legacy synthetic fixtures independent of stale-reference delegation."""
+    monkeypatch.setattr(
+        mod,
+        "_run_verify_stale_refs_check",
         lambda *_args, **_kwargs: (
             {
                 "state": "complete",
@@ -1359,7 +1431,10 @@ class TestRoamVersionEnforcement:
         assert "python metadata: roam-code 13.10.4" in res.output
 
 
-@pytest.mark.usefixtures("neutralize_synthetic_verify_tx_boundaries_check")
+@pytest.mark.usefixtures(
+    "neutralize_synthetic_verify_tx_boundaries_check",
+    "neutralize_synthetic_verify_stale_refs_check",
+)
 class TestFutureRoamMajorIsVerifiedNotRefused:
     """A newer kernel major is verified; the CONTRACT decides, not the number.
 
@@ -1983,6 +2058,16 @@ class TestBoundedVerifyCapture:
             "pass. Fix: repair Git, the Roam index or detector, or the changed importable source, then rerun "
             "`compile verify --changed`.",
         ),
+        (
+            mod._verify_stale_refs_unavailable_verdict,
+            "VERDICT: verify unavailable — stale-refs did not run completely: CAPTURED_REASON. A triggered "
+            "stale-reference check that did not run cannot pass. Fix: repair Git, the Roam detector, or the changed "
+            "path and its references, then rerun `compile verify --changed`.",
+            "VERDICT: verify unavailable — stale-refs did not run completely: the stale-reference check could not "
+            "establish a complete result. A triggered stale-reference check that did not run cannot pass. Fix: "
+            "repair Git, the Roam detector, or the changed path and its references, then rerun `compile verify "
+            "--changed`.",
+        ),
     ],
 )
 def test_verify_unavailable_verdicts_are_byte_stable(builder, safe_expected: str, fallback_expected: str):
@@ -2546,6 +2631,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -2571,6 +2657,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
@@ -2587,6 +2674,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
@@ -2672,6 +2760,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         finding = {
@@ -2717,6 +2806,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         checks = [*mod._VERIFY_DEFAULT_CHECKS, "delete_check"]
@@ -2743,6 +2833,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -2833,6 +2924,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "src" / "service.py"
         source.parent.mkdir()
@@ -3136,6 +3228,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def save_row(db):\n    return db.fetch_row()\n", encoding="utf-8")
@@ -3331,6 +3424,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def save_row(db):\n    return 1\n", encoding="utf-8")
@@ -3365,6 +3459,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def save_row(db):\n    return 1\n", encoding="utf-8")
@@ -3406,6 +3501,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         package = tmp_path / "src" / "pkg"
@@ -3581,6 +3677,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "dependency.py"
@@ -3615,6 +3712,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_calc_golden_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "dependency.py"
@@ -3670,6 +3768,222 @@ class TestVerifyFailureFormatting:
 
         assert "orphan-imports" in mod._auto_select_product_verify_checks(["dependency.txt"], root=tmp_path)
 
+    def test_deleting_a_referenced_path_fails_and_names_the_untouched_reference(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        target = tmp_path / "docs" / "guide.md"
+        target.parent.mkdir()
+        target.write_text("# Guide\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("See [the guide](docs/guide.md).\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        target.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["docs/guide.md"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+        stale = {
+            "target": "docs/guide.md",
+            "file": "README.md",
+            "line": 1,
+            "kind": "md_inline",
+            "raw": "docs/guide.md",
+        }
+        calls: list[list[str]] = []
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            calls.append(list(args))
+            if list(args[:2]) == ["--json", "stale-refs"]:
+                findings = [] if (Path(cwd) / "docs/guide.md").is_file() else [stale]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(_stale_refs_envelope(findings=findings, files_scanned=2)),
+                    stderr="",
+                )
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "docs/guide.md"])
+
+        assert result.exit_code == mod.EXIT_VERIFY_GATE
+        assert result.output.startswith("VERDICT: FAIL (stale reference regression)")
+        assert "README.md:1" in result.output
+        assert "docs/guide.md" in result.output
+        assert [call for call in calls if call[:2] == ["--json", "stale-refs"]] == [
+            ["--json", "stale-refs", "--limit", str(mod.MAX_VERIFY_STALE_REFS_ENVELOPE_TARGETS), "--no-rename-hint"],
+            ["--json", "stale-refs", "--limit", str(mod.MAX_VERIFY_STALE_REFS_ENVELOPE_TARGETS), "--no-rename-hint"],
+        ]
+
+    def test_preexisting_stale_reference_in_an_untouched_file_passes(self, monkeypatch, tmp_path):
+        (tmp_path / "README.md").write_text("See [legacy](docs/already-gone.md).\n", encoding="utf-8")
+        source = tmp_path / "service.txt"
+        source.write_text("value=1\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.write_text("value=2\n", encoding="utf-8")
+        stale = {
+            "target": "docs/already-gone.md",
+            "file": "README.md",
+            "line": 1,
+            "kind": "md_inline",
+            "raw": "docs/already-gone.md",
+        }
+
+        def capture(*args, **_kwargs):
+            assert list(args[:2]) == ["--json", "stale-refs"]
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(_stale_refs_envelope(findings=[stale], files_scanned=2)),
+                stderr="",
+            )
+
+        monkeypatch.setattr(mod, "_roam_capture", capture)
+
+        result, rc = mod._run_verify_stale_refs_check(
+            tmp_path,
+            targets=["service.txt"],
+            executable="roam",
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            env={},
+        )
+
+        assert rc == 0
+        assert result["state"] == "complete"
+        assert result["absolute_finding_count"] == 1
+        assert result["baseline_finding_count"] == 1
+        assert result["regression_count"] == 0
+        assert result["findings"] == ()
+
+    def test_stale_refs_protocol_preserves_the_detectors_normalized_reference(self, tmp_path):
+        (tmp_path / "README.md").write_text("See `docs/guide.md:12`.\n", encoding="utf-8")
+        detector_finding = {
+            "target": "docs/guide.md",
+            "file": "README.md",
+            "line": 1,
+            "kind": "backtick",
+            "raw": "docs/guide.md:12",
+        }
+
+        findings = mod._validate_verify_stale_refs_protocol(
+            json.dumps(_stale_refs_envelope(findings=[detector_finding], files_scanned=1)),
+            returncode=0,
+            expected_roam_version=mod.MIN_ROAM_VERSION,
+            expected_root=tmp_path,
+        )
+
+        assert findings == (detector_finding,)
+
+    def test_stale_refs_tool_absence_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        target = tmp_path / "guide.md"
+        target.write_text("guide\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("[guide](guide.md)\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        target.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["guide.md"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["--json", "stale-refs"]:
+                raise FileNotFoundError("roam")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "guide.md"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "toolchain missing" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_malformed_stale_refs_envelope_is_typed_unavailable_never_pass(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_py_types_check,
+        neutralize_synthetic_verify_py_modern_check,
+        neutralize_synthetic_verify_calc_golden_check,
+        neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_tx_boundaries_check,
+        neutralize_synthetic_verify_orphan_imports_check,
+    ):
+        target = tmp_path / "guide.md"
+        target.write_text("guide\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("[guide](guide.md)\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        target.unlink()
+        self._bind_product_verify_scope(monkeypatch, tmp_path, ["guide.md"])
+        verify_fake, _captured = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
+
+        def fake(*args, timeout=600, executable="roam", env=None, cwd=None):
+            if list(args[:2]) == ["--json", "stale-refs"]:
+                return SimpleNamespace(returncode=0, stdout='{not "one complete envelope"', stderr="")
+            return verify_fake(*args, timeout=timeout, executable=executable, env=env)
+
+        monkeypatch.setattr(mod, "_roam_capture", fake)
+
+        result = runner.invoke(mod.cli, ["verify", "guide.md"])
+
+        assert result.exit_code == mod.EXIT_TOOLCHAIN
+        assert result.output.count("VERDICT:") == 1
+        assert "stale-refs did not run completely" in result.output
+        assert "VERDICT: PASS" not in result.output
+
+    def test_stale_refs_auto_selection_includes_deletes_renames_and_referenced_doc_edits(self, tmp_path):
+        target = tmp_path / "docs" / "guide.md"
+        target.parent.mkdir()
+        target.write_text("# Guide\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("[guide](docs/guide.md)\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+
+        target.write_text("# Renamed heading\n", encoding="utf-8")
+        assert "stale-refs" in mod._auto_select_product_verify_checks(["docs/guide.md"], root=tmp_path)
+
+        subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "-qm",
+                "edit guide",
+            ],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(["git", "mv", "docs/guide.md", "docs/renamed.md"], cwd=tmp_path, check=True)
+        assert "stale-refs" in mod._auto_select_product_verify_checks(["docs/renamed.md"], root=tmp_path)
+
+    def test_stale_refs_auto_selection_excludes_an_unreferenced_file_edit(self, tmp_path):
+        source = tmp_path / "notes.txt"
+        source.write_text("baseline\n", encoding="utf-8")
+        (tmp_path / "README.md").write_text("No file reference here.\n", encoding="utf-8")
+        self._commit_fixture_baseline(tmp_path, ".")
+        source.write_text("edited\n", encoding="utf-8")
+
+        assert "stale-refs" not in mod._auto_select_product_verify_checks(["notes.txt"], root=tmp_path)
+
     def test_declared_golden_semantic_change_fails_and_names_calculation_case_and_values(
         self,
         runner,
@@ -3680,6 +3994,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text(
@@ -3943,6 +4258,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "calc.py"
         source.write_text("tax = base * rate\n", encoding="utf-8")
@@ -3990,7 +4306,13 @@ class TestVerifyFailureFormatting:
         assert result["state"] == "unavailable"
         assert result["reason"] == "tracked golden declarations were removed from the edit"
 
-    def test_non_code_edit_with_golden_declaration_never_launches_evaluator(self, runner, monkeypatch, tmp_path):
+    def test_non_code_edit_with_golden_declaration_never_launches_evaluator(
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_stale_refs_check,
+    ):
         (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
         (tmp_path / "README.md").write_text("# Neutral fixture\n", encoding="utf-8")
         declaration_dir = tmp_path / ".roam" / "calc-golden"
@@ -4036,6 +4358,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         (tmp_path / "calc.py").write_text("tax = base * rate\n", encoding="utf-8")
         self._bind_product_verify_scope(monkeypatch, tmp_path, ["calc.py"])
@@ -4118,6 +4441,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text(
@@ -4176,6 +4500,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
@@ -4218,6 +4543,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
@@ -4261,7 +4587,11 @@ class TestVerifyFailureFormatting:
         assert "absolute repository adoption observed at type-modern 0%, f-string 0%" in result.output
 
     def test_non_python_edit_records_modernization_not_applicable_without_launching_evaluator(
-        self, runner, monkeypatch, tmp_path
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         readme = tmp_path / "README.md"
         readme.write_text("# Neutral fixture\n", encoding="utf-8")
@@ -4288,6 +4618,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
@@ -4321,6 +4652,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def describe(value: int) -> str:\n    return f'{value}'\n", encoding="utf-8")
@@ -4369,6 +4701,7 @@ class TestVerifyFailureFormatting:
         tmp_path,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         source = tmp_path / "service.py"
@@ -4564,6 +4897,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(record_id, label):\n    return f'{record_id}:{label}'\n", encoding="utf-8")
@@ -4617,7 +4951,11 @@ class TestVerifyFailureFormatting:
         assert f"coverage observed at {expected_coverage}" in result.output
 
     def test_non_python_edit_records_type_not_applicable_without_launching_evaluator(
-        self, runner, monkeypatch, tmp_path
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         readme = tmp_path / "README.md"
         readme.write_text("# Fixture\n", encoding="utf-8")
@@ -4648,7 +4986,12 @@ class TestVerifyFailureFormatting:
         assert "product_args" not in captured
 
     def test_triggered_type_check_unavailability_is_typed_at_exit_2(
-        self, runner, monkeypatch, tmp_path, neutralize_synthetic_verify_orphan_imports_check
+        self,
+        runner,
+        monkeypatch,
+        tmp_path,
+        neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         source = tmp_path / "service.py"
         source.write_text("def normalise(value: int) -> int:\n    return value\n", encoding="utf-8")
@@ -4713,6 +5056,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: WARN (score 75/100) -- review findings\n", 0)
@@ -4753,6 +5097,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -4769,6 +5114,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(
@@ -4810,6 +5156,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
@@ -4897,6 +5244,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -4921,6 +5269,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: PASS (score 100/100) -- no changed files\n", 0)
@@ -4940,6 +5289,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture("VERDICT: FAIL (score 60/100) -- discovery-level failure\n", 5)
@@ -4958,6 +5308,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -4985,6 +5336,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, captured = self._capture(self.FAIL_OUTPUT, 5)
@@ -5001,6 +5353,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         fake, _ = self._capture("VERDICT: PASS (score 100/100) -- no issues\n", 0)
@@ -5030,6 +5383,7 @@ class TestVerifyFailureFormatting:
         monkeypatch,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         """An upstream envelope addition must not become a local verify outage."""
@@ -5051,6 +5405,7 @@ class TestVerifyFailureFormatting:
         neutralize_synthetic_verify_py_types_check,
         neutralize_synthetic_verify_py_modern_check,
         neutralize_synthetic_verify_collapse_check,
+        neutralize_synthetic_verify_stale_refs_check,
         neutralize_synthetic_verify_tx_boundaries_check,
     ):
         self._newer_producer(monkeypatch, 5, self.FAIL_OUTPUT)
@@ -6914,6 +7269,7 @@ class TestVerifyReceiptV3Protocol:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         # End to end: tracked source under venv/ is verified, the untracked
         # index is not, and the PASS carries its own reduced denominator.
@@ -7045,6 +7401,7 @@ class TestVerifyReceiptV3Protocol:
         neutralize_synthetic_verify_collapse_check,
         neutralize_synthetic_verify_tx_boundaries_check,
         neutralize_synthetic_verify_orphan_imports_check,
+        neutralize_synthetic_verify_stale_refs_check,
     ):
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".git").mkdir()

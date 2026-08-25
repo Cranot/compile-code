@@ -67,7 +67,16 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     inventory = coverage.roam_command_inventory()
 
     assert coverage._product_verify_commands(inventory) == frozenset(
-        {"calc-golden", "collapse", "orphan-imports", "py-modern", "py-types", "rules", "tx-boundaries"}
+        {
+            "calc-golden",
+            "collapse",
+            "orphan-imports",
+            "py-modern",
+            "py-types",
+            "rules",
+            "stale-refs",
+            "tx-boundaries",
+        }
     )
 
     import compile_code.cli as cli
@@ -92,11 +101,15 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
     assert "deleted or renamed" in descriptions["orphan-imports"]
     assert "import lines" in descriptions["orphan-imports"]
     assert "Git pre-edit state" in descriptions["orphan-imports"]
+    assert "Deleted or renamed paths" in descriptions["stale-refs"]
+    assert "referenced by other tracked files" in descriptions["stale-refs"]
+    assert "Git pre-edit state" in descriptions["stale-refs"]
     assert cli._auto_select_product_verify_checks(["README.md"]) == (
         "rules",
         "py-types",
         "py-modern",
         "calc-golden",
+        "stale-refs",
     )
     assert cli._auto_select_product_verify_checks(["tests/test_service.py"]) == (
         "rules",
@@ -106,6 +119,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "collapse",
         "tx-boundaries",
         "orphan-imports",
+        "stale-refs",
     )
     assert cli._auto_select_product_verify_checks(["web/service.tsx"]) == (
         "rules",
@@ -115,6 +129,7 @@ def test_verify_derives_product_check_registration_and_trigger_descriptions() ->
         "collapse",
         "tx-boundaries",
         "orphan-imports",
+        "stale-refs",
     )
     assert "collapse" not in cli._auto_select_product_verify_checks(["scripts/check.sh"])
     assert cli._auto_select_product_verify_checks([]) == ()
@@ -129,3 +144,14 @@ def test_f10_review_declares_the_detector_gate_complete() -> None:
     assert migration_plan.edit_relevant is False
     assert migration_plan.failure_classes == ()
     assert "planning ACTION" in migration_plan.reason
+
+
+def test_f8_review_declares_both_reference_gates_complete() -> None:
+    report = coverage.build_report()
+
+    assert {"delete-check", "stale-refs"} <= report.channels["VERIFY"]
+    assert coverage._failure_state(report, "F8") == ("covered", 2, 2)
+    safe_delete = report.classifications["safe-delete"]
+    assert safe_delete.edit_relevant is False
+    assert safe_delete.failure_classes == ()
+    assert "planning ACTION" in safe_delete.reason

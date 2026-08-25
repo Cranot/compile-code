@@ -393,7 +393,10 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("rules-suggest", _c(False, "", "Suggests future rules and does not validate the current edit.")),
     ("rules-validate", _c(False, "", "Excluded from the edit denominator: lint rules file.")),
     ("runs", _c(False, "", "Excluded from the edit denominator: event ledger.")),
-    ("safe-delete", _c(True, "F8", "Plans and validates dependency-aware deletion.")),
+    (
+        "safe-delete",
+        _c(False, "", "Excluded from the edit denominator: deletion-planning ACTION, not an edit detector."),
+    ),
     ("safe-zones", _c(True, "F18", "Identifies low-risk areas and architecture constraints for edits.")),
     ("savings", _c(False, "", "Reports optimization savings rather than code correctness.")),
     ("savings-backfill", _c(False, "", "Backfills metrics and does not validate code edits.")),
@@ -413,7 +416,14 @@ COMMAND_CLASSIFICATION_ROWS = (
     ("snapshot", _c(False, "", "Excluded from the edit denominator: deprecated->trends.")),
     ("spectral", _c(False, "", "Excluded from the edit denominator: spectral partition (reporting).")),
     ("split", _c(True, "F16", "Finds safe boundaries for splitting a module or change.")),
-    ("stale-refs", _c(True, "F12", "Finds references made stale by moves, renames, or deletions.")),
+    (
+        "stale-refs",
+        _c(
+            True,
+            "F8 F12",
+            "Compares stale references after deletes, renames, and referenced-path edits with Git pre-edit state.",
+        ),
+    ),
     ("stats", _c(False, "", "Excluded from the edit denominator: aggregate metrics (reporting).")),
     ("suggest-refactoring", _c(False, "", "Excluded from the edit denominator: refactor ranking (comprehension).")),
     ("suggest-reviewers", _c(False, "", "Excluded from the edit denominator: PM.")),
