@@ -230,12 +230,12 @@ named_paths:     ['src/compile_code/cli.py', 'tests/test_cli.py']
 
 PREFETCHED ANSWERS (do not re-run the tools that produced these):
   callers: (2 items)
-    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1260',
+    - {'name': '_ensure_indexed_for_launch', 'location': 'src/compile_code/cli.py:1262',
        'edge': 'call', 'call_line': 'if _require_index():',
-       'call_location': 'src/compile_code/cli.py:1269'}
-    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:9569', 'edge': 'call',
+       'call_location': 'src/compile_code/cli.py:1271'}
+    - {'name': 'doctor', 'location': 'src/compile_code/cli.py:9677', 'edge': 'call',
        'call_line': 'indexed = _require_index()',
-       'call_location': 'src/compile_code/cli.py:9579'}
+       'call_location': 'src/compile_code/cli.py:9687'}
   callers_definition: Callers of `_require_index`. Each entry includes
     `call_line` — the actual calling source line — so you do NOT need to
     re-grep the symbol.
@@ -312,6 +312,7 @@ planted hallucinations caught in both languages.
 | `compile wire claude` | Persistent hooks plus curated Roam permissions/guidance; `--user` for all repos, `--no-verify` to skip the post-edit check |
 | `compile unwire claude` | Remove the hooks (`--user` for the user-global install) |
 | `compile run "task"` | Headless: print the compiled envelope (`--json` for scripts/CI) |
+| `compile transcript SESSION.jsonl` | Mechanically derive a results note, handoff brief, or evidence JSON from a Claude Code transcript |
 | `compile verify [files...]` | Scoped review of the changed files (`--changed`, `--new-only`, `--diff-only`, `--threshold`); names the next local action on failure |
 | `compile baseline [dirs...]` | Snapshot accepted debt for a clean whole-repo tree (refuses a dirty tree) |
 | `compile report` | Persist a whole-repo verify report without a quality gate (the toolchain is still checked) |
@@ -327,6 +328,15 @@ itself (staged, unstaged, untracked, renamed, and deleted paths), canonicalizes
 that set, and passes explicit root-bound targets to `roam verify`. Only when
 discovery yields no bound targets does it use `roam verify --changed` as the
 path-free recovery fallback.
+
+### Transcript artifacts
+
+`compile transcript SESSION.jsonl` emits a results note by default; choose a
+handoff brief or evidence JSON with `--artifact`, and use `--out` for an atomic
+file write. Extraction is mechanical, makes no model calls or inferred claims,
+and reports missing facts explicitly. Artifacts quote the input verbatim, so
+sensitive transcript content remains sensitive; redaction is an explicit
+non-goal of v1.
 
 ### Declared calculation semantics
 

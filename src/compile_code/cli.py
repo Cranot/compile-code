@@ -47,6 +47,8 @@ from typing import BinaryIO, Iterator
 
 import click
 
+from compile_code import transcript as transcript_compiler
+
 __all__ = ["cli"]
 
 EXIT_TOOLCHAIN = 2
@@ -2290,6 +2292,112 @@ def _report() -> None:
     # verdict about this tree.
     _exit_on_roam_problem()
     raise SystemExit(_delegate("verify", "--report", "--persist"))
+
+
+def _transcript_refusal(reason: str) -> str:
+    fixes = {
+        "missing_file": "input file not found. Fix: rerun `compile transcript PATH` with an existing JSONL file.",
+        "unreadable_file": "input file is unreadable. Fix: grant read access and rerun `compile transcript PATH`.",
+        "not_regular_file": "input path is not a regular file. Fix: rerun `compile transcript PATH` with a JSONL file.",
+        "total_size_limit": (
+            f"input exceeds MAX_TRANSCRIPT_BYTES ({transcript_compiler.MAX_TRANSCRIPT_BYTES} bytes). "
+            "Fix: split the transcript and rerun `compile transcript PATH` on one smaller file."
+        ),
+        "empty_file": "input file is empty. Fix: rerun `compile transcript PATH` with a non-empty JSONL file.",
+        "non_utf8_file": "input is not UTF-8. Fix: convert the JSONL file to UTF-8 and rerun `compile transcript PATH`.",
+        "no_readable_events": (
+            "no readable v1 events were found. "
+            "Fix: provide Claude Code JSONL with user or assistant events and rerun `compile transcript PATH`."
+        ),
+        "file_changed": "input changed during reading. Fix: stop its writer and rerun `compile transcript PATH`.",
+        "render_too_large": "artifact exceeds the output cap. Fix: split the transcript and compile each part separately.",
+        "unknown_artifact": "unknown artifact. Fix: rerun with `--artifact results-note`, `handoff-brief`, or `evidence`.",
+        "internal_quote_mismatch": (
+            "internal extraction defect: a quote did not match its source line. "
+            "Fix: rerun `compile transcript PATH`; report the input shape if the verdict repeats."
+        ),
+        "internal_coverage_mismatch": (
+            "internal extraction defect: line coverage did not conserve the input. "
+            "Fix: rerun `compile transcript PATH`; report the input shape if the verdict repeats."
+        ),
+        "internal_fact_shape": (
+            "internal extraction defect: a fact had an invalid shape. "
+            "Fix: rerun `compile transcript PATH`; report the input shape if the verdict repeats."
+        ),
+    }
+    detail = fixes.get(
+        reason,
+        "processing failed. Fix: validate the JSONL input and rerun `compile transcript PATH`.",
+    )
+    return f"VERDICT: transcript refused: {detail}"
+
+
+@cli.command("transcript")
+@click.argument("source", type=click.Path(path_type=Path))
+@click.option(
+    "--artifact",
+    type=click.Choice(["results-note", "handoff-brief", "evidence"]),
+    default="results-note",
+    show_default=True,
+    help="Choose the derived artifact.",
+)
+@click.option("--out", type=click.Path(path_type=Path), help="Atomically write the artifact to FILE instead of stdout.")
+def _transcript(source: Path, artifact: str, out: Path | None) -> None:
+    """Compile a v1 Claude Code JSONL transcript into a mechanical artifact.
+
+    \b
+    Artifacts quote the transcript verbatim and make no inferred claims.
+    Sensitive input produces sensitive output; redaction is not performed in v1.
+    """
+    try:
+        rendered = transcript_compiler.compile_transcript(
+            source,
+            artifact=artifact,
+            parse_json=_strict_json_document,
+        )
+        if out is None:
+            click.echo(rendered, nl=False)
+            return
+        try:
+            same_target = source.resolve() == out.resolve()
+        except OSError:
+            same_target = False
+        if same_target:
+            click.echo(
+                "VERDICT: transcript refused: output path is the input file. "
+                "Fix: rerun with `--out` naming a different file."
+            )
+            raise SystemExit(1)
+        try:
+            out.lstat()
+        except FileNotFoundError:
+            previous = None
+        else:
+            try:
+                previous = _read_bounded_utf8_regular_file(out, max_bytes=transcript_compiler.MAX_RENDER_BYTES)
+            except (OSError, UnicodeError, ValueError):
+                click.echo(
+                    "VERDICT: transcript refused: output path is not a writable regular UTF-8 file. "
+                    "Fix: choose a regular file in an existing writable directory."
+                )
+                raise SystemExit(1)
+        if not _atomic_write_utf8(
+            out,
+            rendered,
+            max_bytes=transcript_compiler.MAX_RENDER_BYTES,
+            expected_previous=previous,
+        ):
+            click.echo(
+                "VERDICT: transcript refused: atomic output write failed. "
+                "Fix: choose a new file in an existing writable directory and rerun."
+            )
+            raise SystemExit(1)
+    except transcript_compiler.TranscriptError as exc:
+        click.echo(_transcript_refusal(exc.reason))
+        raise SystemExit(1)
+    except (MemoryError, OSError, RuntimeError, TypeError, UnicodeError, ValueError):
+        click.echo(_transcript_refusal("processing_failed"))
+        raise SystemExit(1)
 
 
 def _launch_agent(argv: list[str], env: dict[str, str], *, use_exec: bool | None = None) -> int:
